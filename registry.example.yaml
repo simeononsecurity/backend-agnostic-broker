@@ -1,0 +1,129 @@
+# Example model registry for backend-agnostic-broker.
+# Copy to registry.yaml and edit. Requests select a model by its `alias`.
+# NOTE: paths/URLs below are placeholders — no real host details are committed.
+
+models:
+  # ---- Fake backend (no external runtime; used for tests & smoke) ----------
+  - alias: echo-fake
+    backend: fake
+    runtime_model_id: fake-echo-v1
+    context_limit: 8192
+    output_limit: 2048
+    idle_timeout_seconds: 60
+    supports_streaming: true
+
+  # ---- Ollama (external daemon, native lazy loading via keep_alive) ---------
+  - alias: llama3-ollama
+    backend: ollama
+    runtime_model_id: llama3.1:8b
+    base_url: http://127.0.0.1:11434
+    context_limit: 8192
+    output_limit: 2048
+    idle_timeout_seconds: 300
+    keep_alive: "5m"
+    readiness:
+      kind: http
+      path: /api/tags
+      expect_status: 200
+    supports_streaming: true
+    supports_tools: true
+
+  # ---- llama.cpp (broker-managed process; model loads at startup) -----------
+  - alias: qwen-llamacpp
+    backend: llamacpp
+    runtime_model_id: qwen2.5-7b-instruct
+    model_path: /models/qwen2.5-7b-instruct-q4_k_m.gguf
+    base_url: http://127.0.0.1:8081
+    context_limit: 8192
+    output_limit: 2048
+    idle_timeout_seconds: 300
+    # argv TEMPLATE. {exe}/{model_path}/{context_limit}/{tensor_split}/{layer_split}
+    # are substituted by the broker; no request can inject flags.
+    startup_command:
+      - /usr/local/bin/llama-server
+      - --model
+      - "{model_path}"
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8081"
+      - --ctx-size
+      - "{context_limit}"
+      - --n-gpu-layers
+      - "{layer_split}"
+    readiness:
+      kind: http
+      path: /health
+      expect_status: 200
+      timeout_seconds: 120
+    gpu:
+      required: true
+      device_ids: [0]
+      layer_split: "35"          # n-gpu-layers
+      tensor_split: [1.0]
+    supports_streaming: true
+
+  # ---- vLLM (broker-managed process; one model per process) ----------------
+  - alias: mistral-vllm
+    backend: vllm
+    runtime_model_id: mistralai/Mistral-7B-Instruct-v0.3
+    model_path: /models/Mistral-7B-Instruct-v0.3
+    base_url: http://127.0.0.1:8000
+    context_limit: 32768
+    output_limit: 4096
+    idle_timeout_seconds: 600
+    startup_command:
+      - /usr/local/bin/vllm
+      - serve
+      - "{model_path}"
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8000"
+      - --max-model-len
+      - "{context_limit}"
+      - --tensor-parallel-size
+      - "{tensor_parallel_size}"
+      - --gpu-memory-utilization
+      - "{gpu_memory_fraction}"
+    readiness:
+      kind: http
+      path: /health
+      expect_status: 200
+      timeout_seconds: 300
+    gpu:
+      required: true
+      device_ids: [0]
+      tensor_parallel_size: 1
+      gpu_memory_fraction: 0.9
+    supports_streaming: true
+    supports_tools: true
+
+  # ---- Strata (broker-managed; flags are deployment-specific/UNVERIFIED) ----
+  # Fill startup_command/readiness from your confirmed Strata version. See
+  # docs/backends/strata.md — do NOT assume flags.
+  - alias: strata-model
+    backend: strata
+    runtime_model_id: strata-default
+    model_path: /models/strata-default
+    base_url: http://127.0.0.1:8090
+    context_limit: 8192
+    output_limit: 2048
+    idle_timeout_seconds: 600
+    startup_command:
+      - /opt/strata/bin/strata-server
+      - --model-path
+      - "{model_path}"
+      - --port
+      - "8090"
+    readiness:
+      kind: http
+      path: /health
+      expect_status: 200
+      timeout_seconds: 300
+    gpu:
+      required: true
+      device_ids: [0]
+    mtp:
+      enabled: false
+    supports_streaming: true

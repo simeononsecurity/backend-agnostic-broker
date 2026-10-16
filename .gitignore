@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local registry with real paths/hosts (ship only the example)
+registry.yaml
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Models & caches (never commit weights)
+models/
+*.gguf
+*.safetensors
+*.bin
+cache/

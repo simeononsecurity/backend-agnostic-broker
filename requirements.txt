@@ -1,0 +1,9 @@
+# Runtime dependencies (pinned for reproducible builds).
+fastapi==0.143.2
+starlette==1.8.0
+uvicorn[standard]==0.54.0
+pydantic==2.14.1
+pydantic-settings==2.16.0
+httpx==0.28.1
+PyYAML==6.0.3
+prometheus-client==0.26.0

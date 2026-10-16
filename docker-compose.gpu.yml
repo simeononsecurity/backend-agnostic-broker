@@ -1,0 +1,23 @@
+# GPU override. Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+#
+# Requires the NVIDIA Container Toolkit on the host. GPU passthrough is ONLY
+# enabled when this override is explicitly supplied, so the default (base) file
+# stays CI/CPU-friendly.
+
+services:
+  broker:
+    environment:
+      BROKER_GPU_VISIBLE: "true"
+      BROKER_CUDA_VISIBLE_DEVICES: "${BROKER_CUDA_VISIBLE_DEVICES:-0}"
+      BROKER_ENABLED_BACKENDS: '["fake","ollama","vllm","llamacpp","strata"]'
+    # Modern Compose GPU reservation.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+    # Some runtimes need shared memory for tensor/pipeline parallelism.
+    shm_size: "1g"

@@ -1,0 +1,130 @@
+# Pull-request CI. SAFE FOR FORKS:
+#  * triggered on `pull_request` (NOT pull_request_target) so untrusted fork code
+#    runs with a read-only GITHUB_TOKEN and no access to repo secrets;
+#  * default permissions are read-only; only the specific job that must write
+#    (SARIF upload) is granted security-events: write;
+#  * all third-party actions are pinned to full commit SHAs;
+#  * superseded runs for the same PR are cancelled.
+name: pr
+
+on:
+  pull_request:
+    branches: [main]
+
+# Least privilege by default. Jobs opt into more only where required.
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: backend-agnostic-broker:ci
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.11"
+      - name: "Install"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: "Ruff lint"
+        run: ruff check broker tests
+      - name: "Ruff format check"
+        run: ruff format --check broker tests
+      - name: "Type check (advisory)"
+        run: mypy broker || true
+      - name: "Unit + integration + API tests"
+        run: pytest -q
+      - name: "Docs example test (real API, fake backend)"
+        run: pytest -q tests/test_docs_examples.py
+      - name: "Upload test logs"
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: pytest-logs
+          path: .pytest_cache/
+          if-no-files-found: ignore
+
+  compose-validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: "Validate base + GPU compose"
+        run: |
+          docker compose -f docker-compose.yml config >/dev/null
+          docker compose -f docker-compose.yml -f docker-compose.gpu.yml config >/dev/null
+
+  secrets-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: "Gitleaks (secret scanning)"
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-scan:
+    runs-on: ubuntu-latest
+    needs: [lint-test]
+    permissions:
+      contents: read
+      security-events: write   # only to upload Trivy SARIF
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+      - name: "Build image (CPU, no push)"
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}
+          build-args: |
+            VERSION=ci
+            VCS_REF=${{ github.sha }}
+      - name: "Container smoke test"
+        run: bash scripts/docker_smoke.sh ${{ env.IMAGE }}
+      - name: "Generate SBOM"
+        uses: anchore/sbom-action@fc46e51fd3cb168ffb36c6d1915723c47db58abb # v0.17.7
+        with:
+          image: ${{ env.IMAGE }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+      - name: "Trivy image scan - fail on fixable CRITICAL or HIGH"
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: "Upload Trivy SARIF"
+        if: always()
+        uses: github/codeql-action/upload-sarif@9887d98ae49f1f598651b556d8c8f02f3ea065cb # v3.27.0
+        with:
+          sarif_file: trivy.sarif
+      - name: "Upload SBOM + reports"
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: sbom-and-scan
+          path: |
+            sbom.spdx.json
+            trivy.sarif
+          if-no-files-found: warn

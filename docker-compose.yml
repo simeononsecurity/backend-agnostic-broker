@@ -1,0 +1,58 @@
+# Base Compose: CPU-only broker. GPU passthrough is opt-in via the override file
+# docker-compose.gpu.yml (see docs/docker-compose.md).
+#
+# Secrets: API keys are injected via a Docker secret, never baked into the image.
+# Create ./secrets/api_keys.json before `docker compose up` (see .env.example).
+
+services:
+  broker:
+    build:
+      context: .
+      args:
+        VERSION: "0.1.0"
+        VCS_REF: "${VCS_REF:-dev}"
+    image: backend-agnostic-broker:0.1.0
+    container_name: broker
+    ports:
+      - "${BROKER_PORT:-8080}:8080"
+    environment:
+      BROKER_HOST: "0.0.0.0"
+      BROKER_PORT: "8080"
+      BROKER_AUTH_ENABLED: "${BROKER_AUTH_ENABLED:-true}"
+      # API keys via secret file (preferred) — see api_keys secret below.
+      BROKER_API_KEYS: "${BROKER_API_KEYS:-}"
+      BROKER_REGISTRY_PATH: "/config/registry.yaml"
+      BROKER_ENABLED_BACKENDS: '["fake","ollama"]'
+      BROKER_LOG_FORMAT: "json"
+      BROKER_ALLOWED_MODEL_ROOTS: '["/models"]'
+      BROKER_CACHE_DIR: "/var/cache/broker"
+      BROKER_TMP_DIR: "/tmp/broker"
+      BROKER_GPU_VISIBLE: "false"
+    volumes:
+      - ./registry.example.yaml:/config/registry.yaml:ro
+      - models:/models:ro
+    # Harden the container: read-only root fs + explicit writable tmpfs mounts.
+    read_only: true
+    tmpfs:
+      - /tmp/broker
+      - /var/cache/broker
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Resource limits (compose v2 honours these under `docker compose up`).
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3); sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  models:
