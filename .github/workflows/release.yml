@@ -1,21 +1,23 @@
-# Release workflow. Runs ONLY on approved tags (not on PRs), uses separate
-# least-privilege permissions, builds immutable image tags, and does NOT publish
-# images by default — publishing is gated behind an explicit, manual approval
-# environment. Release credentials never exist in PR jobs (this file never runs
-# on pull_request).
+# Release workflow. Runs on approved semver tags (v*.*.*) or manual dispatch —
+# never on pull_request, so release credentials are never exposed to fork code.
+# It builds an immutable image, smoke-tests it, runs a Trivy gate, and ONLY
+# THEN publishes the exact scanned image to GHCR. Third-party actions are pinned
+# to full commit SHAs. Publishing uses the repo-scoped GITHUB_TOKEN (no static
+# registry secret required).
 name: release
 
 on:
   push:
     tags:
-      - "v*.*.*"      # protected/approved tags only
+      - "v*.*.*" # protected/approved tags only
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish image to registry (requires approval environment)"
+        description: "Publish image to GHCR after build + scan"
         type: boolean
-        default: false
+        default: true
 
+# Read-only by default; the release job opts into packages:write to push.
 permissions:
   contents: read
 
@@ -24,56 +26,80 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    outputs:
-      version: ${{ steps.meta.outputs.version }}
+      packages: write # publish to GHCR
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
-      - name: "Derive immutable version"
+
+      - name: "Derive version + image ref"
         id: meta
         env:
           REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
         run: |
-          # REF_NAME is the tag (e.g. v1.2.3); sanitize to a bare semver.
-          VER="${REF_NAME#v}"
+          set -euo pipefail
+          if [ "$EVENT" = "push" ]; then
+            # Tag push: REF_NAME is the tag (e.g. v1.2.3) -> bare semver.
+            VER="${REF_NAME#v}"
+          else
+            # Manual dispatch: read the version from pyproject.toml.
+            VER="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          fi
+          # GHCR requires a lowercase owner/repo path.
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
-      - name: "Build immutable image (no push)"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved image: ${IMAGE}:${VER} (+ :latest)"
+
+      - name: "Build immutable image (load locally, no push yet)"
         uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
         with:
           context: .
           load: true
           push: false
-          tags: backend-agnostic-broker:${{ steps.meta.outputs.version }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:latest
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
             VCS_REF=${{ github.sha }}
+
       - name: "Container smoke test"
-        run: bash scripts/docker_smoke.sh backend-agnostic-broker:${{ steps.meta.outputs.version }}
-      - name: "Trivy gate"
+        # Pass the ref via env (not inline ${{ }}) so a crafted tag name cannot
+        # inject into the shell.
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+        run: bash scripts/docker_smoke.sh "$IMAGE_REF"
+
+      - name: "Trivy gate (fail on fixable CRITICAL/HIGH)"
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: backend-agnostic-broker:${{ steps.meta.outputs.version }}
+          image-ref: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1"
 
-  publish:
-    # Publishing requires BOTH an explicit opt-in AND a protected environment
-    # whose required reviewers must approve. Release secrets live only here.
-    needs: [build]
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == true }}
-    runs-on: ubuntu-latest
-    environment: release-approval   # configure required reviewers in repo settings
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: "Publish placeholder (no-op until registry configured)"
+      # Publish only on a tag push, or on manual dispatch with publish=true.
+      # The image pushed is the exact one that passed smoke + Trivy above.
+      - name: "Log in to GHCR"
+        if: ${{ github.event_name == 'push' || inputs.publish }}
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Push image to GHCR (version + latest)"
+        if: ${{ github.event_name == 'push' || inputs.publish }}
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          echo "Would publish backend-agnostic-broker:${{ needs.build.outputs.version }}"
-          echo "Registry login + push intentionally omitted; configure secrets in"
-          echo "the 'release-approval' environment and add a push step when ready."
+          set -euo pipefail
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:latest"
+          echo "Published ${IMAGE}:${VERSION} and :latest"
