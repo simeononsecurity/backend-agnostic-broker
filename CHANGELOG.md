@@ -6,6 +6,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-16
+
+Second local release (not published; commits and tag are local-only). Adds
+deployment-config portability (registry env-var substitution + local `.env`
+loader) and verified live remote-backend routing, with a streaming fix.
+
 ### Added
 
 - **Registry env-var substitution**: registry files now expand `${VAR}` /
@@ -71,4 +77,5 @@ Initial local release (not published; commits are local-only).
   adapters, API, auth, streaming, lazy-load, unload, security, docs-examples).
 
 [Unreleased]: https://example.local/backend-agnostic-broker
+[0.2.0]: https://example.local/backend-agnostic-broker
 [0.1.0]: https://example.local/backend-agnostic-broker
