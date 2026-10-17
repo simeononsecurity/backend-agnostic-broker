@@ -26,12 +26,24 @@
 - alias: llama3-ollama
   backend: ollama
   runtime_model_id: llama3.1:8b
-  base_url: http://127.0.0.1:11434
+  base_url: ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}
   keep_alive: "5m"
   readiness: { kind: http, path: /api/tags, expect_status: 200 }
   supports_streaming: true
   supports_tools: true
 ```
+
+### Remote daemons (including over tailscale) without committing the host
+
+`base_url` supports `${VAR}` / `${VAR:-default}` expansion (see
+`docs/configuration.md`), so point the broker at a remote Ollama daemon — e.g.
+one reachable over tailscale — by setting `OLLAMA_BASE_URL` in a **gitignored
+`.env`** and referencing `base_url: ${OLLAMA_BASE_URL}` in `registry.yaml`. The
+host IP never enters version control. The broker runs locally and makes only
+**outbound** API calls to that daemon; it never deploys onto or modifies the
+remote host. A live run against a remote daemon (models list, non-streaming and
+streaming completions, lazy-load, idle-unload) is recorded in
+`docs/EVIDENCE.md`.
 
 ## Runtime reference (vendor docs — verify before production)
 

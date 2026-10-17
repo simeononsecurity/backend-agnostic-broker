@@ -50,3 +50,39 @@ def test_extra_field_rejected(tmp_path):
 def test_missing_file(tmp_path):
     with pytest.raises(ConfigError):
         load_registry(str(tmp_path / "missing.yaml"))
+
+
+def test_env_var_substitution(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_OLLAMA_URL", "http://10.0.0.9:11434")
+    p = tmp_path / "env.yaml"
+    p.write_text(
+        "models:\n"
+        "  - alias: a\n    backend: ollama\n    runtime_model_id: m\n"
+        "    base_url: ${TEST_OLLAMA_URL}\n"
+    )
+    reg = load_registry(str(p))
+    assert reg.models[0].base_url == "http://10.0.0.9:11434"
+
+
+def test_env_var_default_used_when_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("TEST_OLLAMA_URL", raising=False)
+    p = tmp_path / "env_default.yaml"
+    p.write_text(
+        "models:\n"
+        "  - alias: a\n    backend: ollama\n    runtime_model_id: m\n"
+        "    base_url: ${TEST_OLLAMA_URL:-http://127.0.0.1:11434}\n"
+    )
+    reg = load_registry(str(p))
+    assert reg.models[0].base_url == "http://127.0.0.1:11434"
+
+
+def test_unset_env_var_without_default_fails_fast(tmp_path, monkeypatch):
+    monkeypatch.delenv("TEST_MISSING_VAR", raising=False)
+    p = tmp_path / "env_missing.yaml"
+    p.write_text(
+        "models:\n"
+        "  - alias: a\n    backend: ollama\n    runtime_model_id: m\n"
+        "    base_url: ${TEST_MISSING_VAR}\n"
+    )
+    with pytest.raises(ConfigError):
+        load_registry(str(p))

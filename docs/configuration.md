@@ -100,6 +100,39 @@ or `reject`; `gpu_memory_fraction` (per model) must be in `(0, 1]`.
 |---------|------|---------|-------------|
 | `BROKER_DOCKER_NETWORK_MODE` | str | `bridge` | Documentation/Compose hint for network mode. |
 
+## Registry env-var substitution
+
+The registry file (`BROKER_REGISTRY_PATH`) is expanded against the process
+environment **before** it is parsed (`broker/registry.py::_expand_env`). Any
+`${VAR}` or `${VAR:-default}` reference is replaced with the environment value;
+a referenced variable that is unset **and** has no default raises a fail-fast
+`ConfigError`. Only this exact `${...}` syntax is expanded — a literal `$` is
+left untouched.
+
+Use it to keep deployment-specific endpoints and host details **out of version
+control**: commit `registry.example.yaml` with placeholders and set the real
+value in a gitignored `.env`. For example, to target a remote (e.g. tailscale)
+Ollama daemon:
+
+```yaml
+# registry.yaml  (gitignored)
+- alias: remote-ollama
+  backend: ollama
+  runtime_model_id: qwen2.5:14b-instruct
+  base_url: ${OLLAMA_BASE_URL}        # value lives only in .env
+```
+
+```bash
+# .env  (gitignored)
+OLLAMA_BASE_URL=http://<daemon-host>:11434
+```
+
+`python -m broker` loads `.env` into the process environment first
+(`broker/__main__.py::_load_local_env`, stdlib-only and **non-overriding**), so
+non-`BROKER_`-prefixed variables like `OLLAMA_BASE_URL` reach the expander. An
+existing environment variable always wins, so Docker/Compose/secret injection
+overrides `.env`.
+
 ## Secrets
 
 Never commit a filled-in `.env`. Provide `BROKER_API_KEYS` via a Docker secret

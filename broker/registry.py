@@ -10,6 +10,8 @@ never introduce a new backend, executable, or path.
 from __future__ import annotations
 
 import json
+import os
+import re
 from enum import Enum
 from pathlib import Path
 
@@ -18,6 +20,35 @@ from pydantic import BaseModel, Field, field_validator
 from pydantic import ValidationError as PydanticValidationError
 
 from .errors import ConfigError
+
+# ``${VAR}`` or ``${VAR:-default}`` references expanded from the environment at
+# load time. This lets a committed registry stay free of secrets/host details
+# (e.g. ``base_url: ${OLLAMA_BASE_URL}``) while the real endpoint is injected via
+# env/.env/Docker secret. Only this exact syntax is expanded; a literal ``$`` is
+# left untouched.
+_ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _expand_env(text: str) -> str:
+    """Expand ``${VAR}`` / ``${VAR:-default}`` references against ``os.environ``.
+
+    Raises :class:`ConfigError` if a referenced variable is unset and no default
+    is supplied, so misconfiguration fails fast instead of silently producing an
+    empty/garbage URL.
+    """
+
+    def _sub(m: re.Match[str]) -> str:
+        name, default = m.group(1), m.group(2)
+        if name in os.environ:
+            return os.environ[name]
+        if default is not None:
+            return default
+        raise ConfigError(
+            f"registry references unset environment variable ${{{name}}}",
+            remediation=(f"set {name} (e.g. in .env) or give it a default: ${{{name}:-...}}"),
+        )
+
+    return _ENV_REF_RE.sub(_sub, text)
 
 
 class BackendType(str, Enum):
@@ -145,7 +176,7 @@ def load_registry(path: str, enabled_backends: set[str] | None = None) -> Regist
             f"registry file not found: {path!r}",
             remediation="set BROKER_REGISTRY_PATH to a valid registry file",
         )
-    text = p.read_text(encoding="utf-8")
+    text = _expand_env(p.read_text(encoding="utf-8"))
     try:
         if p.suffix in (".yaml", ".yml"):
             data = yaml.safe_load(text)

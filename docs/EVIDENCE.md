@@ -60,3 +60,62 @@ via Trivy `ignore-unfixed: true`, `severity: CRITICAL,HIGH`, `exit-code: 1` — 
 to fail only on vulnerabilities that have a fix available. `trivy-fixable.txt`
 shows zero such findings, so the gate passes. Operators should rebuild the image
 periodically so base-image fixes are picked up as they are released.
+
+---
+
+## Follow-up: live integration against the `remote-ollama-host` Ollama backend (over tailscale)
+
+**Deploy model.** The broker runs **locally** on this Mac and makes **outbound
+API calls only** to the Ollama daemon on the shared `remote-ollama-host` tailnet node. Nothing
+is deployed onto, copied to, or changed on `remote-ollama-host`. The backend address is set
+**only** in a gitignored local `.env` (`OLLAMA_BASE_URL`) and referenced from a
+gitignored local `registry.yaml` as `base_url: ${OLLAMA_BASE_URL}`; no host IP,
+model list, or key appears in any tracked file (verified: `git grep` for the IP,
+the CGNAT 100.64.0.0/10 range, and the test key all return no matches).
+
+**Env-var substitution** is performed by `broker/registry.py::_expand_env()`
+(`${VAR}` / `${VAR:-default}`, fail-fast on an unset variable with no default),
+wired into `load_registry()`. `broker/__main__.py::_load_local_env()` loads the
+local `.env` into the process environment (stdlib only, non-overriding) so the
+non-`BROKER_`-prefixed `OLLAMA_BASE_URL` reaches the expander; Docker/compose/
+secret injection still overrides it.
+
+Local config used for this run (gitignored): `BROKER_PORT=8077`,
+`BROKER_AUTH_ENABLED=true`, one API key, `registry.yaml` with aliases
+`echo-fake` (fake) and `remote-ollama` (ollama → runtime `qwen2.5:14b-instruct`,
+`idle_timeout_seconds: 15`). Broker launched with `python -m broker`.
+
+| # | Follow-up acceptance item | Observed evidence |
+|---|---------------------------|-------------------|
+| F1 | Ollama registry entry targets remote-ollama-host via env var; broker started locally | Startup log: `broker 0.1.0 started; 2 models registered (none loaded)`. `/healthz` → `{"status":"ok"}` 200; `/readyz` → `{"status":"ready","models_registered":2}` 200. `base_url` came from `${OLLAMA_BASE_URL}`. |
+| F2 | `GET /v1/models` lists the remote-ollama-host-backed alias | 200 with auth; `data[]` includes `{"id":"remote-ollama","backend":"ollama","runtime_model_id":"qwen2.5:14b-instruct","capabilities":{"streaming":true,"tools":true}}`. Without auth → 401 `authentication_error`. |
+| F3 | Non-streaming completion through the broker → real completion from remote-ollama-host | `POST /v1/chat/completions {"model":"remote-ollama",...,"stream":false}` → 200. Response `model:"remote-ollama"` (public alias), `choices[0].message.content` = `"Paris is the capital of France.\nBROKER_REMOTE_NONSTREAM_OK"`, `usage.total_tokens: 72`, `x-request-id` header present. |
+| F4 | Streaming completion through the broker → token stream from remote-ollama-host | `...{"stream":true}` → 200, `text/event-stream`. 19 `chat.completion.chunk` SSE frames with incremental `delta.content` tokens (`"1"," ","2",...`), final frame `finish_reason:"stop"`, then exactly one `data: [DONE]`. (Fixed a duplicate terminal `[DONE]`: `HTTPBackendAdapter.stream_chat` now drops the upstream sentinel and emits its own single one.) |
+| F5 | Lazy-load + idle-unload observed | `/status` **before** any request: `remote-ollama` state `unloaded`, `loaded_at: null`. **After** the chat: `remote-ollama` state `ready`, `loaded_at` set, while `echo-fake` stays `unloaded` (only the selected model loaded — no fallback). After ~15 s idle the sweeper unloads it — broker log: `idle unload: remote-ollama (idle 15.7s)` → `model remote-ollama unloaded`; a later request reloads it (`model remote-ollama ready`), confirming reversible lazy reload. Ollama's native unload is invoked via `POST /api/generate {"keep_alive":0}`. |
+| F6 | Evidence recorded; config stays secret-free; local-only commit | This section. `git grep` for the remote-ollama-host IP / tailnet range / API key over all tracked files → no matches; `.env` and `registry.yaml` are gitignored. Committed **locally only** (no push). |
+
+### Reproduce the remote-ollama-host integration
+
+```bash
+# 1. Point the broker at the Ollama daemon WITHOUT committing the address:
+cp .env.example .env                      # then set OLLAMA_BASE_URL + BROKER_API_KEYS
+cp registry.example.yaml registry.yaml    # keep base_url: ${OLLAMA_BASE_URL}
+#    (edit registry.yaml: set runtime_model_id to a model the daemon has)
+
+# 2. Run the broker locally (outbound calls only; nothing is deployed remotely):
+python -m broker
+
+# 3. Drive it (replace $KEY with your BROKER_API_KEYS value):
+curl -s localhost:8077/v1/models -H "Authorization: Bearer $KEY"
+curl -s localhost:8077/status    -H "Authorization: Bearer $KEY"   # remote-ollama: unloaded
+curl -s localhost:8077/v1/chat/completions -H "Authorization: Bearer $KEY" \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"remote-ollama","messages":[{"role":"user","content":"hi"}],"stream":false}'
+curl -s localhost:8077/status    -H "Authorization: Bearer $KEY"   # remote-ollama: ready
+#    wait > idle_timeout_seconds, then /status shows remote-ollama: unloaded again
+```
+
+> Security note: `remote-ollama-host` is a shared node owned by another tailnet user. The
+> broker only issues outbound OpenAI/Ollama API calls to it; idle-unload uses
+> Ollama's own `keep_alive: 0` (reversible — the model reloads on next request).
+

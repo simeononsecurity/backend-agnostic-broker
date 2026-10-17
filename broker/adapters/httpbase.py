@@ -253,8 +253,14 @@ class HTTPBackendAdapter(BackendAdapter):
                 async for line in resp.aiter_lines():
                     if cancel_event.is_set():
                         break
-                    if line:
-                        yield (line + "\n\n").encode()
+                    if not line:
+                        continue
+                    # Upstream (e.g. Ollama's OpenAI endpoint) emits its own
+                    # terminal `data: [DONE]`; drop it so we send exactly one,
+                    # appended below, and never a duplicate sentinel.
+                    if line.strip() == "data: [DONE]":
+                        continue
+                    yield (line + "\n\n").encode()
                 if not cancel_event.is_set():
                     yield b"data: [DONE]\n\n"
         except httpx.HTTPError as exc:

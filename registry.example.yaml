@@ -1,6 +1,11 @@
 # Example model registry for backend-agnostic-broker.
 # Copy to registry.yaml and edit. Requests select a model by its `alias`.
 # NOTE: paths/URLs below are placeholders — no real host details are committed.
+#
+# Env-var substitution: any `${VAR}` or `${VAR:-default}` is expanded from the
+# environment (e.g. .env / Docker secret) when the registry loads. Use it to keep
+# host IPs and endpoints OUT of version control — set them in a gitignored .env
+# instead. Example: a remote Ollama daemon reached via `${OLLAMA_BASE_URL}`.
 
 models:
   # ---- Fake backend (no external runtime; used for tests & smoke) ----------
@@ -13,10 +18,12 @@ models:
     supports_streaming: true
 
   # ---- Ollama (external daemon, native lazy loading via keep_alive) ---------
+  # base_url is injected from the environment so no host IP is committed. Point
+  # OLLAMA_BASE_URL at a local or remote (e.g. tailscale) Ollama daemon.
   - alias: llama3-ollama
     backend: ollama
     runtime_model_id: llama3.1:8b
-    base_url: http://127.0.0.1:11434
+    base_url: ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}
     context_limit: 8192
     output_limit: 2048
     idle_timeout_seconds: 300
