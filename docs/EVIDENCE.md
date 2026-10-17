@@ -125,7 +125,7 @@ curl -s localhost:8077/status    -H "Authorization: Bearer $KEY"   # remote-olla
 
 The remote-ollama-host follow-up changed source (`registry.py`, `__main__.py`,
 `adapters/httpbase.py`), tests, and docs, so every gate those changes could
-affect was re-run against commit `00c… (this follow-up)`:
+affect was re-run against commit `7e5ac12` (this follow-up):
 
 - **Gate 13/14/20 (tests)** — `ruff check` + `ruff format --check` clean;
   `python -m pytest -q` → **71 passed** (added env-var substitution tests, incl.
@@ -133,7 +133,7 @@ affect was re-run against commit `00c… (this follow-up)`:
   existing fake-backend / security / docs-example suites).
 - **Gate 15 (Docker build)** — `make docker-build` → `backend-agnostic-broker:0.1.0`,
   labels `org.opencontainers.image.version=0.1.0`,
-  `org.opencontainers.image.revision=<follow-up short sha>`.
+  `org.opencontainers.image.revision=7e5ac12` (== committed HEAD).
 - **Gate 16 (Compose)** — `make compose-config` → `base OK` + `gpu OK`.
 - **Container smoke** — `make docker-smoke` → `PASS` (`/healthz` ok, `/v1/models`
   401 without key / 200 with key listing `echo-fake`, `/v1/chat/completions`
