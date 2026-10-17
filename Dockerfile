@@ -21,7 +21,7 @@ LABEL org.opencontainers.image.title="backend-agnostic-broker" \
       org.opencontainers.image.description="OpenAI-compatible local AI broker" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.source="https://example.local/backend-agnostic-broker" \
+      org.opencontainers.image.source="https://github.com/simeononsecurity/backend-agnostic-broker/" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 ENV PYTHONUNBUFFERED=1 \
