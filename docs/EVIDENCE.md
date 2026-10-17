@@ -75,7 +75,9 @@ the CGNAT 100.64.0.0/10 range, and the test key all return no matches).
 
 **Env-var substitution** is performed by `broker/registry.py::_expand_env()`
 (`${VAR}` / `${VAR:-default}`, fail-fast on an unset variable with no default),
-wired into `load_registry()`. `broker/__main__.py::_load_local_env()` loads the
+applied to parsed **string values only** (never comments or keys, so the
+example's documentation comments that mention `${VAR}` load cleanly), and wired
+into `load_registry()`. `broker/__main__.py::_load_local_env()` loads the
 local `.env` into the process environment (stdlib only, non-overriding) so the
 non-`BROKER_`-prefixed `OLLAMA_BASE_URL` reaches the expander; Docker/compose/
 secret injection still overrides it.
@@ -118,4 +120,35 @@ curl -s localhost:8077/status    -H "Authorization: Bearer $KEY"   # remote-olla
 > Security note: `remote-ollama-host` is a shared node owned by another tailnet user. The
 > broker only issues outbound OpenAI/Ollama API calls to it; idle-unload uses
 > Ollama's own `keep_alive: 0` (reversible — the model reloads on next request).
+
+### Full-suite re-verification after the remote-ollama-host changes
+
+The remote-ollama-host follow-up changed source (`registry.py`, `__main__.py`,
+`adapters/httpbase.py`), tests, and docs, so every gate those changes could
+affect was re-run against commit `00c… (this follow-up)`:
+
+- **Gate 13/14/20 (tests)** — `ruff check` + `ruff format --check` clean;
+  `python -m pytest -q` → **71 passed** (added env-var substitution tests, incl.
+  a regression test that a `${VAR}` in a *comment* is not expanded, plus the
+  existing fake-backend / security / docs-example suites).
+- **Gate 15 (Docker build)** — `make docker-build` → `backend-agnostic-broker:0.1.0`,
+  labels `org.opencontainers.image.version=0.1.0`,
+  `org.opencontainers.image.revision=<follow-up short sha>`.
+- **Gate 16 (Compose)** — `make compose-config` → `base OK` + `gpu OK`.
+- **Container smoke** — `make docker-smoke` → `PASS` (`/healthz` ok, `/v1/models`
+  401 without key / 200 with key listing `echo-fake`, `/v1/chat/completions`
+  200) running the hardened container (`--read-only`, `--cap-drop ALL`,
+  `--security-opt no-new-privileges`, tmpfs cache/tmp, non-root).
+- **Gate 19 (container scan)** — Trivy with the documented fail-on-fixable policy
+  (`--ignore-unfixed --severity CRITICAL,HIGH --exit-code 1 --scanners vuln`)
+  exited **0** — zero fixable CRITICAL/HIGH.
+- **Gate 21/22** — `git grep` for the remote-ollama-host IP / CGNAT range / API key over all
+  tracked files → no matches; `.env` and `registry.yaml` stay gitignored; working
+  tree shows only intended project files.
+
+> Bugfix captured here: the first follow-up pass expanded `${VAR}` on the raw
+> registry *text*, which made the example's documentation comments (mentioning
+> `${OLLAMA_BASE_URL}` / `${VAR}`) fail to load when the var was unset — caught by
+> the container smoke test. Fixed by expanding parsed **string values only**;
+> regression-tested.
 

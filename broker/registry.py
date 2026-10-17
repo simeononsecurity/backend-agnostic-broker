@@ -25,11 +25,12 @@ from .errors import ConfigError
 # load time. This lets a committed registry stay free of secrets/host details
 # (e.g. ``base_url: ${OLLAMA_BASE_URL}``) while the real endpoint is injected via
 # env/.env/Docker secret. Only this exact syntax is expanded; a literal ``$`` is
-# left untouched.
+# left untouched. Expansion is applied to parsed string *values* only — never to
+# comments or keys — so documentation comments may safely mention ``${VAR}``.
 _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
-def _expand_env(text: str) -> str:
+def _expand_env_str(text: str) -> str:
     """Expand ``${VAR}`` / ``${VAR:-default}`` references against ``os.environ``.
 
     Raises :class:`ConfigError` if a referenced variable is unset and no default
@@ -49,6 +50,21 @@ def _expand_env(text: str) -> str:
         )
 
     return _ENV_REF_RE.sub(_sub, text)
+
+
+def _expand_env(obj: object) -> object:
+    """Recursively expand env references in string values of a parsed structure.
+
+    Only string leaves are expanded; dict keys, comments (already dropped by the
+    parser), and non-string scalars are returned unchanged.
+    """
+    if isinstance(obj, str):
+        return _expand_env_str(obj)
+    if isinstance(obj, list):
+        return [_expand_env(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _expand_env(v) for k, v in obj.items()}
+    return obj
 
 
 class BackendType(str, Enum):
@@ -176,7 +192,7 @@ def load_registry(path: str, enabled_backends: set[str] | None = None) -> Regist
             f"registry file not found: {path!r}",
             remediation="set BROKER_REGISTRY_PATH to a valid registry file",
         )
-    text = _expand_env(p.read_text(encoding="utf-8"))
+    text = p.read_text(encoding="utf-8")
     try:
         if p.suffix in (".yaml", ".yml"):
             data = yaml.safe_load(text)
@@ -195,6 +211,8 @@ def load_registry(path: str, enabled_backends: set[str] | None = None) -> Regist
             "registry must be a mapping with a top-level 'models' list",
             remediation="see registry.example.yaml",
         )
+    # Expand ${VAR} references in string *values* only (never comments/keys).
+    data = _expand_env(data)
     try:
         reg = Registry.model_validate(data)
     except PydanticValidationError as exc:

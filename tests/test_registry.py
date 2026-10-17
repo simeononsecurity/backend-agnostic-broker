@@ -86,3 +86,17 @@ def test_unset_env_var_without_default_fails_fast(tmp_path, monkeypatch):
     )
     with pytest.raises(ConfigError):
         load_registry(str(p))
+
+
+def test_env_ref_in_comment_is_not_expanded(tmp_path, monkeypatch):
+    # A ${VAR} mentioned in a YAML comment must NOT trigger expansion/fail-fast —
+    # only string values are expanded. Guards registry.example.yaml loading.
+    monkeypatch.delenv("UNSET_DOC_VAR", raising=False)
+    p = tmp_path / "comment.yaml"
+    p.write_text(
+        "# Example: point base_url at ${UNSET_DOC_VAR} via .env\n"
+        "models:\n"
+        "  - alias: a\n    backend: fake\n    runtime_model_id: m\n"
+    )
+    reg = load_registry(str(p))
+    assert reg.models[0].alias == "a"

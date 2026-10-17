@@ -10,10 +10,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Registry env-var substitution**: registry files now expand `${VAR}` /
   `${VAR:-default}` references from the environment at load time
-  (`broker/registry.py::_expand_env`), so deployment-specific endpoints (e.g. a
-  remote Ollama daemon's URL) stay out of version control — set them in a
-  gitignored `.env` and reference `base_url: ${OLLAMA_BASE_URL}`. A referenced
-  variable that is unset with no default fails fast.
+  (`broker/registry.py::_expand_env`), applied to parsed **string values only**
+  (never comments or keys), so deployment-specific endpoints (e.g. a remote
+  Ollama daemon's URL) stay out of version control — set them in a gitignored
+  `.env` and reference `base_url: ${OLLAMA_BASE_URL}`. A referenced variable that
+  is unset with no default fails fast.
 - **Local `.env` loader** in `python -m broker`
   (`broker/__main__.py::_load_local_env`, stdlib-only, non-overriding) so
   non-`BROKER_`-prefixed vars referenced by the registry are available; Docker/
