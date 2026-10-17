@@ -4,67 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - 2026-10-17
+
+Initial release.
 
 ### Added
 
-- **Getting Started guide** (`docs/getting-started.md`): end-to-end walkthrough —
-  install, run with the built-in fake backend, first requests (curl + OpenAI
-  Python SDK), lifecycle inspection, and connecting a remote Ollama backend over
-  the network. Host IPs/hostnames are redacted to placeholders. Linked from the
-  README (intro callout + docs table).
-
-## [0.2.0] - 2026-10-16
-
-Second local release (not published; commits and tag are local-only). Adds
-deployment-config portability (registry env-var substitution + local `.env`
-loader) and verified live remote-backend routing, with a streaming fix.
-
-### Added
-
-- **Registry env-var substitution**: registry files now expand `${VAR}` /
-  `${VAR:-default}` references from the environment at load time
-  (`broker/registry.py::_expand_env`), applied to parsed **string values only**
-  (never comments or keys), so deployment-specific endpoints (e.g. a remote
-  Ollama daemon's URL) stay out of version control — set them in a gitignored
-  `.env` and reference `base_url: ${OLLAMA_BASE_URL}`. A referenced variable that
-  is unset with no default fails fast.
-- **Local `.env` loader** in `python -m broker`
-  (`broker/__main__.py::_load_local_env`, stdlib-only, non-overriding) so
-  non-`BROKER_`-prefixed vars referenced by the registry are available; Docker/
-  compose/secret injection still takes precedence.
-- **Live remote-Ollama integration evidence**: verified the local broker routing to a
-  remote Ollama backend over tailscale (models list, non-streaming + streaming
-  completions, lazy-load, idle-unload). See `docs/EVIDENCE.md` → "Follow-up:
-  live integration against a remote Ollama backend".
-- **CI image publishing**: the `release` workflow builds, smoke-tests,
-  Trivy-scans, and then publishes the exact scanned image to GHCR
-  (`ghcr.io/<owner>/backend-agnostic-broker`, `:<version>` + `:latest`) on
-  semver tag push, using the repo-scoped `GITHUB_TOKEN` (no static registry
-  secret). The PR workflow runs lint/format/type/tests + Compose validation +
-  secret scan + image build/Trivy/SBOM on every pull request.
-
-### Fixed
-
-- **Streaming**: `HTTPBackendAdapter.stream_chat` now drops the upstream
-  `data: [DONE]` sentinel and emits exactly one terminal marker, preventing a
-  duplicate `[DONE]` when proxying backends (e.g. Ollama) that send their own.
-
-## [0.1.0] - 2026-10-16
-
-Initial local release (not published; commits are local-only).
-
-### Added
-
-- **Broker core**: OpenAI-compatible FastAPI service with lazy per-model
-  loading, an explicit lifecycle state machine
+- **Broker core**: OpenAI-compatible FastAPI service with lazy per-model loading,
+  an explicit lifecycle state machine
   (`unloaded → loading → ready → busy → unloading → failed → stopping`),
   per-model load locking, global + per-model concurrency limits, idle-unload
   sweep, and LRU eviction past `max_loaded_models`.
 - **Adapters**: uniform backend contract (`base.py`), shared HTTP adapter
   (`httpbase.py`), and adapters for `fake`, `ollama`, `vllm`, `llamacpp`, and
   `strata`. Ollama uses native `keep_alive`; vLLM/llama.cpp/Strata are
-  broker-managed child processes.
+  broker-managed child processes. Streaming proxies emit exactly one terminal
+  `data: [DONE]` (upstream duplicates are dropped).
 - **API**: `GET /v1/models`, `POST /v1/chat/completions` (streaming +
   non-streaming), `GET /healthz`, `GET /readyz`, `GET /status`, `GET /metrics`,
   and an optional Ollama-style `GET /api/tags`. API-key auth (Bearer /
@@ -72,24 +27,32 @@ Initial local release (not published; commits are local-only).
   limits, timeouts, and cancellation.
 - **Configuration**: typed, fail-fast `Settings` (env prefix `BROKER_`),
   declarative pydantic model registry (YAML/JSON), `.env.example`,
-  `registry.example.yaml`.
-- **Security**: executable allow-listing, model-path validation (traversal/
-  symlink-safe), request-flag rejection, no-shell argv construction, and an SSRF
-  guard; no silent fallback.
+  `registry.example.yaml`. Registry files expand `${VAR}` / `${VAR:-default}`
+  references from the environment at load time (parsed string values only), so
+  deployment-specific endpoints (e.g. a remote Ollama daemon's URL) stay out of
+  version control; `python -m broker` loads a local `.env` (stdlib-only,
+  non-overriding, overridable by real env / Docker secrets).
+- **Security**: executable allow-listing, model-path validation
+  (traversal/symlink-safe), request-flag rejection, no-shell argv construction,
+  and an SSRF guard (each registry `base_url` is auto-trusted); no silent
+  fallback.
 - **Docker**: hardened multi-stage image (non-root, read-only rootfs, dropped
   capabilities, healthcheck), base + GPU Compose files, Makefile, smoke test.
 - **CI**: fork-safe PR workflow (lint/format/type/tests, Compose validation,
-  secret scan, image build + smoke, SBOM, Trivy scan) and a gated release
-  workflow (no default image publishing).
-- **Docs**: README, architecture overview, ADRs (language choice, architecture
-  review), API reference, OpenAPI spec, configuration + registry references,
+  secret scan, image build + smoke, SBOM, Trivy scan) and a release workflow that
+  builds, smoke-tests, Trivy-scans, and then publishes the image to GHCR
+  (`:<version>` + `:latest`) on semver tag push via the repo-scoped
+  `GITHUB_TOKEN`.
+- **Docs**: README, Getting Started guide, architecture overview, ADRs, API
+  reference + OpenAPI spec, configuration + registry references,
   Docker/Compose/local-dev/testing/CI/secure-PR guides, backend lazy-loading
   guides, GPU/tensor-split/layer-split/MTP/cache guides, operations runbook,
   troubleshooting, security model, threat model, contributing guide, and an
-  acceptance-gate evidence ledger.
-- **Tests**: 67 unit/integration/API tests (config, registry, lifecycle,
-  adapters, API, auth, streaming, lazy-load, unload, security, docs-examples).
+  acceptance-gate evidence ledger (including a verified live remote-Ollama
+  integration: models list, non-streaming + streaming completions, lazy-load,
+  idle-unload).
+- **Tests**: 71 unit/integration/API tests (config, registry incl. env-var
+  substitution, lifecycle, adapters, API, auth, streaming, lazy-load, unload,
+  security, docs-examples).
 
-[Unreleased]: https://example.local/backend-agnostic-broker
-[0.2.0]: https://example.local/backend-agnostic-broker
-[0.1.0]: https://example.local/backend-agnostic-broker
+[0.1.0]: https://github.com/simeononsecurity/backend-agnostic-broker/releases/tag/v0.1.0

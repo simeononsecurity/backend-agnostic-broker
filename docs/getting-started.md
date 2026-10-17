@@ -37,7 +37,7 @@ Verify the install:
 
 ```bash
 .venv/bin/python -c "import broker; print('broker', broker.__version__)"
-# -> broker 0.2.0
+# -> broker 0.1.0
 ```
 
 ---
@@ -85,7 +85,7 @@ BROKER_ENABLED_BACKENDS='["fake"]' make run
 You should see a startup log like:
 
 ```
-broker 0.2.0 started; 1 model registered (none loaded)
+broker 0.1.0 started; 1 model registered (none loaded)
 Uvicorn running on http://0.0.0.0:8080
 ```
 
