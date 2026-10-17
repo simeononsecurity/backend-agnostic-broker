@@ -11,6 +11,10 @@ lifetime, and caching are all **configurable**.
 > URLs pass an SSRF allow-list, and there is **no silent fallback** to another
 > model.
 
+**New here? → [Getting Started guide](docs/getting-started.md)** — install, make
+your first request against the built-in fake backend, then connect a real Ollama
+backend over the network, all with copy-paste examples.
+
 ## Features
 
 - OpenAI-compatible API: `GET /v1/models`, `POST /v1/chat/completions`
@@ -70,6 +74,7 @@ docker compose up -d --build
 
 | Topic | Doc |
 |---|---|
+| **Getting started** | [docs/getting-started.md](docs/getting-started.md) |
 | Architecture overview | [docs/architecture.md](docs/architecture.md) |
 | ADRs | [docs/adr/](docs/adr/) |
 | API reference | [docs/api-reference.md](docs/api-reference.md) · [OpenAPI](docs/openapi.yaml) |

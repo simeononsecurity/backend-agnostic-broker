@@ -6,6 +6,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Getting Started guide** (`docs/getting-started.md`): end-to-end walkthrough —
+  install, run with the built-in fake backend, first requests (curl + OpenAI
+  Python SDK), lifecycle inspection, and connecting a remote Ollama backend over
+  the network. Host IPs/hostnames are redacted to placeholders. Linked from the
+  README (intro callout + docs table).
+
 ## [0.2.0] - 2026-10-16
 
 Second local release (not published; commits and tag are local-only). Adds
