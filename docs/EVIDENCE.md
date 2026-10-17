@@ -63,14 +63,14 @@ periodically so base-image fixes are picked up as they are released.
 
 ---
 
-## Follow-up: live integration against the `remote-ollama-host` Ollama backend (over tailscale)
+## Follow-up: live integration against a remote Ollama backend (over tailscale)
 
 **Deploy model.** The broker runs **locally** on this Mac and makes **outbound
-API calls only** to the Ollama daemon on the shared `remote-ollama-host` tailnet node. Nothing
-is deployed onto, copied to, or changed on `remote-ollama-host`. The backend address is set
+API calls only** to the Ollama daemon on a shared remote tailnet node. Nothing
+is deployed onto, copied to, or changed on the remote node. The backend address is set
 **only** in a gitignored local `.env` (`OLLAMA_BASE_URL`) and referenced from a
-gitignored local `registry.yaml` as `base_url: ${OLLAMA_BASE_URL}`; no host IP,
-model list, or key appears in any tracked file (verified: `git grep` for the IP,
+gitignored local `registry.yaml` as `base_url: ${OLLAMA_BASE_URL}`; no host IP, hostname, model list, or key appears
+in any tracked file (verified: `git grep` for the IP,
 the CGNAT 100.64.0.0/10 range, and the test key all return no matches).
 
 **Env-var substitution** is performed by `broker/registry.py::_expand_env()`
@@ -89,14 +89,14 @@ Local config used for this run (gitignored): `BROKER_PORT=8077`,
 
 | # | Follow-up acceptance item | Observed evidence |
 |---|---------------------------|-------------------|
-| F1 | Ollama registry entry targets remote-ollama-host via env var; broker started locally | Startup log: `broker 0.1.0 started; 2 models registered (none loaded)`. `/healthz` → `{"status":"ok"}` 200; `/readyz` → `{"status":"ready","models_registered":2}` 200. `base_url` came from `${OLLAMA_BASE_URL}`. |
-| F2 | `GET /v1/models` lists the remote-ollama-host-backed alias | 200 with auth; `data[]` includes `{"id":"remote-ollama","backend":"ollama","runtime_model_id":"qwen2.5:14b-instruct","capabilities":{"streaming":true,"tools":true}}`. Without auth → 401 `authentication_error`. |
-| F3 | Non-streaming completion through the broker → real completion from remote-ollama-host | `POST /v1/chat/completions {"model":"remote-ollama",...,"stream":false}` → 200. Response `model:"remote-ollama"` (public alias), `choices[0].message.content` = `"Paris is the capital of France.\nBROKER_REMOTE_NONSTREAM_OK"`, `usage.total_tokens: 72`, `x-request-id` header present. |
-| F4 | Streaming completion through the broker → token stream from remote-ollama-host | `...{"stream":true}` → 200, `text/event-stream`. 19 `chat.completion.chunk` SSE frames with incremental `delta.content` tokens (`"1"," ","2",...`), final frame `finish_reason:"stop"`, then exactly one `data: [DONE]`. (Fixed a duplicate terminal `[DONE]`: `HTTPBackendAdapter.stream_chat` now drops the upstream sentinel and emits its own single one.) |
+| F1 | Ollama registry entry targets the remote host via env var; broker started locally | Startup log: `broker 0.1.0 started; 2 models registered (none loaded)`. `/healthz` → `{"status":"ok"}` 200; `/readyz` → `{"status":"ready","models_registered":2}` 200. `base_url` came from `${OLLAMA_BASE_URL}`. |
+| F2 | `GET /v1/models` lists the remote-backed alias | 200 with auth; `data[]` includes `{"id":"remote-ollama","backend":"ollama","runtime_model_id":"qwen2.5:14b-instruct","capabilities":{"streaming":true,"tools":true}}`. Without auth → 401 `authentication_error`. |
+| F3 | Non-streaming completion through the broker → real completion from the remote host | `POST /v1/chat/completions {"model":"remote-ollama",...,"stream":false}` → 200. Response `model:"remote-ollama"` (public alias), `choices[0].message.content` = `"Paris is the capital of France.\nBROKER_REMOTE_NONSTREAM_OK"`, `usage.total_tokens: 72`, `x-request-id` header present. |
+| F4 | Streaming completion through the broker → token stream from the remote host | `...{"stream":true}` → 200, `text/event-stream`. 19 `chat.completion.chunk` SSE frames with incremental `delta.content` tokens (`"1"," ","2",...`), final frame `finish_reason:"stop"`, then exactly one `data: [DONE]`. (Fixed a duplicate terminal `[DONE]`: `HTTPBackendAdapter.stream_chat` now drops the upstream sentinel and emits its own single one.) |
 | F5 | Lazy-load + idle-unload observed | `/status` **before** any request: `remote-ollama` state `unloaded`, `loaded_at: null`. **After** the chat: `remote-ollama` state `ready`, `loaded_at` set, while `echo-fake` stays `unloaded` (only the selected model loaded — no fallback). After ~15 s idle the sweeper unloads it — broker log: `idle unload: remote-ollama (idle 15.7s)` → `model remote-ollama unloaded`; a later request reloads it (`model remote-ollama ready`), confirming reversible lazy reload. Ollama's native unload is invoked via `POST /api/generate {"keep_alive":0}`. |
-| F6 | Evidence recorded; config stays secret-free; local-only commit | This section. `git grep` for the remote-ollama-host IP / tailnet range / API key over all tracked files → no matches; `.env` and `registry.yaml` are gitignored. Committed **locally only** (no push). |
+| F6 | Evidence recorded; config stays secret-free; local-only commit | This section. `git grep` for the remote host IP / tailnet range / API key over all tracked files → no matches; `.env` and `registry.yaml` are gitignored. Committed **locally only** (no push). |
 
-### Reproduce the remote-ollama-host integration
+### Reproduce the remote-Ollama integration
 
 ```bash
 # 1. Point the broker at the Ollama daemon WITHOUT committing the address:
@@ -117,13 +117,13 @@ curl -s localhost:8077/status    -H "Authorization: Bearer $KEY"   # remote-olla
 #    wait > idle_timeout_seconds, then /status shows remote-ollama: unloaded again
 ```
 
-> Security note: `remote-ollama-host` is a shared node owned by another tailnet user. The
+> Security note: the remote Ollama daemon runs on a shared node owned by another tailnet user. The
 > broker only issues outbound OpenAI/Ollama API calls to it; idle-unload uses
 > Ollama's own `keep_alive: 0` (reversible — the model reloads on next request).
 
-### Full-suite re-verification after the remote-ollama-host changes
+### Full-suite re-verification after the remote-backend changes
 
-The remote-ollama-host follow-up changed source (`registry.py`, `__main__.py`,
+The remote-backend follow-up changed source (`registry.py`, `__main__.py`,
 `adapters/httpbase.py`), tests, and docs, so every gate those changes could
 affect was re-run against commit `7e5ac12` (this follow-up):
 
@@ -142,7 +142,7 @@ affect was re-run against commit `7e5ac12` (this follow-up):
 - **Gate 19 (container scan)** — Trivy with the documented fail-on-fixable policy
   (`--ignore-unfixed --severity CRITICAL,HIGH --exit-code 1 --scanners vuln`)
   exited **0** — zero fixable CRITICAL/HIGH.
-- **Gate 21/22** — `git grep` for the remote-ollama-host IP / CGNAT range / API key over all
+- **Gate 21/22** — `git grep` for the remote host IP / CGNAT range / API key over all
   tracked files → no matches; `.env` and `registry.yaml` stay gitignored; working
   tree shows only intended project files.
 

@@ -33,10 +33,10 @@ loader) and verified live remote-backend routing, with a streaming fix.
   (`broker/__main__.py::_load_local_env`, stdlib-only, non-overriding) so
   non-`BROKER_`-prefixed vars referenced by the registry are available; Docker/
   compose/secret injection still takes precedence.
-- **Live remote-ollama-host integration evidence**: verified the local broker routing to a
+- **Live remote-Ollama integration evidence**: verified the local broker routing to a
   remote Ollama backend over tailscale (models list, non-streaming + streaming
   completions, lazy-load, idle-unload). See `docs/EVIDENCE.md` → "Follow-up:
-  live integration against the `remote-ollama-host` Ollama backend".
+  live integration against a remote Ollama backend".
 - **CI image publishing**: the `release` workflow builds, smoke-tests,
   Trivy-scans, and then publishes the exact scanned image to GHCR
   (`ghcr.io/<owner>/backend-agnostic-broker`, `:<version>` + `:latest`) on
