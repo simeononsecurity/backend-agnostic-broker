@@ -29,6 +29,12 @@ loader) and verified live remote-backend routing, with a streaming fix.
   remote Ollama backend over tailscale (models list, non-streaming + streaming
   completions, lazy-load, idle-unload). See `docs/EVIDENCE.md` → "Follow-up:
   live integration against the `remote-ollama-host` Ollama backend".
+- **CI image publishing**: the `release` workflow builds, smoke-tests,
+  Trivy-scans, and then publishes the exact scanned image to GHCR
+  (`ghcr.io/<owner>/backend-agnostic-broker`, `:<version>` + `:latest`) on
+  semver tag push, using the repo-scoped `GITHUB_TOKEN` (no static registry
+  secret). The PR workflow runs lint/format/type/tests + Compose validation +
+  secret scan + image build/Trivy/SBOM on every pull request.
 
 ### Fixed
 
