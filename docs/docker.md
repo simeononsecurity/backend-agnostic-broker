@@ -15,10 +15,35 @@ Build args become OCI labels: `org.opencontainers.image.version` (`VERSION`) and
 `org.opencontainers.image.revision` (`VCS_REF`), plus title/description/source/
 licenses. Inspect with `docker inspect backend-agnostic-broker:0.1.0`.
 
+## Image variants (lean vs bundled router LLM)
+
+Two variants are published per release:
+
+| Tag | Build | Contents | Size |
+|-----|-------|----------|------|
+| `:X.Y.Z`, `:latest` | default | broker only; `auto` uses the heuristic router | ~272 MB |
+| `:X.Y.Z-llm`, `:latest-llm` | `--build-arg WITH_ROUTER_LLM=1` | + CPU `llama-cpp-python` + a small Q4 GGUF at `/models/router.gguf` | ~1.35 GB |
+
+```bash
+# Self-contained LLM router (CPU) baked in:
+docker build --build-arg WITH_ROUTER_LLM=1 -t backend-agnostic-broker:llm .
+# Override the bundled model if you want a different one:
+docker build --build-arg WITH_ROUTER_LLM=1 \
+  --build-arg ROUTER_MODEL_URL=https://.../your-model.Q4_K_M.gguf -t broker:llm .
+```
+
+The lean image's `auto` alias still works (zero-dependency heuristic). The `-llm`
+image sets `BROKER_ROUTER_MODEL_PATH=/models/router.gguf` so `router_backend=auto`
+uses the GGUF classifier; if the file is absent it falls back to the heuristic.
+See [auto-router.md](auto-router.md).
+
 ## Image design
 
-- **Multi-stage**: a `builder` stage compiles wheels from `requirements.txt`; the
-  `runtime` stage installs them `--no-index` from the local wheel dir.
+- **Multi-stage**: a `pydeps` stage installs `requirements.txt` into a relocatable
+  `/install` prefix; an optional `router` stage compiles `llama-cpp-python` and
+  fetches the GGUF; the `runtime` stage copies only the installed packages (and,
+  for the LLM variant, the model) — so no wheels layer or compiler ships in the
+  final image.
 - **Minimal runtime**: `python:3.11-slim`; `pip`/`setuptools`/`wheel` are
   uninstalled from the runtime layer to reduce the vulnerability surface.
 - **Non-root**: a system user/group `broker` (uid/gid `10001`); `ENTRYPOINT

@@ -55,7 +55,7 @@ jobs:
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
           echo "Resolved image: ${IMAGE}:${VER} (+ :latest)"
 
-      - name: "Build immutable image (load locally, no push yet)"
+      - name: "Build lean image (load locally, no push yet)"
         uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
         with:
           context: .
@@ -68,14 +68,14 @@ jobs:
             VERSION=${{ steps.meta.outputs.version }}
             VCS_REF=${{ github.sha }}
 
-      - name: "Container smoke test"
+      - name: "Container smoke test (lean)"
         # Pass the ref via env (not inline ${{ }}) so a crafted tag name cannot
         # inject into the shell.
         env:
           IMAGE_REF: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
         run: bash scripts/docker_smoke.sh "$IMAGE_REF"
 
-      - name: "Trivy gate (fail on fixable CRITICAL/HIGH)"
+      - name: "Trivy gate — lean (fail on fixable CRITICAL/HIGH)"
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
@@ -83,8 +83,35 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
 
+      - name: "Build LLM image (bundled CPU router classifier; load locally)"
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-llm
+            ${{ steps.meta.outputs.image }}:latest-llm
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            VCS_REF=${{ github.sha }}
+            WITH_ROUTER_LLM=1
+
+      - name: "Container smoke test (LLM)"
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-llm
+        run: bash scripts/docker_smoke.sh "$IMAGE_REF"
+
+      - name: "Trivy gate — LLM (fail on fixable CRITICAL/HIGH)"
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-llm
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
       # Publish only on a tag push, or on manual dispatch with publish=true.
-      # The image pushed is the exact one that passed smoke + Trivy above.
+      # The images pushed are the exact ones that passed smoke + Trivy above.
       - name: "Log in to GHCR"
         if: ${{ github.event_name == 'push' || inputs.publish }}
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
@@ -96,7 +123,7 @@ jobs:
           # creation / package-access issues with the repo token.
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: "Push image to GHCR (version + latest)"
+      - name: "Push images to GHCR (lean + llm, version + latest)"
         if: ${{ github.event_name == 'push' || inputs.publish }}
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
@@ -105,4 +132,6 @@ jobs:
           set -euo pipefail
           docker push "${IMAGE}:${VERSION}"
           docker push "${IMAGE}:latest"
-          echo "Published ${IMAGE}:${VERSION} and :latest"
+          docker push "${IMAGE}:${VERSION}-llm"
+          docker push "${IMAGE}:latest-llm"
+          echo "Published ${IMAGE}: ${VERSION}, latest, ${VERSION}-llm, latest-llm"

@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-10-18
 
 ### Added
 
@@ -25,6 +25,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     cache size, and recent decisions. Dockerfile `--build-arg WITH_ROUTER_LLM=1`
     bundles the CPU wheel + a small Q4 GGUF for a self-contained classifier.
   - Docs: [docs/auto-router.md](docs/auto-router.md); `BROKER_ROUTER_*` settings.
+
+### Changed
+
+- **Dockerfile refactored to 3 stages** (`pydeps` → `router` → `runtime`): the
+  compile toolchain and build wheels now live only in build stages and the final
+  image receives just the installed packages (relocatable prefix), so there is no
+  wheels layer or compiler in the published image. Lean image ≈ 272 MB.
+- **Release workflow publishes two image variants** on each tag: lean
+  (`:X.Y.Z`, `:latest`) and the bundled-LLM router (`:X.Y.Z-llm`, `:latest-llm`,
+  built with `WITH_ROUTER_LLM=1`). The LLM variant installs `libgomp1` for the
+  compiled llama.cpp runtime and bundles a small Q4 GGUF.
 
 ## [0.2.0] - 2026-10-17
 
