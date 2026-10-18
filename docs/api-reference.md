@@ -73,6 +73,24 @@ curl -s http://127.0.0.1:8080/readyz
 # {"status":"ready","models_registered":1}
 ```
 
+### `GET /healthz/backends` — per-backend liveness (auth)
+
+Live, **non-loading** liveness of every backend member. Ollama daemons are probed
+via `GET /api/tags`; broker-managed runtimes (vLLM/llama.cpp/Strata) are probed
+only while their process is already running — an unloaded managed model reports
+`not_loaded` (not a failure, and never a spawn). Returns `200` with an overall
+`status` of `ok` or `degraded`.
+
+```bash
+curl -s -H "Authorization: Bearer my-key" http://127.0.0.1:8080/healthz/backends
+# {"status":"ok","backends":[{"alias":"echo-fake","model":"echo-fake","backend":"fake",
+#   "state":"ready","status":"ok","detail":"ready","inflight":0}, ...]}
+```
+
+A background probe (`BROKER_HEALTH_PROBE_*`) runs the same checks periodically and
+marks a `ready` model `failed` if its backend has gone away, so the next request
+reloads/reroutes. See [routing-and-health.md](routing-and-health.md).
+
 ### `GET /metrics` — Prometheus (no auth)
 
 Prometheus exposition when `BROKER_METRICS_ENABLED=true`; otherwise `404`.
@@ -80,8 +98,10 @@ Exposes request counts, latency, in-flight gauge, and loaded-model gauge.
 
 ### `GET /status` — lifecycle + GPU (auth)
 
-Per-model snapshot (state, inflight, pid, idle seconds, last error) and adapter
-status (endpoint, GPU allocation), plus loaded/limit counts.
+Per-model snapshot (state, inflight, pid, idle seconds, last error, live
+`healthy`/`last_health`, public `model` name) and adapter status (endpoint, GPU
+allocation), plus a `pools` map (public name → member aliases) and loaded/limit
+counts.
 
 ```bash
 curl -s -H "Authorization: Bearer my-key" http://127.0.0.1:8080/status
@@ -93,20 +113,36 @@ curl -s -H "Authorization: Bearer my-key" http://127.0.0.1:8080/status
 curl -s -H "Authorization: Bearer my-key" http://127.0.0.1:8080/v1/models
 ```
 
-Returns `{"object":"list","data":[ ... ]}` where each entry includes `id`
-(alias), `backend`, `runtime_model_id`, `context_limit`, `output_limit`,
-`capabilities` (streaming/tools/vision), `gpu`, and `mtp`.
+Returns `{"object":"list","data":[ ... ]}` — **one entry per public model name**
+(a load-balancing pool is collapsed to a single entry). Each entry includes `id`
+(public name), `backend`, `capabilities` (streaming/tools/vision), `context_limit`,
+`output_limit`, and `pool`/`pool_size`/`pool_members`. Standalone models also carry
+`runtime_model_id`, `gpu`, and `mtp`; pooled entries report `backend: "pool"` with
+capabilities ANDed and limits min-ed across members.
 
 ### `GET /api/tags` — Ollama-style discovery (auth, optional compat)
 
 Returns `{"models":[{"name","model","details":{"family","context_length"}}]}`
 for clients that speak Ollama's discovery contract.
 
+### `GET /api/ps` — Ollama residency passthrough (auth)
+
+Aggregates Ollama's `/api/ps` across all configured Ollama daemons (deduplicated
+by base URL) — the models **actually resident in memory**, distinct from the
+broker's lifecycle state. Non-loading. Returns `{"daemons":[{"base_url", "models"|"error"}]}`;
+empty `daemons` when no Ollama backends are configured.
+
 ### `POST /v1/chat/completions` — chat (auth)
 
 Request body is OpenAI-shaped. Required: `model`, `messages`. Optional:
 `stream`, `temperature`, `max_tokens`, `tools`, `tool_choice`; unknown OpenAI
 fields are passed through to the backend.
+
+If `model` names a **pool** (multiple registry members), the broker routes to the
+least-busy healthy member and **fails over** to another member if one is
+unavailable (before the first byte for streams). The response `model` is the
+public name you requested. There is no silent fallback to a *different* model.
+See [routing-and-health.md](routing-and-health.md).
 
 Non-streaming:
 

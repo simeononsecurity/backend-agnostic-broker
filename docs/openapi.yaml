@@ -26,6 +26,47 @@ paths:
           content:
             application/json:
               schema: {}
+  /healthz/backends:
+    get:
+      summary: Healthz Backends
+      description: 'Live, non-loading liveness of every backend member.
+
+
+        Ollama daemons are probed via GET /api/tags; broker-managed runtimes are
+
+        probed only while their process is running (unloaded = ``not_loaded``,
+
+        never a spawn). Returns 200 with ``status: ok|degraded``.'
+      operationId: healthz_backends_healthz_backends_get
+      parameters:
+      - name: authorization
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Authorization
+      - name: x-api-key
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Api-Key
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /status:
     get:
       summary: Status
@@ -107,6 +148,42 @@ paths:
       summary: Ollama Tags
       description: Optional Ollama-style discovery compatibility endpoint.
       operationId: ollama_tags_api_tags_get
+      parameters:
+      - name: authorization
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Authorization
+      - name: x-api-key
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Api-Key
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/ps:
+    get:
+      summary: Ollama Ps
+      description: "Passthrough of Ollama ``/api/ps`` across daemons \u2014 what is\
+        \ actually\nresident in memory, distinct from the broker's lifecycle state.\
+        \ Querying\nthis never loads a model."
+      operationId: ollama_ps_api_ps_get
       parameters:
       - name: authorization
         in: header

@@ -9,6 +9,11 @@
   any `startup_command` (Ollama manages its own process). The `base_url` is
   SSRF-validated.
 - **Readiness / health.** Polls `GET {base_url}/api/tags`; ready when `200`.
+  This is also the non-loading liveness probe used by `GET /healthz/backends`
+  and the background health probe (it lists models without loading any).
+- **Residency.** `GET {base_url}/api/ps` (models currently resident) is exposed,
+  deduplicated across daemons, via the broker's `GET /api/ps` — a non-loading
+  view of real VRAM/RAM usage, distinct from the broker's lifecycle state.
 - **Chat / streaming.** Forwarded to `{base_url}/v1/chat/completions`
   (OpenAI-compatible), streaming and non-streaming, via the shared HTTP adapter.
   The upstream `model` is pinned to `runtime_model_id`.

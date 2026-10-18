@@ -18,7 +18,8 @@ At startup the broker rejects:
 - a `registry_path` that does not exist.
 
 `log_format` must be `json` or `text`; `load_concurrency_policy` must be `queue`
-or `reject`; `gpu_memory_fraction` (per model) must be in `(0, 1]`.
+or `reject`; `route_strategy` must be `least_busy` or `round_robin`;
+`gpu_memory_fraction` (per model) must be in `(0, 1]`.
 
 ## Server
 
@@ -57,6 +58,27 @@ or `reject`; `gpu_memory_fraction` (per model) must be in `(0, 1]`.
 | `BROKER_SHUTDOWN_TIMEOUT_SECONDS` | float | `30` | Graceful shutdown budget. |
 | `BROKER_IDLE_SWEEP_INTERVAL_SECONDS` | float | `5` | Idle-sweep cadence. |
 | `BROKER_LOAD_CONCURRENCY_POLICY` | str | `queue` | `queue` (wait) or `reject` (429) when per-model concurrency is saturated. |
+
+## Routing (load balancing across pool members)
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_ROUTE_STRATEGY` | str | `least_busy` | How requests spread across the members of a pool (registry entries sharing a `pool` name). `least_busy` = fewest in-flight (round-robin tie-break); `round_robin` = rotate regardless. Failover across members is automatic. |
+
+See [routing-and-health.md](routing-and-health.md).
+
+## Health probing (non-loading)
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_HEALTH_PROBE_ENABLED` | bool | `true` | Run a periodic background liveness probe (never loads a model). |
+| `BROKER_HEALTH_PROBE_INTERVAL_SECONDS` | float | `30` | Seconds between probe sweeps. |
+| `BROKER_HEALTH_PROBE_TIMEOUT_SECONDS` | float | `5` | Per-probe timeout. |
+
+Probes use non-loading calls (Ollama `GET /api/tags`; managed runtimes only while
+running) and mark a `ready` model `failed` if its backend has gone away, so the
+next request reloads/reroutes. Surfaced at `GET /healthz/backends` and in
+`GET /status`.
 
 ## Limits
 
