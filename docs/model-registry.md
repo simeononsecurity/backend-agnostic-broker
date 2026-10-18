@@ -23,7 +23,8 @@ and toggle backends via config. Duplicate aliases are rejected.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `alias` | str | _(required)_ | Public model id used by clients (`model` in requests, `id` in `/v1/models`). |
+| `alias` | str | _(required)_ | Unique member id. Also the public model id **unless** `pool` is set. |
+| `pool` | str? | _(none)_ | Load-balancing pool name. Entries sharing a `pool` form one logical model clients call by the pool name; requests route across members with failover. See [routing-and-health.md](routing-and-health.md). |
 | `backend` | enum | _(required)_ | One of `fake`, `ollama`, `vllm`, `llamacpp`, `strata`. |
 | `runtime_model_id` | str | _(required)_ | The model id the backend runtime uses. |
 | `model_path` | str? | _(none)_ | Local model path (required by file-based runtimes); validated against `BROKER_ALLOWED_MODEL_ROOTS`. |

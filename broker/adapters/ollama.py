@@ -28,6 +28,7 @@ from .httpbase import HTTPBackendAdapter
 
 class OllamaAdapter(HTTPBackendAdapter):
     name = "ollama"
+    external_daemon = True
     chat_path = "/v1/chat/completions"
 
     def validate_config(self) -> None:
@@ -110,6 +111,18 @@ class OllamaAdapter(HTTPBackendAdapter):
         if self._client:
             await self._client.aclose()
             self._client = None
+
+    async def ps(self) -> dict[str, Any]:
+        """Return Ollama's ``/api/ps`` — models currently resident in memory.
+
+        This is a non-loading introspection call: it reports what the daemon
+        already has in VRAM/RAM and never causes a model to load.
+        """
+        url = self._validated_url("/api/ps")
+        client = self._client_or_new()
+        resp = await client.get(url, timeout=5)
+        resp.raise_for_status()
+        return resp.json()
 
     async def collect_status(self) -> dict[str, Any]:
         status = await super().collect_status()

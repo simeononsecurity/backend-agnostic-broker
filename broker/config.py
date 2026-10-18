@@ -55,6 +55,20 @@ class Settings(BaseSettings):
     # concurrency policy when a model is loading: "queue" waits, "reject" 429s.
     load_concurrency_policy: str = "queue"
 
+    # --- Routing (load balancing across pool members) ---
+    # "least_busy": route to the pool member with the fewest in-flight requests
+    # (round-robin tie-break). "round_robin": rotate members regardless of load.
+    route_strategy: str = "least_busy"
+
+    # --- Background health probing (non-loading) ---
+    # Periodically liveness-probe active models without loading any: Ollama via
+    # GET /api/tags, broker-managed runtimes only while their process is running.
+    # A READY model whose backend has gone away is marked FAILED so the next
+    # request reloads/reroutes instead of erroring mid-flight.
+    health_probe_enabled: bool = True
+    health_probe_interval_seconds: float = 30.0
+    health_probe_timeout_seconds: float = 5.0
+
     # --- Limits ---
     max_request_bytes: int = 2_000_000
 
@@ -95,6 +109,13 @@ class Settings(BaseSettings):
     def _policy(cls, v: str) -> str:
         if v not in ("queue", "reject"):
             raise ValueError("load_concurrency_policy must be 'queue' or 'reject'")
+        return v
+
+    @field_validator("route_strategy")
+    @classmethod
+    def _route(cls, v: str) -> str:
+        if v not in ("least_busy", "round_robin"):
+            raise ValueError("route_strategy must be 'least_busy' or 'round_robin'")
         return v
 
     def validate_runtime(self) -> None:

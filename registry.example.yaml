@@ -134,3 +134,26 @@ models:
     mtp:
       enabled: false
     supports_streaming: true
+
+  # ---- Load-balancing POOL (multiple hosts serving one logical model) -------
+  # Give several entries the SAME `pool` name and clients call that pool name as
+  # the model. The broker routes each request to the least-busy healthy member
+  # and fails over if one backend is down — so N concurrent callers spread
+  # across your hosts instead of hammering one. Members may be different hosts or
+  # even different backends; keep real host IPs in env vars, not committed here.
+  - alias: chat-pool-node-1
+    backend: ollama
+    runtime_model_id: llama3.1:8b
+    pool: chat             # <- clients request model: "chat"
+    base_url: ${OLLAMA_URL_1:-http://127.0.0.1:11434}
+    readiness: { kind: http, path: /api/tags, expect_status: 200 }
+    idle_timeout_seconds: 300
+    supports_streaming: true
+  - alias: chat-pool-node-2
+    backend: ollama
+    runtime_model_id: llama3.1:8b
+    pool: chat             # <- same pool -> same public model name
+    base_url: ${OLLAMA_URL_2:-http://127.0.0.1:11434}
+    readiness: { kind: http, path: /api/tags, expect_status: 200 }
+    idle_timeout_seconds: 300
+    supports_streaming: true

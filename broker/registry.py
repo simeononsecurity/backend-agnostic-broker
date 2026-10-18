@@ -128,6 +128,11 @@ class ModelEntry(BaseModel):
     backend: BackendType
     runtime_model_id: str
     model_path: str | None = None
+    # Optional load-balancing pool. When set, every entry sharing this pool name
+    # is a member of one logical model that clients call by the POOL name; the
+    # broker routes each request to one member (least-busy) with failover. When
+    # unset, the entry stands alone and is addressed by its ``alias``.
+    pool: str | None = None
     context_limit: int = 8192
     output_limit: int = 2048
 
@@ -159,6 +164,19 @@ class ModelEntry(BaseModel):
             raise ValueError("must be non-empty")
         return v.strip()
 
+    @field_validator("pool")
+    @classmethod
+    def _pool(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+    @property
+    def public_name(self) -> str:
+        """The name clients address this entry by (pool if pooled, else alias)."""
+        return self.pool or self.alias
+
     @field_validator("tensor_split", check_fields=False)
     @classmethod
     def _noop(cls, v):  # pragma: no cover - placeholder for forward-compat
@@ -178,6 +196,27 @@ class Registry(BaseModel):
                 )
             out[m.alias] = m
         return out
+
+    def public_groups(self) -> dict[str, list[ModelEntry]]:
+        """Group entries by the public name clients address (pool or alias).
+
+        A name with more than one member is a load-balancing pool; every member
+        of such a group must declare ``pool`` explicitly, so a standalone
+        ``alias`` can never silently collide with another entry's pool name.
+        """
+        groups: dict[str, list[ModelEntry]] = {}
+        for m in self.models:
+            groups.setdefault(m.public_name, []).append(m)
+        for name, members in groups.items():
+            if len(members) > 1 and any(not m.pool for m in members):
+                raise ConfigError(
+                    f"name {name!r} is used as both a standalone alias and a pool",
+                    remediation=(
+                        "give the standalone entry a unique alias, or set "
+                        f"pool: {name} on every member of the pool"
+                    ),
+                )
+        return groups
 
 
 def load_registry(path: str, enabled_backends: set[str] | None = None) -> Registry:
@@ -223,6 +262,7 @@ def load_registry(path: str, enabled_backends: set[str] | None = None) -> Regist
 
     if enabled_backends is not None:
         reg = Registry(models=[m for m in reg.models if m.backend.value in enabled_backends])
-    # Trigger duplicate-alias check eagerly.
+    # Trigger duplicate-alias + pool-grouping checks eagerly.
     reg.by_alias()
+    reg.public_groups()
     return reg

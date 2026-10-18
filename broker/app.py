@@ -90,12 +90,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     registry = load_registry(settings.registry_path, set(settings.enabled_backends))
     manager = ModelManager(registry, settings)
     manager.validate_all()  # fail-fast; no models load here
-    if settings.default_model and settings.default_model not in manager.models:
+    if (
+        settings.default_model
+        and settings.default_model not in manager.pools
+        and settings.default_model not in manager.models
+    ):
         raise ValidationError(f"default_model {settings.default_model!r} not in registry")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await manager.start_sweeper()
+        await manager.start_health_probe()
         log.info(
             "broker %s started; %d models registered (none loaded)",
             __version__,
@@ -151,6 +156,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return JSONResponse(status_code=503, content={"status": "not_ready"})
         return {"status": "ready", "models_registered": len(manager.models)}
 
+    @app.get("/healthz/backends")
+    async def healthz_backends(
+        request: Request,
+        authorization: str | None = Header(None),
+        x_api_key: str | None = Header(None),
+    ):
+        """Live, non-loading liveness of every backend member.
+
+        Ollama daemons are probed via GET /api/tags; broker-managed runtimes are
+        probed only while their process is running (unloaded = ``not_loaded``,
+        never a spawn). Returns 200 with ``status: ok|degraded``.
+        """
+        authed(authorization, x_api_key)
+        return await manager.backends_health()
+
     @app.get("/status")
     async def status(
         request: Request,
@@ -175,7 +195,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         x_api_key: str | None = Header(None),
     ):
         authed(authorization, x_api_key)
-        return {"object": "list", "data": manager.describe_models()}
+        return {"object": "list", "data": manager.public_models()}
 
     @app.get("/api/tags")
     async def ollama_tags(
@@ -193,9 +213,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "context_length": d["context_limit"],
                 },
             }
-            for d in manager.describe_models()
+            for d in manager.public_models()
         ]
         return {"models": models}
+
+    @app.get("/api/ps")
+    async def ollama_ps(
+        authorization: str | None = Header(None),
+        x_api_key: str | None = Header(None),
+    ):
+        """Passthrough of Ollama ``/api/ps`` across daemons — what is actually
+        resident in memory, distinct from the broker's lifecycle state. Querying
+        this never loads a model.
+        """
+        authed(authorization, x_api_key)
+        return await manager.ollama_ps()
 
     @app.post("/v1/chat/completions")
     async def chat_completions(

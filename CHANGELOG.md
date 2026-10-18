@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Load-balancing pools**: registry entries sharing a `pool` name form one
+  logical model; requests are routed across members (`BROKER_ROUTE_STRATEGY` =
+  `least_busy` default, or `round_robin`) with the in-flight slot reserved at
+  selection so concurrent callers spread across hosts instead of piling onto one.
+- **Automatic failover**: a request whose chosen pool member is unavailable
+  transparently retries another member (before first byte for streams); failed
+  members are marked unhealthy and excluded until they recover. No silent
+  fallback to a *different* model.
+- **Non-loading health surfaces**: `GET /healthz/backends` (live per-member
+  liveness — Ollama via `/api/tags`, managed runtimes only while running,
+  unloaded = `not_loaded`), a `healthy`/`last_health` field and `pools` map in
+  `GET /status`, and a background liveness probe
+  (`BROKER_HEALTH_PROBE_ENABLED` / `_INTERVAL_SECONDS` / `_TIMEOUT_SECONDS`) that
+  marks a `ready` model `failed` when its backend has gone away so the next
+  request reloads/reroutes.
+- **`GET /api/ps`**: passthrough of Ollama `/api/ps` across daemons (deduped by
+  base URL) showing models actually resident in memory — distinct from the
+  broker's lifecycle state. Non-loading.
+- Docs: [docs/routing-and-health.md](docs/routing-and-health.md); pool example in
+  `registry.example.yaml`; new routing/health env vars in `.env.example`.
+
 ## [0.1.0] - 2026-10-17
 
 Initial release.

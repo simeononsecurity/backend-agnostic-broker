@@ -41,6 +41,10 @@ class BackendAdapter(abc.ABC):
 
     #: Human-readable backend name (matches BackendType value).
     name: str = "base"
+    #: True for backends that run as an independent daemon the broker does NOT
+    #: own (e.g. Ollama). Such backends can be liveness-probed without loading a
+    #: model, and their daemon liveness is independent of broker lifecycle state.
+    external_daemon: bool = False
 
     def __init__(self, entry: ModelEntry, settings: Settings) -> None:
         self.entry = entry
