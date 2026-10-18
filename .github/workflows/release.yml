@@ -91,7 +91,10 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # Prefer a dedicated PAT (write:packages) when configured; fall back to
+          # the ephemeral GITHUB_TOKEN. The PAT sidesteps first-push package
+          # creation / package-access issues with the repo token.
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: "Push image to GHCR (version + latest)"
         if: ${{ github.event_name == 'push' || inputs.publish }}
