@@ -256,13 +256,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload = req.model_dump(exclude_none=True)
         payload["messages"] = [m.model_dump(exclude_none=True) for m in req.messages]
 
+        # Sticky-routing session key: explicit header wins, else the OpenAI
+        # `user` field, else the client IP. Keeps a conversation pinned to one
+        # pool member (warm cache) while distinct sessions still spread.
+        user_field = body.get("user")
+        session_key = (
+            request.headers.get("x-session-id")
+            or (user_field if isinstance(user_field, str) and user_field else None)
+            or (request.client.host if request.client else None)
+            or "anon"
+        )
+
         start = time.monotonic()
         if req.stream:
 
             async def gen():
                 INFLIGHT.inc()
                 try:
-                    async for chunk in manager.stream_chat(alias, payload, request_id):
+                    async for chunk in manager.stream_chat(
+                        alias, payload, request_id, route_key=session_key
+                    ):
                         yield chunk
                     REQUESTS.labels("chat_stream", alias, "ok").inc()
                 except BrokerError as exc:
@@ -283,7 +296,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         INFLIGHT.inc()
         try:
-            result = await manager.chat(alias, payload, request_id)
+            result = await manager.chat(alias, payload, request_id, route_key=session_key)
             REQUESTS.labels("chat", alias, "ok").inc()
             return JSONResponse(content=result, headers={"x-request-id": request_id})
         finally:

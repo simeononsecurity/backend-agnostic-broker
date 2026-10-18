@@ -11,7 +11,7 @@ tensor/layer split, and caching are all configurable.
 | Module | Responsibility |
 |--------|----------------|
 | `broker/app.py` | FastAPI app: OpenAI + ops routes, auth, request-size limit, request IDs, structured errors, streaming. |
-| `broker/manager.py` | `ModelManager` / `ManagedModel`: lazy loading, per-model load lock, global + per-model concurrency, idle sweep, LRU eviction, **pool routing (least-busy/round-robin) with failover**, **non-loading health probe**, graceful shutdown, status aggregation. |
+| `broker/manager.py` | `ModelManager` / `ManagedModel`: lazy loading, per-model load lock, global + per-model concurrency, idle sweep, LRU eviction, **pool routing (sticky/least-busy/round-robin) with failover**, **non-loading health probe**, graceful shutdown, status aggregation. |
 | `broker/lifecycle.py` | Pure state machine (`unloaded → loading → ready → busy → unloading → failed → stopping`) with explicit legal transitions. |
 | `broker/adapters/` | Backend adapter contract (`base.py`), shared HTTP adapter (`httpbase.py`), and one adapter per backend (`fake`, `ollama`, `vllm`, `llamacpp`, `strata`). |
 | `broker/registry.py` | Declarative, pydantic-validated model registry (YAML/JSON). |
@@ -48,9 +48,11 @@ transitions.
    rejects flag-like/shell-metacharacter tokens in `model`.
 3. **Resolve + route** — the `model` names a public model (a standalone alias or
    a **pool** of members). `_members_for` raises `ModelNotFoundError` if unknown
-   (**no silent fallback**). `_select_member` picks a member — least-busy
-   (round-robin tie-break) by default, or round-robin — and reserves its
-   in-flight slot under a route lock so concurrent callers spread across members.
+   (**no silent fallback**). `_select_member` picks a member per
+   `route_strategy`: **`sticky`** (default) pins a session — `X-Session-Id`
+   header, else OpenAI `user`, else client IP — to one member and reuses it,
+   assigning new sessions the least-busy member; `least_busy` and `round_robin`
+   pick per request. It reserves the member's in-flight slot under a route lock.
 4. **Acquire the member**:
    - `_maybe_evict(alias)` unloads the LRU idle model if `max_loaded_models` is
      reached (raises `ConcurrencyLimitError` if nothing can be evicted).
@@ -102,7 +104,8 @@ link-local/metadata addresses. See `docs/security-model.md` and
 
 - `GET /status` — per-model lifecycle snapshot (state, inflight, pid, idle
   seconds, last error, live `healthy`/`last_health`) plus adapter status
-  (endpoint, GPU allocation) and the `pools` map.
+  (endpoint, GPU allocation), the `pools` map, and `route_strategy` /
+  `sticky_sessions`.
 - `GET /healthz/backends` — live, non-loading per-backend liveness (`ok`/`degraded`).
 - `GET /api/ps` — Ollama residency passthrough (what is actually in memory).
 - `GET /metrics` — Prometheus exposition (when `metrics_enabled`).

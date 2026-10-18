@@ -56,9 +56,17 @@ class Settings(BaseSettings):
     load_concurrency_policy: str = "queue"
 
     # --- Routing (load balancing across pool members) ---
-    # "least_busy": route to the pool member with the fewest in-flight requests
-    # (round-robin tie-break). "round_robin": rotate members regardless of load.
-    route_strategy: str = "least_busy"
+    # "sticky" (default): pin each session (X-Session-Id header, else the OpenAI
+    #   `user` field, else client IP) to one member and keep using it; only switch
+    #   members if that member is unhealthy/unavailable. New sessions are assigned
+    #   the least-busy member, so distinct sessions still spread across the pool.
+    # "least_busy": route every request to the member with the fewest in-flight
+    #   requests (round-robin tie-break).
+    # "round_robin": rotate members every request regardless of load.
+    route_strategy: str = "sticky"
+    # Max remembered session->member pairings (LRU-evicted). Bounds memory for
+    # sticky routing under many distinct sessions/clients.
+    route_sticky_max_entries: int = 10000
 
     # --- Background health probing (non-loading) ---
     # Periodically liveness-probe active models without loading any: Ollama via
@@ -114,8 +122,8 @@ class Settings(BaseSettings):
     @field_validator("route_strategy")
     @classmethod
     def _route(cls, v: str) -> str:
-        if v not in ("least_busy", "round_robin"):
-            raise ValueError("route_strategy must be 'least_busy' or 'round_robin'")
+        if v not in ("sticky", "least_busy", "round_robin"):
+            raise ValueError("route_strategy must be 'sticky', 'least_busy', or 'round_robin'")
         return v
 
     def validate_runtime(self) -> None:

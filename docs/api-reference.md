@@ -138,11 +138,14 @@ Request body is OpenAI-shaped. Required: `model`, `messages`. Optional:
 `stream`, `temperature`, `max_tokens`, `tools`, `tool_choice`; unknown OpenAI
 fields are passed through to the backend.
 
-If `model` names a **pool** (multiple registry members), the broker routes to the
-least-busy healthy member and **fails over** to another member if one is
-unavailable (before the first byte for streams). The response `model` is the
-public name you requested. There is no silent fallback to a *different* model.
-See [routing-and-health.md](routing-and-health.md).
+If `model` names a **pool** (multiple registry members), the broker routes it per
+`BROKER_ROUTE_STRATEGY`. The default **`sticky`** pins each session to one member
+and only switches on failure; set `X-Session-Id: <conversation-id>` (or send the
+OpenAI `user` field) to control the pairing — otherwise the client IP is used.
+Routing **fails over** to another member if one is unavailable (before the first
+byte for streams) and re-pins the session. The response `model` is the public
+name you requested. There is no silent fallback to a *different* model. See
+[routing-and-health.md](routing-and-health.md).
 
 Non-streaming:
 

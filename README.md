@@ -23,7 +23,8 @@ backend over the network, all with copy-paste examples.
 - Lazy per-model loading with an explicit lifecycle state machine
   (`unloaded → loading → ready → busy → unloading → failed → stopping`).
 - **Load-balancing pools**: route one model name across multiple backend hosts
-  (least-busy or round-robin) with automatic failover — see
+  with automatic failover — **sticky per-session by default** (pin a conversation
+  to one backend), or least-busy / round-robin. See
   [docs/routing-and-health.md](docs/routing-and-health.md).
 - **Non-loading health**: `GET /healthz/backends`, a live `health` field in
   `/status`, a background liveness probe that marks dead backends failed, and an

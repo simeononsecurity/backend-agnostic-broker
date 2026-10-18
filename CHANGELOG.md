@@ -8,10 +8,26 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Sticky session routing** (now the **default** `route_strategy`): each session
+  is pinned 1:1 to a pool member and reused across requests (warm cache / KV
+  locality), switching members only on failure/unavailability (failover re-pins).
+  Session key = `X-Session-Id` header, else the OpenAI `user` field, else client
+  IP; new sessions are assigned the least-busy member so distinct sessions still
+  spread. Bounded LRU map via `BROKER_ROUTE_STICKY_MAX_ENTRIES` (default 10000).
+  `GET /status` now reports `route_strategy` and `sticky_sessions`.
+
+### Changed
+
+- `BROKER_ROUTE_STRATEGY` default changed from `least_busy` to `sticky`;
+  `least_busy` and `round_robin` remain available. (A request with no derivable
+  session key behaves like `least_busy`.)
+
+### Added (load balancing & health — earlier this release)
+
 - **Load-balancing pools**: registry entries sharing a `pool` name form one
-  logical model; requests are routed across members (`BROKER_ROUTE_STRATEGY` =
-  `least_busy` default, or `round_robin`) with the in-flight slot reserved at
-  selection so concurrent callers spread across hosts instead of piling onto one.
+  logical model; requests are routed across members per `BROKER_ROUTE_STRATEGY`
+  with the in-flight slot reserved at selection so concurrent callers spread
+  across hosts instead of piling onto one.
 - **Automatic failover**: a request whose chosen pool member is unavailable
   transparently retries another member (before first byte for streams); failed
   members are marked unhealthy and excluded until they recover. No silent

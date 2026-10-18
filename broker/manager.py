@@ -18,10 +18,23 @@ The manager owns one :class:`ManagedModel` per registry alias. Guarantees:
 Routing (pools)
 ---------------
 A *public model name* maps to one or more member aliases (a load-balancing
-**pool**). A request for a pooled name is routed to the least-busy healthy
-member (round-robin tie-break), with **failover**: if a member's backend is
-unavailable the request transparently retries on another member. A name with a
-single member behaves exactly as a standalone model.
+**pool**). Routing is governed by ``route_strategy``:
+
+* ``sticky`` (default) — pin each *session* to one member and keep using it,
+  only switching members when that member is unhealthy/unavailable. A session is
+  identified by an ``X-Session-Id`` header, else the OpenAI ``user`` field, else
+  the client IP (derived in the API layer and passed in as ``route_key``). New
+  sessions are assigned the least-busy member, so distinct sessions still spread
+  across the pool, but a given conversation keeps hitting the same backend (warm
+  cache / KV locality).
+* ``least_busy`` — route every request to the member with the fewest in-flight
+  requests (round-robin tie-break).
+* ``round_robin`` — rotate members every request.
+
+All strategies share **failover**: if a member's backend is unavailable the
+request transparently retries on another member, and under ``sticky`` the
+session is re-pinned to the new member. A name with a single member behaves
+exactly as a standalone model.
 
 Health probing (non-loading)
 ----------------------------
@@ -37,6 +50,7 @@ import asyncio
 import itertools
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -156,6 +170,8 @@ class ModelManager:
         self.global_sem = asyncio.Semaphore(settings.max_concurrent_requests)
         self._route_lock = asyncio.Lock()
         self._route_counter = itertools.count(1)
+        # Sticky routing: (public_name, session_key) -> member alias. LRU-ordered.
+        self._sticky: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._sweeper: asyncio.Task | None = None
         self._health_task: asyncio.Task | None = None
         self._stopping = False
@@ -215,16 +231,54 @@ class ModelManager:
         await victim.unload()
 
     # --- routing ---------------------------------------------------------
+    def _least_busy(self, tier: list[ManagedModel]) -> ManagedModel:
+        """Fewest in-flight; tie-break prefers an already-active member, then RR."""
+        return min(
+            tier,
+            key=lambda m: (m.machine.inflight, 0 if m.machine.is_active() else 1, m._route_seq),
+        )
+
+    def _assign_member(self, tier: list[ManagedModel]) -> ManagedModel:
+        """Pick a member for a NEW sticky session: least in-flight, round-robin
+        tie-break. Unlike ``_least_busy`` this does *not* prefer an already-active
+        member, so distinct sessions spread across the pool instead of piling onto
+        one warm member.
+        """
+        return min(tier, key=lambda m: (m.machine.inflight, m._route_seq))
+
+    def _remember_sticky(self, name: str, route_key: str, alias: str) -> None:
+        """Record/refresh a session->member pairing with LRU eviction."""
+        k = (name, route_key)
+        self._sticky[k] = alias
+        self._sticky.move_to_end(k)
+        cap = self.settings.route_sticky_max_entries
+        while cap > 0 and len(self._sticky) > cap:
+            self._sticky.popitem(last=False)
+
     async def _select_member(
-        self, members: list[ManagedModel], exclude: set[str]
+        self,
+        name: str,
+        members: list[ManagedModel],
+        exclude: set[str],
+        route_key: str | None = None,
     ) -> ManagedModel | None:
         """Pick a pool member and reserve an in-flight slot, atomically.
 
-        Preference order: healthy members first, then non-failed, then any.
-        Within the chosen tier, pick the least-busy (fewest in-flight) member,
-        breaking ties by preferring an already-active member and then
-        round-robin. Reserving ``inflight`` here (under the route lock) is what
-        makes concurrent requests to one pool spread across its members.
+        Candidates are filtered to healthy, non-failed members first (falling back
+        to non-failed, then any, so a pool can self-heal). Selection within that
+        tier depends on ``route_strategy``:
+
+        * ``sticky`` — reuse the member this ``route_key`` is pinned to if it is
+          still a candidate; otherwise assign the least-busy member and (re)pin
+          the session to it. This is what keeps a conversation on one backend and
+          only moves it when necessary (unhealthy/excluded-by-failover).
+        * ``round_robin`` — rotate members.
+        * ``least_busy`` — fewest in-flight.
+
+        Reserving ``inflight`` here (under the route lock) is what makes
+        concurrent requests balance across members for the non-sticky strategies
+        and what lets sticky assign *new* sessions to the genuinely least-busy
+        member.
         """
         async with self._route_lock:
             pool = [m for m in members if m.entry.alias not in exclude]
@@ -236,16 +290,20 @@ class ModelManager:
             if not tier:
                 tier = pool  # last resort: retry a failed member (self-heal)
 
-            if self.settings.route_strategy == "round_robin":
-
-                def key(m: ManagedModel) -> tuple:
-                    return (m._route_seq,)
+            strategy = self.settings.route_strategy
+            chosen: ManagedModel | None = None
+            if strategy == "sticky" and route_key is not None and len(members) > 1:
+                assigned = self._sticky.get((name, route_key))
+                if assigned is not None:
+                    chosen = next((m for m in tier if m.entry.alias == assigned), None)
+                if chosen is None:  # new session, or pinned member unavailable
+                    chosen = self._assign_member(tier)
+                self._remember_sticky(name, route_key, chosen.entry.alias)
+            elif strategy == "round_robin":
+                chosen = min(tier, key=lambda m: (m._route_seq,))
             else:  # least_busy
+                chosen = self._least_busy(tier)
 
-                def key(m: ManagedModel) -> tuple:
-                    return (m.machine.inflight, 0 if m.machine.is_active() else 1, m._route_seq)
-
-            chosen = min(tier, key=key)
             chosen.machine.inflight += 1  # reserve the slot
             chosen._route_seq = next(self._route_counter)  # rotate tie-break
             return chosen
@@ -258,12 +316,14 @@ class ModelManager:
         await m.ensure_ready()
         return m
 
-    async def chat(self, name: str, payload: dict, request_id: str) -> dict:
+    async def chat(
+        self, name: str, payload: dict, request_id: str, route_key: str | None = None
+    ) -> dict:
         members = self._members_for(name)
         exclude: set[str] = set()
         last: Exception | None = None
         for _ in range(len(members)):
-            m = await self._select_member(members, exclude)
+            m = await self._select_member(name, members, exclude, route_key)
             if m is None:
                 break
             try:
@@ -316,14 +376,16 @@ class ModelManager:
             if m.machine.inflight == 0 and m.machine.state == State.BUSY:
                 m.machine.to(State.READY)
 
-    async def stream_chat(self, name: str, payload: dict, request_id: str) -> AsyncIterator[bytes]:
+    async def stream_chat(
+        self, name: str, payload: dict, request_id: str, route_key: str | None = None
+    ) -> AsyncIterator[bytes]:
         members = self._members_for(name)
         exclude: set[str] = set()
         last: Exception | None = None
         chosen: ManagedModel | None = None
         # Select + ready a member, with failover *before* the stream starts.
         for _ in range(len(members)):
-            m = await self._select_member(members, exclude)
+            m = await self._select_member(name, members, exclude, route_key)
             if m is None:
                 break
             try:
@@ -534,6 +596,8 @@ class ModelManager:
             "loaded_count": self.loaded_count(),
             "max_loaded_models": self.settings.max_loaded_models,
             "max_concurrent_requests": self.settings.max_concurrent_requests,
+            "route_strategy": self.settings.route_strategy,
+            "sticky_sessions": len(self._sticky),
             "pools": {
                 name: [mm.entry.alias for mm in members] for name, members in self.pools.items()
             },

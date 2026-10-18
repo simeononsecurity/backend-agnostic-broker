@@ -137,10 +137,12 @@ models:
 
   # ---- Load-balancing POOL (multiple hosts serving one logical model) -------
   # Give several entries the SAME `pool` name and clients call that pool name as
-  # the model. The broker routes each request to the least-busy healthy member
-  # and fails over if one backend is down — so N concurrent callers spread
-  # across your hosts instead of hammering one. Members may be different hosts or
-  # even different backends; keep real host IPs in env vars, not committed here.
+  # the model. Default routing is STICKY: each session (X-Session-Id header, else
+  # the OpenAI `user` field, else client IP) is pinned 1:1 to a member and only
+  # moves if that member is down — new sessions get the least-busy member, so
+  # distinct sessions still spread. Set BROKER_ROUTE_STRATEGY=least_busy (or
+  # round_robin) to rebalance every request. Failover is automatic. Members may be
+  # different hosts or even different backends; keep real host IPs in env vars.
   - alias: chat-pool-node-1
     backend: ollama
     runtime_model_id: llama3.1:8b

@@ -18,7 +18,7 @@ At startup the broker rejects:
 - a `registry_path` that does not exist.
 
 `log_format` must be `json` or `text`; `load_concurrency_policy` must be `queue`
-or `reject`; `route_strategy` must be `least_busy` or `round_robin`;
+or `reject`; `route_strategy` must be `sticky`, `least_busy`, or `round_robin`;
 `gpu_memory_fraction` (per model) must be in `(0, 1]`.
 
 ## Server
@@ -63,7 +63,17 @@ or `reject`; `route_strategy` must be `least_busy` or `round_robin`;
 
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
-| `BROKER_ROUTE_STRATEGY` | str | `least_busy` | How requests spread across the members of a pool (registry entries sharing a `pool` name). `least_busy` = fewest in-flight (round-robin tie-break); `round_robin` = rotate regardless. Failover across members is automatic. |
+| `BROKER_ROUTE_STRATEGY` | str | `sticky` | `sticky`, `least_busy`, or `round_robin` (see below). |
+| `BROKER_ROUTE_STICKY_MAX_ENTRIES` | int | `10000` | Max remembered session→member pairings (LRU-evicted); bounds sticky memory. |
+
+- **`sticky`** (default) — pin each **session** to one pool member and keep using
+  it; only switch members if that member is unhealthy/unavailable (failover
+  re-pins the session). A session is identified by the `X-Session-Id` request
+  header, else the OpenAI `user` field in the body, else the client IP. New
+  sessions are assigned the least-busy member, so distinct sessions still spread.
+- **`least_busy`** — route every request to the member with the fewest in-flight
+  requests (round-robin tie-break).
+- **`round_robin`** — rotate members every request.
 
 See [routing-and-health.md](routing-and-health.md).
 
