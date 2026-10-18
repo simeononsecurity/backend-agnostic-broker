@@ -43,6 +43,25 @@ and toggle backends via config. Duplicate aliases are rejected.
 | `supports_tools` | bool | `false` | Advertised tool-call capability. |
 | `supports_vision` | bool | `false` | Advertised vision capability. |
 | `keep_alive` | str? | _(none)_ | Ollama keep-alive override (per model). |
+| `tags` | list[str] | `[]` | Auto-router class tags, e.g. `code`, `vision`, `reasoning`, `long-context`, `tools`, `json`. Main control surface for `auto`. |
+| `description` | str? | _(none)_ | One-line description shown in the router's candidate table. |
+| `router_eligible` | bool | `true` | Whether the `auto` router may select this model. |
+| `priority` | int | `0` | Auto-router tie-break preference (higher = preferred). |
+| `cost_tier` | int | `2` | Relative cost/size `1`(cheapest)..`5`(most expensive); the router prefers the cheapest capable model. |
+
+### `router` (top-level, optional)
+
+Data-driven policy for the `auto` alias (see [auto-router.md](auto-router.md)):
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `default` | str? | _(none)_ | Deterministic fallback model id when the classifier returns an invalid choice. |
+| `policy` | str? | _(none)_ | System-prompt / routing-policy override for the LLM classifier. |
+| `overrides` | list | `[]` | Hard `when → use` rules, first match bypasses the LLM (skipped if the target isn't a valid candidate). |
+| `weights` | object | _(see below)_ | Heuristic scoring weights: `capability` (3.0), `cost` (1.0), `prefer_loaded` (1.0), `priority` (1.0). |
+
+Each override `when` supports `has_images`, `has_tools`, `needs_json`,
+`min_ctx_tokens`, and `regex` (matched against the last user message).
 
 ### `gpu` (GPURequirements)
 

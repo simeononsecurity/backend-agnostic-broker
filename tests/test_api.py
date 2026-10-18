@@ -33,8 +33,8 @@ def test_list_models(client):
     r = client.get("/v1/models", headers=AUTH)
     assert r.status_code == 200
     ids = {m["id"] for m in r.json()["data"]}
-    assert ids == {"echo", "echo2"}
-    m = r.json()["data"][0]
+    assert ids == {"echo", "echo2", "auto"}
+    m = next(x for x in r.json()["data"] if x["id"] == "echo")
     assert m["object"] == "model" and "capabilities" in m
 
 

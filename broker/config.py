@@ -77,6 +77,31 @@ class Settings(BaseSettings):
     health_probe_interval_seconds: float = 30.0
     health_probe_timeout_seconds: float = 5.0
 
+    # --- Auto-router ("auto" alias: a tiny CPU classifier picks the model) ---
+    # When enabled, a virtual model id (router_alias, default "auto") is exposed;
+    # requests to it are classified to a concrete model. Only the "auto" alias is
+    # affected — every other model is addressed directly as before.
+    router_enabled: bool = True
+    router_alias: str = "auto"
+    # Backend selection: "auto" uses the llama.cpp classifier when its model +
+    # library are available and falls back to the heuristic scorer otherwise;
+    # "llm" forces the classifier (errors if unavailable); "heuristic" forces the
+    # rule/score router; "off" disables the alias.
+    router_backend: str = "auto"
+    # GGUF model for the llama.cpp classifier (small, CPU, Q4). In the container
+    # this defaults to the bundled model via BROKER_ROUTER_MODEL_PATH.
+    router_model_path: str | None = None
+    router_model_ctx: int = 2048
+    router_threads: int | None = None  # CPU threads for the classifier (None=auto)
+    # Max characters of the last user message fed to the classifier (~512 tokens).
+    router_max_input_chars: int = 2048
+    # Decision cache size (keyed by flags + candidate set + prompt prefix).
+    router_cache_size: int = 512
+    # Per-classification timeout (seconds) before falling back to the default.
+    router_timeout_seconds: float = 10.0
+    # Deterministic fallback model id (overrides registry router.default).
+    router_default_model: str | None = None
+
     # --- Limits ---
     max_request_bytes: int = 2_000_000
 
@@ -124,6 +149,13 @@ class Settings(BaseSettings):
     def _route(cls, v: str) -> str:
         if v not in ("sticky", "least_busy", "round_robin"):
             raise ValueError("route_strategy must be 'sticky', 'least_busy', or 'round_robin'")
+        return v
+
+    @field_validator("router_backend")
+    @classmethod
+    def _router_backend(cls, v: str) -> str:
+        if v not in ("auto", "llm", "heuristic", "off"):
+            raise ValueError("router_backend must be 'auto', 'llm', 'heuristic', or 'off'")
         return v
 
     def validate_runtime(self) -> None:

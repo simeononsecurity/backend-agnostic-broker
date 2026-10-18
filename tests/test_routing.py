@@ -62,7 +62,7 @@ def _msg() -> dict:
 async def test_pool_exposed_as_single_public_model(tmp_path):
     mgr = _manager(tmp_path)
     assert set(mgr.pools) == {"chat"}
-    pub = mgr.public_models()
+    pub = [p for p in mgr.public_models() if p["id"] != "auto"]
     assert len(pub) == 1
     assert pub[0]["id"] == "chat"
     assert pub[0]["pool_size"] == 2

@@ -65,6 +65,7 @@ from .errors import (
 )
 from .lifecycle import LifecycleMachine, State
 from .registry import ModelEntry, Registry
+from .router import AutoRouter
 
 log = logging.getLogger("broker.manager")
 
@@ -172,6 +173,11 @@ class ModelManager:
         self._route_counter = itertools.count(1)
         # Sticky routing: (public_name, session_key) -> member alias. LRU-ordered.
         self._sticky: OrderedDict[tuple[str, str], str] = OrderedDict()
+        # Auto-router ("auto" alias). Lazy-constructed; classification serialized.
+        self.router: AutoRouter | None = None
+        self._router_lock = asyncio.Lock()
+        if settings.router_enabled and settings.router_backend != "off":
+            self.router = AutoRouter(self, settings, registry.router)
         self._sweeper: asyncio.Task | None = None
         self._health_task: asyncio.Task | None = None
         self._stopping = False
@@ -210,6 +216,19 @@ class ModelManager:
 
     def loaded_count(self) -> int:
         return sum(1 for m in self.models.values() if m.machine.is_active())
+
+    async def _resolve_auto(self, name: str, payload: dict) -> str:
+        """Resolve the ``auto`` alias to a concrete public model via the router.
+
+        Classification is serialized (and offloaded to a thread so an in-process
+        LLM classifier never blocks the event loop) and returns a normal public
+        model name, which then flows through standard pool routing + failover.
+        """
+        if self.router is not None and name == self.settings.router_alias:
+            async with self._router_lock:
+                decision = await asyncio.to_thread(self.router.route, payload)
+            return decision.chosen
+        return name
 
     # --- eviction --------------------------------------------------------
     async def _maybe_evict(self, keep_alias: str) -> None:
@@ -319,6 +338,7 @@ class ModelManager:
     async def chat(
         self, name: str, payload: dict, request_id: str, route_key: str | None = None
     ) -> dict:
+        name = await self._resolve_auto(name, payload)
         members = self._members_for(name)
         exclude: set[str] = set()
         last: Exception | None = None
@@ -379,6 +399,7 @@ class ModelManager:
     async def stream_chat(
         self, name: str, payload: dict, request_id: str, route_key: str | None = None
     ) -> AsyncIterator[bytes]:
+        name = await self._resolve_auto(name, payload)
         members = self._members_for(name)
         exclude: set[str] = set()
         last: Exception | None = None
@@ -598,6 +619,7 @@ class ModelManager:
             "max_concurrent_requests": self.settings.max_concurrent_requests,
             "route_strategy": self.settings.route_strategy,
             "sticky_sessions": len(self._sticky),
+            "router": self.router.status() if self.router else {"enabled": False},
             "pools": {
                 name: [mm.entry.alias for mm in members] for name, members in self.pools.items()
             },
@@ -639,7 +661,43 @@ class ModelManager:
                     "backends": sorted({mm.adapter.name for mm in members}),
                 }
             )
+        if self.router is not None:
+            out.append(self._auto_descriptor())
         return out
+
+    def _auto_descriptor(self) -> dict:
+        """Virtual ``auto`` model: advertises the union of eligible capabilities."""
+        eligible = [
+            members
+            for name, members in self.pools.items()
+            if name != self.settings.router_alias and all(m.entry.router_eligible for m in members)
+        ]
+        flat = [m for members in eligible for m in members]
+        return {
+            "id": self.settings.router_alias,
+            "object": "model",
+            "created": 0,
+            "owned_by": "broker:router",
+            "backend": "router",
+            "description": "Auto-router: a tiny CPU classifier picks the best model per request.",
+            "context_limit": max((m.entry.context_limit for m in flat), default=0),
+            "output_limit": max((m.entry.output_limit for m in flat), default=0),
+            "capabilities": {
+                # The router can pick a capable model, so advertise a capability if
+                # ANY eligible model supports it.
+                "streaming": any(m.entry.supports_streaming for m in flat),
+                "tools": any(m.entry.supports_tools for m in flat),
+                "vision": any(m.entry.supports_vision for m in flat),
+            },
+            "router_candidates": sorted(
+                {
+                    name
+                    for name, members in self.pools.items()
+                    if name != self.settings.router_alias
+                    and all(m.entry.router_eligible for m in members)
+                }
+            ),
+        }
 
     def describe_models(self) -> list[dict]:
         """Back-compat: public model list (pools collapsed to one entry)."""

@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`auto` router alias**: a tiny classifier that, given a request plus the live
+  candidate list, routes to the single best model id. Only the `auto` alias is
+  affected. Pipeline: derive flags (images/tools/json/ctx) → Stage-1 capability
+  filter → data-driven hard overrides → classifier → validate → deterministic
+  fallback → LRU decision cache.
+  - Two backends: a zero-dependency **heuristic** scorer (default/fallback) and a
+    CPU **llama.cpp GGUF** classifier constrained by a GBNF grammar to the exact
+    candidate ids (`BROKER_ROUTER_BACKEND=auto|llm|heuristic|off`).
+  - Model-agnostic: candidates are injected at inference time from the registry,
+    so adding/removing a model changes routing with no retrain.
+  - Customization is all data: per-model `tags`/`description`/`priority`/
+    `cost_tier`/`router_eligible`, plus a registry `router` block
+    (`default`, `policy`, `overrides`, `weights`).
+  - `auto` is listed in `GET /v1/models`; `GET /status.router` shows backend,
+    cache size, and recent decisions. Dockerfile `--build-arg WITH_ROUTER_LLM=1`
+    bundles the CPU wheel + a small Q4 GGUF for a self-contained classifier.
+  - Docs: [docs/auto-router.md](docs/auto-router.md); `BROKER_ROUTER_*` settings.
+
 ## [0.2.0] - 2026-10-17
 
 ### Added

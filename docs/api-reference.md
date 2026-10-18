@@ -118,7 +118,10 @@ Returns `{"object":"list","data":[ ... ]}` — **one entry per public model name
 (public name), `backend`, `capabilities` (streaming/tools/vision), `context_limit`,
 `output_limit`, and `pool`/`pool_size`/`pool_members`. Standalone models also carry
 `runtime_model_id`, `gpu`, and `mtp`; pooled entries report `backend: "pool"` with
-capabilities ANDed and limits min-ed across members.
+capabilities ANDed and limits min-ed across members. When the auto-router is
+enabled, a virtual `auto` entry (`backend: "router"`, with `router_candidates`) is
+also listed — send `"model": "auto"` to have a classifier pick the model. See
+[auto-router.md](auto-router.md).
 
 ### `GET /api/tags` — Ollama-style discovery (auth, optional compat)
 

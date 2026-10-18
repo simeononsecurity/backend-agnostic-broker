@@ -7,6 +7,20 @@
 # host IPs and endpoints OUT of version control — set them in a gitignored .env
 # instead. Example: a remote Ollama daemon reached via `${OLLAMA_BASE_URL}`.
 
+# ---- Auto-router policy (optional): controls the "auto" model id -------------
+# Clients send {"model": "auto", ...} and a tiny classifier picks the best model
+# below for each request. Knobs are all DATA: per-model tags/cost_tier/priority,
+# plus these overrides/default/weights. See docs/auto-router.md.
+router:
+  default: echo-fake            # deterministic fallback if the classifier fails
+  weights: { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0 }
+  overrides:
+    # First match bypasses the LLM (skipped if its target can't serve the request).
+    - when: { has_images: true }
+      use: echo-fake
+    - when: { regex: "(?i)\\btranslate\\b" }
+      use: echo-fake
+
 models:
   # ---- Fake backend (no external runtime; used for tests & smoke) ----------
   - alias: echo-fake
@@ -16,6 +30,10 @@ models:
     output_limit: 2048
     idle_timeout_seconds: 60
     supports_streaming: true
+    # Auto-router metadata (used only by the "auto" alias):
+    tags: [general, cheap, fast]
+    description: fake echo backend for tests
+    cost_tier: 1
 
   # ---- Ollama (external daemon, native lazy loading via keep_alive) ---------
   # base_url is injected from the environment so no host IP is committed. Point
@@ -28,6 +46,9 @@ models:
     output_limit: 2048
     idle_timeout_seconds: 300
     keep_alive: "5m"
+    tags: [general, code, reasoning]
+    description: general-purpose 8B chat/code model
+    cost_tier: 3
     readiness:
       kind: http
       path: /api/tags

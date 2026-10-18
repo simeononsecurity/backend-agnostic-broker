@@ -90,6 +90,24 @@ running) and mark a `ready` model `failed` if its backend has gone away, so the
 next request reloads/reroutes. Surfaced at `GET /healthz/backends` and in
 `GET /status`.
 
+## Auto-router (`auto` alias)
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_ROUTER_ENABLED` | bool | `true` | Expose the virtual `auto` model. |
+| `BROKER_ROUTER_ALIAS` | str | `auto` | Model id that triggers classification. |
+| `BROKER_ROUTER_BACKEND` | str | `auto` | `auto`, `llm`, `heuristic`, or `off`. |
+| `BROKER_ROUTER_MODEL_PATH` | str? | _(unset)_ | GGUF for the llama.cpp classifier (set in-container). |
+| `BROKER_ROUTER_MODEL_CTX` | int | `2048` | Classifier context window. |
+| `BROKER_ROUTER_THREADS` | int? | _(auto)_ | CPU threads for the classifier. |
+| `BROKER_ROUTER_MAX_INPUT_CHARS` | int | `2048` | Last-user-message truncation (~512 tokens). |
+| `BROKER_ROUTER_CACHE_SIZE` | int | `512` | Decision cache entries (LRU). |
+| `BROKER_ROUTER_TIMEOUT_SECONDS` | float | `10` | Per-classification timeout. |
+| `BROKER_ROUTER_DEFAULT_MODEL` | str? | _(unset)_ | Fallback model id (overrides registry `router.default`). |
+
+Policy, per-model `tags`/`priority`/`cost_tier`, and hard overrides live in the
+registry. See [auto-router.md](auto-router.md).
+
 ## Limits
 
 | Env var | Type | Default | Description |

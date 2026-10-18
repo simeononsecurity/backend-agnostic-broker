@@ -12,6 +12,7 @@ tensor/layer split, and caching are all configurable.
 |--------|----------------|
 | `broker/app.py` | FastAPI app: OpenAI + ops routes, auth, request-size limit, request IDs, structured errors, streaming. |
 | `broker/manager.py` | `ModelManager` / `ManagedModel`: lazy loading, per-model load lock, global + per-model concurrency, idle sweep, LRU eviction, **pool routing (sticky/least-busy/round-robin) with failover**, **non-loading health probe**, graceful shutdown, status aggregation. |
+| `broker/router.py` | `AutoRouter` for the `auto` alias: flag extraction, Stage-1 capability filter, data-driven overrides, heuristic + llama.cpp (GBNF-constrained) classifier backends, decision cache + fallback. |
 | `broker/lifecycle.py` | Pure state machine (`unloaded → loading → ready → busy → unloading → failed → stopping`) with explicit legal transitions. |
 | `broker/adapters/` | Backend adapter contract (`base.py`), shared HTTP adapter (`httpbase.py`), and one adapter per backend (`fake`, `ollama`, `vllm`, `llamacpp`, `strata`). |
 | `broker/registry.py` | Declarative, pydantic-validated model registry (YAML/JSON). |
@@ -46,8 +47,9 @@ transitions.
    content-length limit; the route calls `check_auth`.
 2. **Validate selector** — the request body is parsed; `reject_request_flags`
    rejects flag-like/shell-metacharacter tokens in `model`.
-3. **Resolve + route** — the `model` names a public model (a standalone alias or
-   a **pool** of members). `_members_for` raises `ModelNotFoundError` if unknown
+3. **Resolve + route** — if `model` is `auto`, the `AutoRouter` first classifies
+   it to a concrete public model (see [auto-router.md](auto-router.md)). The name
+   then names a public model (a standalone alias or a **pool** of members). `_members_for` raises `ModelNotFoundError` if unknown
    (**no silent fallback**). `_select_member` picks a member per
    `route_strategy`: **`sticky`** (default) pins a session — `X-Session-Id`
    header, else OpenAI `user`, else client IP — to one member and reuses it,

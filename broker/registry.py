@@ -157,6 +157,30 @@ class ModelEntry(BaseModel):
     # Per-model override of the global keep-alive (ollama) behavior.
     keep_alive: str | None = None
 
+    # --- Auto-router metadata (used only by the "auto" alias) ---
+    # Free-form class tags describing what this model is good at, e.g. "code",
+    # "vision", "reasoning", "cheap", "fast", "long-context", "tools", "json".
+    # The router matches request intent against these; they are the main control
+    # surface (data, not code) and need no retrain to change.
+    tags: list[str] = Field(default_factory=list)
+    # One-line description shown to the router classifier's candidate table.
+    description: str | None = None
+    # Whether the "auto" router may ever select this model.
+    router_eligible: bool = True
+    # Relative preference for tie-breaks (higher = preferred). Also the user-facing
+    # "priority" knob for auto routing.
+    priority: int = 0
+    # Relative cost/size: 1 (cheapest/smallest) .. 5 (most expensive). The router
+    # prefers the cheapest model that still satisfies the request.
+    cost_tier: int = 2
+
+    @field_validator("cost_tier")
+    @classmethod
+    def _cost_tier(cls, v: int) -> int:
+        if not (1 <= v <= 5):
+            raise ValueError("cost_tier must be between 1 and 5")
+        return v
+
     @field_validator("alias", "runtime_model_id")
     @classmethod
     def _nonempty(cls, v: str) -> str:
@@ -183,8 +207,70 @@ class ModelEntry(BaseModel):
         return v
 
 
+class RouterWhen(BaseModel):
+    """Match conditions for a hard router override (all given conditions must hold)."""
+
+    model_config = {"extra": "forbid"}
+
+    has_images: bool | None = None
+    has_tools: bool | None = None
+    needs_json: bool | None = None
+    min_ctx_tokens: int | None = None
+    # Regex matched (search, case-insensitive handled by the pattern) against the
+    # last user message.
+    regex: str | None = None
+
+    @field_validator("regex")
+    @classmethod
+    def _regex(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        try:
+            re.compile(v)
+        except re.error as exc:
+            raise ValueError(f"invalid override regex {v!r}: {exc}") from exc
+        return v
+
+
+class RouterOverride(BaseModel):
+    """A deterministic rule that bypasses the LLM classifier when it matches."""
+
+    model_config = {"extra": "forbid"}
+
+    when: RouterWhen
+    use: str  # target public model id
+
+
+class RouterWeights(BaseModel):
+    """Scoring weights for the heuristic router (capability dominates by default)."""
+
+    model_config = {"extra": "forbid"}
+
+    capability: float = 3.0
+    cost: float = 1.0
+    prefer_loaded: float = 1.0
+    priority: float = 1.0
+
+
+class RouterConfig(BaseModel):
+    """Data-driven policy for the ``auto`` alias (all knobs are config, not code)."""
+
+    model_config = {"extra": "forbid"}
+
+    # Deterministic fallback model id used when the classifier returns an invalid
+    # or empty choice. If unset, the router falls back to its best heuristic pick.
+    default: str | None = None
+    # Optional system-prompt / routing-policy override for the LLM classifier.
+    policy: str | None = None
+    # Hard overrides, evaluated in order; the first match bypasses the LLM.
+    overrides: list[RouterOverride] = Field(default_factory=list)
+    weights: RouterWeights = Field(default_factory=RouterWeights)
+
+
 class Registry(BaseModel):
     models: list[ModelEntry]
+    # Optional policy for the "auto" router alias.
+    router: RouterConfig = Field(default_factory=RouterConfig)
 
     def by_alias(self) -> dict[str, ModelEntry]:
         out: dict[str, ModelEntry] = {}
@@ -261,7 +347,10 @@ def load_registry(path: str, enabled_backends: set[str] | None = None) -> Regist
         ) from exc
 
     if enabled_backends is not None:
-        reg = Registry(models=[m for m in reg.models if m.backend.value in enabled_backends])
+        reg = Registry(
+            models=[m for m in reg.models if m.backend.value in enabled_backends],
+            router=reg.router,
+        )
     # Trigger duplicate-alias + pool-grouping checks eagerly.
     reg.by_alias()
     reg.public_groups()

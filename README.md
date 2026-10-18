@@ -29,6 +29,10 @@ backend over the network, all with copy-paste examples.
 - **Non-loading health**: `GET /healthz/backends`, a live `health` field in
   `/status`, a background liveness probe that marks dead backends failed, and an
   Ollama `GET /api/ps` passthrough — none of which load a model.
+- **`auto` router**: send `"model": "auto"` and a tiny CPU classifier (GBNF-constrained
+  llama.cpp GGUF, or a zero-dependency heuristic) picks the best model per request
+  from the live registry — with capability filtering, data-driven overrides, and a
+  deterministic fallback. See [docs/auto-router.md](docs/auto-router.md).
 - Broker-managed process supervision for runtimes that only load a model at
   process startup (vLLM, llama.cpp, Strata); native lazy loading for Ollama.
 - Per-model load locking, configurable global/per-model concurrency, idle unload
@@ -88,6 +92,7 @@ docker compose up -d --build
 | Configuration reference | [docs/configuration.md](docs/configuration.md) |
 | Model registry reference | [docs/model-registry.md](docs/model-registry.md) |
 | Routing / load balancing / health | [docs/routing-and-health.md](docs/routing-and-health.md) |
+| Auto-router (`auto` alias) | [docs/auto-router.md](docs/auto-router.md) |
 | Docker guide | [docs/docker.md](docs/docker.md) |
 | Compose guide | [docs/docker-compose.md](docs/docker-compose.md) |
 | Local dev | [docs/local-dev.md](docs/local-dev.md) |

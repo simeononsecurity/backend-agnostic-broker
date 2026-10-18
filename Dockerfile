@@ -11,6 +11,15 @@ COPY requirements.txt .
 RUN python -m pip install --upgrade pip && \
     pip wheel --wheel-dir /wheels -r requirements.txt
 
+# Optional: build the CPU llama-cpp-python wheel for the bundled "auto" router
+# classifier. Portable build (GGML_NATIVE=OFF) so the wheel runs on any x86-64.
+ARG WITH_ROUTER_LLM=0
+RUN if [ "$WITH_ROUTER_LLM" = "1" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends build-essential cmake && \
+      CMAKE_ARGS="-DGGML_NATIVE=OFF" pip wheel --wheel-dir /wheels "llama-cpp-python==0.3.2" && \
+      rm -rf /var/lib/apt/lists/* ; \
+    fi
+
 # ---- runtime ---------------------------------------------------------------
 FROM python:${PYTHON_VERSION} AS runtime
 
@@ -40,12 +49,26 @@ WORKDIR /app
 # Install deps from prebuilt wheels (no network at runtime-layer build).
 COPY --from=builder /wheels /wheels
 COPY requirements.txt .
+# Optionally bundle the CPU router classifier (llama-cpp-python wheel built above
+# + a small Q4 GGUF) so the "auto" alias is a self-contained in-container AI
+# backend. Default off: the heuristic router already works with zero extra deps.
+ARG WITH_ROUTER_LLM=0
+ARG ROUTER_MODEL_URL=https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
 RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt && \
+    if [ "$WITH_ROUTER_LLM" = "1" ]; then \
+      pip install --no-cache-dir --no-index --find-links=/wheels llama-cpp-python && \
+      mkdir -p /models && \
+      python -c "import urllib.request; urllib.request.urlretrieve('${ROUTER_MODEL_URL}', '/models/router.gguf')" ; \
+    fi && \
     rm -rf /wheels && \
     # Drop build-only tooling (setuptools/wheel) from the runtime image. The app
     # runs via `python -m broker` and needs none of it; this clears vendored
     # build-tool CVEs from the image surface.
     pip uninstall -y setuptools wheel pip || true
+
+# Point the router at the bundled model when present; if the file is absent (lean
+# build) the router falls back to the heuristic automatically.
+ENV BROKER_ROUTER_MODEL_PATH=/models/router.gguf
 
 # App code.
 COPY broker/ ./broker/
