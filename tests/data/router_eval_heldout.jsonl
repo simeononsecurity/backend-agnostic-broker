@@ -1,0 +1,24 @@
+{"prompt": "write a python function that checks if a string is a palindrome", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "refactor this code to remove the nested loops", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "what does this regex pattern match", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "implement binary search over a sorted array", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "fix the null pointer exception in this java program", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "write a sql statement to count rows per category", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "calculate the standard deviation of these numbers", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 4, "task": "math"}
+{"prompt": "solve the quadratic equation x^2 + 2x - 8 = 0", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 4, "task": "math"}
+{"prompt": "compute the greatest common divisor of 48 and 36", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 4, "task": "math"}
+{"prompt": "find the derivative of x cubed", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 4, "task": "math"}
+{"prompt": "evaluate the integral of cos(x) dx", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 4, "task": "math"}
+{"prompt": "analyze the pros and cons of remote work step by step", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 4, "task": "reasoning"}
+{"prompt": "prove that there are infinitely many prime numbers", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 4, "task": "reasoning"}
+{"prompt": "what are some good houseplants for low light", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "recommend a movie for a rainy day", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "what's the tallest mountain in the world", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "write a limerick about a cat", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "creative"}
+{"prompt": "write a bedtime story about a dragon", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "creative"}
+{"prompt": "describe the scenery in this photo", "flags": {"has_images": true}, "acceptable": ["vizard"], "cheapest_capable": "vizard", "quality_tier": 3, "task": "vision"}
+{"prompt": "what text appears in this screenshot", "flags": {"has_images": true}, "acceptable": ["vizard"], "cheapest_capable": "vizard", "quality_tier": 3, "task": "vision"}
+{"prompt": "condense this entire contract into key points", "flags": {"max_tokens": 100000}, "acceptable": ["longboi"], "cheapest_capable": "longboi", "quality_tier": 4, "task": "long-context"}
+{"prompt": "call the maps tool to get directions", "flags": {"has_tools": true}, "acceptable": ["tooly", "coder"], "cheapest_capable": "tooly", "quality_tier": 2, "task": "tools"}
+{"prompt": "use the weather tool to look up the forecast", "flags": {"has_tools": true}, "acceptable": ["tooly", "coder"], "cheapest_capable": "tooly", "quality_tier": 2, "task": "tools"}
+{"prompt": "return the output strictly as a json array", "flags": {"needs_json": true}, "acceptable": ["tooly"], "cheapest_capable": "tooly", "quality_tier": 2, "task": "json"}

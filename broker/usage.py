@@ -48,12 +48,22 @@ CREATE TABLE IF NOT EXISTS usage (
   completion_tokens INTEGER DEFAULT 0,
   total_tokens INTEGER DEFAULT 0,
   latency_ms REAL,
+  ttft_ms REAL,
   status TEXT,
   stream INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts);
 CREATE INDEX IF NOT EXISTS idx_usage_model ON usage(model);
 """
+
+# Columns added after the original ADR 0007 schema. Each is applied with an
+# idempotent ``ALTER TABLE ... ADD COLUMN`` only when the column is absent, so an
+# existing ``usage.sqlite3`` written by an older broker is migrated in place with
+# no data loss and old rows simply carry NULL for the new column.
+_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    # ADR 0019: time-to-first-token (ms) for streaming requests.
+    ("ttft_ms", "ALTER TABLE usage ADD COLUMN ttft_ms REAL"),
+)
 
 
 class UsageLog:
@@ -69,11 +79,25 @@ class UsageLog:
         try:
             self._conn = sqlite3.connect(self.path, check_same_thread=False)
             self._conn.executescript(_SCHEMA)
+            self._migrate(self._conn)
             self._conn.commit()
         except Exception as exc:  # noqa: BLE001 - never block startup on the log
             log.warning("usage log init failed (%s): disabling", exc)
             self.enabled = False
             self._conn = None
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Apply forward-only, additive column migrations to an existing table.
+
+        Backward compatible: a usage DB written by an older broker (without the
+        newer columns) is upgraded in place by adding any missing column. Old
+        rows keep NULL for the new column; no row is rewritten or dropped.
+        """
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(usage)").fetchall()}
+        for name, ddl in _MIGRATIONS:
+            if name not in cols:
+                conn.execute(ddl)
 
     @staticmethod
     def key_fingerprint(api_key: str | None) -> str | None:
@@ -96,6 +120,7 @@ class UsageLog:
         latency_ms: float | None = None,
         status: str = "ok",
         stream: bool = False,
+        ttft_ms: float | None = None,
     ) -> None:
         if not self.enabled or self._conn is None:
             return
@@ -103,8 +128,9 @@ class UsageLog:
             with self._lock:
                 self._conn.execute(
                     "INSERT INTO usage (ts, request_id, endpoint, requested, model, api_key_id, "
-                    "prompt_tokens, completion_tokens, total_tokens, latency_ms, status, stream) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "prompt_tokens, completion_tokens, total_tokens, latency_ms, status, stream, "
+                    "ttft_ms) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         time.time(),
                         request_id,
@@ -118,6 +144,7 @@ class UsageLog:
                         latency_ms,
                         status,
                         1 if stream else 0,
+                        ttft_ms,
                     ),
                 )
                 self._conn.commit()
@@ -201,24 +228,33 @@ class UsageLog:
         return out
 
     def latency_percentiles(
-        self, window_seconds: float = 3600.0, endpoints: tuple[str, ...] | None = None
+        self,
+        window_seconds: float = 3600.0,
+        endpoints: tuple[str, ...] | None = None,
+        metric: str = "latency",
     ) -> dict[str, dict[str, float]]:
         """Per-served-model latency p50/p90 (ms) over a recent window.
 
-        Used by the auto-router's latency-budget feature (ADR 0011). Best-effort:
-        returns an empty dict if the log is disabled or a query fails, so it can
-        never break routing. ``endpoints`` optionally restricts the rows
-        considered (e.g. non-streaming chat only).
+        Used by the auto-router's latency-budget feature (ADR 0011/0019).
+        ``metric`` selects which timing column is summarized: ``"latency"``
+        (end-to-end, the default) or ``"ttft"`` (time-to-first-token, recorded
+        for streaming requests per ADR 0019). For ``"ttft"`` only rows that
+        carry a non-NULL ``ttft_ms`` are counted, so a model with no streamed
+        samples yet returns no entry (and the budget cannot rank it) rather than
+        a misleading zero. Best-effort: returns an empty dict if the log is
+        disabled or a query fails, so it can never break routing. ``endpoints``
+        optionally restricts the rows considered (e.g. non-streaming chat only).
         """
         if not self.enabled or self._conn is None:
             return {}
+        col = "ttft_ms" if metric == "ttft" else "latency_ms"
         cutoff = time.time() - max(0.0, float(window_seconds))
         try:
             with self._lock:
                 cur = self._conn.cursor()
                 sql = (
-                    "SELECT model, latency_ms FROM usage "
-                    "WHERE ts >= ? AND latency_ms IS NOT NULL AND model IS NOT NULL"
+                    f"SELECT model, {col} FROM usage "
+                    f"WHERE ts >= ? AND {col} IS NOT NULL AND model IS NOT NULL"
                 )
                 params: list[Any] = [cutoff]
                 if endpoints:

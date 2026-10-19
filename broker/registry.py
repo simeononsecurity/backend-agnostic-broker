@@ -284,6 +284,55 @@ class RouterWeights(BaseModel):
     priority: float = 1.0
 
 
+class ScorerConfig(BaseModel):
+    """Calibrated reliability scorer for cascade escalation (ADR 0019, opt-in).
+
+    When ``enabled``, the cheap hop's answer is reduced to a single reliability
+    score in ``[0, 1]`` (higher = keep) from data-driven features — answer length
+    adequacy, refusal match, truncation (``finish_reason == "length"``), and, when
+    the response carries token logprobs, the mean token probability. The hop
+    escalates when ``score < threshold``. This unifies the fixed boolean signals
+    into one tunable operating point (slide ``threshold`` up to demand more
+    certainty / escalate more). Default-off: the boolean signals remain the
+    default so v0.5.0 behavior is unchanged.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    enabled: bool = False
+    # Escalate when the reliability score is strictly below this threshold.
+    threshold: float = 0.5
+    # Answer length (chars, stripped) at which the length feature saturates to 1.
+    target_chars: int = 200
+    # Non-negative feature weights; the score is their weighted mean over the
+    # features actually present (logprob is skipped when the response has none).
+    weight_length: float = 0.4
+    weight_refusal: float = 0.4
+    weight_finish: float = 0.2
+    weight_logprob: float = 0.0
+
+    @field_validator("threshold")
+    @classmethod
+    def _threshold(cls, v: float) -> float:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError("cascade.scorer.threshold must be in [0, 1]")
+        return v
+
+    @field_validator("target_chars")
+    @classmethod
+    def _target_chars(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("cascade.scorer.target_chars must be >= 1")
+        return v
+
+    @field_validator("weight_length", "weight_refusal", "weight_finish", "weight_logprob")
+    @classmethod
+    def _weight(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("cascade.scorer weights must be >= 0")
+        return v
+
+
 class CascadeConfig(BaseModel):
     """Escalation signals for ``router.mode: cascade`` (ADR 0011).
 
@@ -310,6 +359,25 @@ class CascadeConfig(BaseModel):
             r"(?i)\bas an AI\b",
         ]
     )
+
+    # --- ADR 0019 ---
+    # Streaming behavior for a cascade route:
+    #   "fallback_single" (default, = v0.5.0): a streaming request is served by
+    #     the single strong pick (a live stream can't be re-scored).
+    #   "buffer": buffer the cheap hop fully, score it, then REPLAY it as a stream
+    #     or STREAM the stronger hop — one model's output per stream, never mixed.
+    #     Chat endpoint only; completions/responses stay fallback_single.
+    stream_mode: str = "fallback_single"
+    # Optional calibrated reliability scorer (opt-in) that replaces the boolean
+    # escalate_on_* signals with one tunable threshold when scorer.enabled.
+    scorer: ScorerConfig = Field(default_factory=ScorerConfig)
+
+    @field_validator("stream_mode")
+    @classmethod
+    def _stream_mode(cls, v: str) -> str:
+        if v not in ("fallback_single", "buffer"):
+            raise ValueError("cascade.stream_mode must be 'fallback_single' or 'buffer'")
+        return v
 
     @field_validator("refusal_patterns")
     @classmethod

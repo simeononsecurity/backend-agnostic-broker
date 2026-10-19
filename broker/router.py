@@ -86,13 +86,96 @@ class RouteDecision:
     latency_estimate_ms: float | None = None  # estimate for the chosen model
 
 
+def _logprob_confidence(result: dict) -> float | None:
+    """Mean per-token probability from OpenAI ``logprobs`` if present, else None.
+
+    Reads ``choices[0].logprobs.content[*].logprob`` (natural-log probabilities)
+    and returns ``exp(mean(logprob)) in (0, 1]`` — a confidence proxy. Returns
+    ``None`` when the response carries no usable logprobs so the scorer can skip
+    the feature instead of inventing a value.
+    """
+    choices = result.get("choices") or []
+    if not choices:
+        return None
+    lp = (choices[0] or {}).get("logprobs") or {}
+    content = lp.get("content")
+    if not isinstance(content, list) or not content:
+        return None
+    vals = [
+        float(t["logprob"])
+        for t in content
+        if isinstance(t, dict) and isinstance(t.get("logprob"), (int, float))
+    ]
+    if not vals:
+        return None
+    import math
+
+    return math.exp(sum(vals) / len(vals))
+
+
+def reliability_score(result: dict, cfg: CascadeConfig) -> tuple[float, dict]:
+    """Calibrated reliability score in ``[0, 1]`` for a cascade first-hop answer.
+
+    Combines data-driven features (answer length adequacy, refusal match,
+    truncation, and — when available — mean token probability) into one weighted
+    score; higher means keep, lower means escalate. Pure and dependency-free.
+    Returns ``(score, features)`` where ``features`` is a breakdown for logging.
+    """
+    sc = cfg.scorer
+    choices = result.get("choices") or []
+    ch = (choices[0] if choices else {}) or {}
+    finish = ch.get("finish_reason")
+    content = (ch.get("message") or {}).get("content")
+    text = content.strip() if isinstance(content, str) else ""
+
+    f_length = min(1.0, len(text) / float(sc.target_chars))
+    refused = any(_safe_search(p, text) for p in cfg.refusal_patterns)
+    f_refusal = 0.0 if refused else 1.0
+    f_finish = 0.0 if finish == "length" else 1.0
+    conf = _logprob_confidence(result)
+
+    feats: list[tuple[float, float]] = [
+        (sc.weight_length, f_length),
+        (sc.weight_refusal, f_refusal),
+        (sc.weight_finish, f_finish),
+    ]
+    if conf is not None:
+        feats.append((sc.weight_logprob, conf))
+    wsum = sum(w for w, _ in feats)
+    score = (sum(w * v for w, v in feats) / wsum) if wsum > 0 else 1.0
+    breakdown = {
+        "score": round(score, 4),
+        "length": round(f_length, 4),
+        "refusal": f_refusal,
+        "finish": f_finish,
+        "logprob": (round(conf, 4) if conf is not None else None),
+    }
+    return score, breakdown
+
+
+def _safe_search(pattern: str, text: str) -> bool:
+    try:
+        return bool(re.search(pattern, text))
+    except re.error:  # pragma: no cover - validated at load time
+        return False
+
+
 def should_escalate(result: dict, cfg: CascadeConfig) -> tuple[bool, str]:
     """Decide whether a cascade's first-hop response warrants escalation.
 
     Pure and data-driven: inspects the *actual* OpenAI chat-completion result
     against the configured signals and returns ``(escalate, reason)``. The
     reason is a short machine-friendly tag for the decision/usage log.
+
+    When ``cfg.scorer.enabled`` (ADR 0019) the fixed boolean signals are replaced
+    by a single calibrated reliability score with one threshold; otherwise the
+    v0.5.0 boolean signals (length / empty / refusal) are used unchanged.
     """
+    if getattr(cfg, "scorer", None) is not None and cfg.scorer.enabled:
+        score, _ = reliability_score(result, cfg)
+        if score < cfg.scorer.threshold:
+            return (True, f"reliability={score:.2f}<{cfg.scorer.threshold:.2f}")
+        return (False, "")
     choices = result.get("choices") or []
     if not choices:
         # No choices at all is as bad as empty output.
@@ -211,11 +294,50 @@ _TAG_KEYWORDS: dict[str, list[str]] = {
         "stack trace",
         "traceback",
         "algorithm",
+        "implement",
+        "class",
+        "method",
+        "exception",
+        "syntax",
+        "variable",
+        "script",
+        "compiler",
+        "unit test",
+        "api endpoint",
     ],
     "vision": ["image", "photo", "picture", "screenshot", "diagram", "chart", "vision"],
     "reasoning": ["reason", "prove", "theorem", "logic", "step by step", "deduce", "analyze"],
-    "math": ["math", "calculate", "equation", "integral", "derivative", "algebra", "arithmetic"],
-    "creative": ["poem", "story", "novel", "lyrics", "creative", "essay", "haiku", "write a"],
+    "math": [
+        "math",
+        "calculate",
+        "equation",
+        "integral",
+        "derivative",
+        "algebra",
+        "arithmetic",
+        "geometry",
+        "probability",
+        "factorial",
+        "polynomial",
+        "matrix",
+        "compute the",
+        "solve for",
+    ],
+    "creative": [
+        "poem",
+        "story",
+        "novel",
+        "lyrics",
+        "haiku",
+        "sonnet",
+        "limerick",
+        "bedtime",
+        "song",
+        "screenplay",
+        "fiction",
+        "write a poem",
+        "write a story",
+    ],
     "long-context": ["summarize", "summarise", "transcript", "whole document", "entire"],
     "json": ["json", "schema", "structured output"],
     "tools": ["tool", "function call", "api call", "call the"],
@@ -248,8 +370,13 @@ class HeuristicRouterBackend(RouterBackend):
             s += w.capability * 0.5
         if flags.approx_ctx_tokens > 8000 and "long-context" in tags:
             s += w.capability
-        # Prefer cheaper, already-loaded, higher-priority models (tie-breakers).
-        s += (5 - c.cost_tier) * w.cost
+        # Prefer cheaper, already-loaded, higher-priority models. The cost term is
+        # NORMALIZED to [0, 1]·w.cost (0 = most expensive tier, 1 = cheapest) so at
+        # the default weights it stays a TIE-BREAKER and can never outweigh a single
+        # capability match — a cheap generalist no longer beats the one capable
+        # model on a code/math prompt (ADR 0019). The cost sweep in the eval still
+        # lets cost dominate at high weights, tracing the full cost–quality curve.
+        s += (5 - c.cost_tier) / 4.0 * w.cost
         if c.loaded:
             s += w.prefer_loaded
         s += c.priority * w.priority
@@ -502,6 +629,7 @@ class AutoRouter:
         payload: dict,
         required_placement: frozenset[str] | None = None,
         latency_budget_ms: float | None = None,
+        stream: bool = False,
     ) -> RouteDecision:
         t0 = time.monotonic()
         req_place = frozenset(required_placement or ())
@@ -533,6 +661,7 @@ class AutoRouter:
             message[:256],
             tuple(sorted(req_place)),
             budget,
+            stream,
         )
         if cache_key in self._cache:
             cached = self._cache[cache_key]
@@ -569,7 +698,7 @@ class AutoRouter:
         # candidate (never below the capability/placement filters).
         est: float | None = None
         if budget is not None:
-            pick, via, est = self._apply_latency_budget(pick, via, candidates, budget)
+            pick, via, est = self._apply_latency_budget(pick, via, candidates, budget, stream)
 
         self._store(cache_key, pick)
         return self._finish(
@@ -635,16 +764,25 @@ class AutoRouter:
             return [primary]
         return [primary, strong]
 
-    def _latency_estimates(self, candidates: list[Candidate]) -> dict[str, float | None]:
+    def _latency_estimates(
+        self, candidates: list[Candidate], stream: bool = False
+    ) -> dict[str, float | None]:
         """Per-candidate estimated latency (ms): usage-log p90 + cold-start penalty.
 
-        ``None`` means no data yet for that model (so the budget can't rank it).
+        For a streaming request the estimate uses **time-to-first-token** (TTFT,
+        ADR 0019) — the latency a streaming client actually perceives before the
+        first token — summarized only over prior streamed samples. For a
+        non-streaming request it uses end-to-end latency. ``None`` means no usable
+        sample yet for that model (so the budget can't rank it).
         """
         stats: dict[str, dict[str, float]] = {}
         usage = getattr(self.manager, "usage", None)
         if usage is not None:
             try:
-                stats = usage.latency_percentiles(self.settings.router_latency_window_seconds)
+                stats = usage.latency_percentiles(
+                    self.settings.router_latency_window_seconds,
+                    metric="ttft" if stream else "latency",
+                )
             except Exception as exc:  # noqa: BLE001 - never break routing on the log
                 log.warning("latency estimate unavailable: %s", exc)
                 stats = {}
@@ -661,9 +799,14 @@ class AutoRouter:
         return out
 
     def _apply_latency_budget(
-        self, chosen: str, via: str, candidates: list[Candidate], budget: float
+        self,
+        chosen: str,
+        via: str,
+        candidates: list[Candidate],
+        budget: float,
+        stream: bool = False,
     ) -> tuple[str, str, float | None]:
-        ests = self._latency_estimates(candidates)
+        ests = self._latency_estimates(candidates, stream)
         chosen_est = ests.get(chosen)
         if chosen_est is None or chosen_est <= budget:
             return chosen, via, chosen_est
@@ -768,5 +911,6 @@ __all__ = [
     "RouterBackend",
     "RouterUnavailable",
     "extract_flags",
+    "reliability_score",
     "should_escalate",
 ]
