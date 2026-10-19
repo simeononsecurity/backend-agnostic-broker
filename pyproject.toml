@@ -23,6 +23,12 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
     "mypy>=1.8",
+    "fakeredis>=2",
+]
+# Optional: shared routing/runtime state across replicas (ADR 0009). Absent this
+# extra the broker runs exactly as before with in-process state.
+redis = [
+    "redis>=5",
 ]
 
 [project.scripts]
