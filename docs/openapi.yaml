@@ -395,6 +395,44 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /v1/rerank:
+    post:
+      summary: Rerank
+      description: "Cohere/Jina-compatible rerank \u2014 routed to a rerank-capable\
+        \ model (ADR 0013).\n\nRequired: `model`, `query` (non-empty string), `documents`\
+        \ (non-empty list\nof strings or {text} objects). Optional: `top_n`, `return_documents`\n\
+        (default false). No `auto` (nothing to classify); a non-rerank model\nreturns\
+        \ 400, an unknown model 404."
+      operationId: rerank_v1_rerank_post
+      parameters:
+      - name: authorization
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Authorization
+      - name: x-api-key
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Api-Key
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /admin/models:
     get:
       summary: Admin Models

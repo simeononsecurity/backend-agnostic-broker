@@ -1,0 +1,53 @@
+# Example registry for POST /v1/rerank (ADR 0013).
+#
+# Two entries: a FAKE reranker you can run with no GPU / no downloads (great for
+# trying the endpoint and for the tested example), and a commented llama.cpp
+# reranker showing the real production shape. Copy the bits you need into your
+# registry.yaml. Only models with `supports_rerank: true` may serve /v1/rerank;
+# everything else returns 400. Ollama and Strata rerank always return 400.
+
+models:
+  # --- Fake reranker: deterministic lexical-overlap scoring, no runtime ------
+  # Run with BROKER_ENABLED_BACKENDS=fake and BROKER_AUTH_ENABLED=false to try
+  # /v1/rerank locally. Scores are a deterministic Jaccard overlap of the query
+  # and each document, so the ordering is reproducible.
+  - alias: rerank-fake
+    backend: fake
+    runtime_model_id: fake-reranker
+    supports_rerank: true
+    router_eligible: false
+    tags: [rerank]
+    description: deterministic fake reranker (no GPU, for local trials + CI)
+
+  # --- llama.cpp reranker (production): run llama-server with --reranking ------
+  # Start a reranker GGUF (e.g. bge-reranker-v2-m3) with:
+  #   llama-server -m bge-reranker-v2-m3-q8_0.gguf --reranking --pooling rank \
+  #     --host 127.0.0.1 --port 8082 -ngl 99
+  # then point the broker at it on loopback (BROKER_ALLOW_LOOPBACK_BACKENDS=true).
+  # vLLM reranker models work the same way (backend: vllm). Uncomment to use:
+  #
+  # - alias: bge-reranker
+  #   backend: llamacpp
+  #   runtime_model_id: bge-reranker-v2-m3
+  #   model_path: /models/bge-reranker-v2-m3-q8_0.gguf
+  #   base_url: http://127.0.0.1:8082
+  #   context_limit: 512
+  #   output_limit: 1
+  #   supports_rerank: true
+  #   router_eligible: false
+  #   tags: [rerank]
+  #   startup_command:
+  #     - /usr/local/bin/llama-server
+  #     - --model
+  #     - "{model_path}"
+  #     - --host
+  #     - 127.0.0.1
+  #     - --port
+  #     - "8082"
+  #     - --reranking
+  #     - --pooling
+  #     - rank
+  #     - --n-gpu-layers
+  #     - "{layer_split}"
+  #   readiness: { kind: http, path: /health, expect_status: 200, timeout_seconds: 120 }
+  #   gpu: { required: true, device_ids: [0], layer_split: "99" }

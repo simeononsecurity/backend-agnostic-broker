@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`POST /v1/rerank`** (ADR 0013): a Cohere/Jina-compatible reranking endpoint.
+  Request `{model, query, documents (strings or {text} objects), top_n?,
+  return_documents?}`; response `{id, object:"rerank", model, results:[{index,
+  relevance_score, document?}], usage}` — sorted by score descending, `index` is
+  the original ordinal, `document` echoed (as `{text}`) only when
+  `return_documents` is true. Routed by model name (no `auto`) through the same
+  pool/lazy-load/concurrency/failover machinery as `/v1/embeddings`, with per-key
+  scoping, placement, usage logging, and response-cache eligibility
+  (always-deterministic). **vLLM** and **llama.cpp** reranker models are served by
+  an HTTP passthrough to their `/v1/rerank`; the **fake** backend scores by
+  deterministic lexical overlap so CI covers the endpoint. **Ollama and Strata
+  rerank return 400** (Ollama has no native rerank endpoint and the broker refuses
+  the embeddings-cosine substitute; Strata rerank is unverified).
+- **`supports_rerank`** registry capability (default `false`), surfaced in
+  `/v1/models` capabilities; requesting rerank on a model without it returns 400.
+- **`BROKER_RERANK_MAX_DOCUMENTS`** (default `1000`): caps the documents count on
+  `/v1/rerank` (Cohere recommends ≤1,000); the body is still bounded by
+  `BROKER_MAX_REQUEST_BYTES`.
+
+Defaults reproduce v0.5.0 exactly (new capability and endpoint are opt-in via the
+registry; no model loads at startup).
+
 ## [0.5.0] - 2026-10-19
 
 ### Added

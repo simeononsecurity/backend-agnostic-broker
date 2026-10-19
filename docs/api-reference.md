@@ -261,11 +261,42 @@ apply; a chat-only model returns `400` (`does not support embeddings`), an unkno
 model `404`.
 
 ```bash
-curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+curl -s -H "Authorization: Bearer ***" -H 'content-type: application/json' \
   -d '{"model":"nomic-embed-text","input":"the cat sat on the mat"}' \
   http://127.0.0.1:8080/v1/embeddings
 # -> {"object":"list","data":[{"object":"embedding","index":0,"embedding":[...768 floats...]}],
 #     "model":"nomic-embed-text","usage":{"prompt_tokens":8,"total_tokens":8}}
+```
+
+### `POST /v1/rerank` — rerank (auth)
+
+Cohere/Jina-compatible reranking ([ADR 0013](adr/0013-rerank-endpoint.md)), routed
+to a **rerank-capable backend/model** (vLLM or llama.cpp reranker) — not the chat
+pipeline and never `auto`. Required: `model`, `query` (non-empty string),
+`documents` (non-empty list of strings **or** `{"text": ...}` objects). Optional:
+`top_n` (non-negative int; caps the results), `return_documents` (bool, default
+`false`). Response: a `rerank` object whose `results` are **sorted by
+`relevance_score` descending**; `index` is the **original** document ordinal;
+`document` (`{"text": ...}`) appears only when `return_documents` is true (omitted,
+never `null`, otherwise).
+
+Routing, pooling, lazy-load, failover, per-key scoping, placement, usage logging,
+and response caching all apply. A model without `supports_rerank` returns `400`
+(`does not support rerank`); an unknown model `404`. **Ollama and Strata rerank
+return `400`** — Ollama has no native rerank endpoint and the broker refuses the
+embeddings-cosine substitute; Strata rerank is unverified. The documents count is
+bounded by `BROKER_RERANK_MAX_DOCUMENTS` (default 1000) and the body by
+`BROKER_MAX_REQUEST_BYTES`.
+
+```bash
+curl -s -H "Authorization: Bearer ***" -H 'content-type: application/json' \
+  -d '{"model":"bge-reranker","query":"What is the capital of France?",
+       "documents":["Paris is the capital of France.","Bananas are a fruit."],
+       "top_n":2}' \
+  http://127.0.0.1:8080/v1/rerank
+# -> {"id":"rerank-...","object":"rerank","model":"bge-reranker",
+#     "results":[{"index":0,"relevance_score":0.99},{"index":1,"relevance_score":0.01}],
+#     "usage":{"total_tokens":16}}
 ```
 
 ### `GET /usage` — request/token usage (auth)
@@ -285,7 +316,7 @@ auth disabled, the caller is treated as admin.
 
 When the exact response cache is enabled (`BROKER_RESPONSE_CACHE_ENABLED`), every
 non-streaming response on `/v1/chat/completions`, `/v1/completions`,
-`/v1/responses`, and `/v1/embeddings` carries an **`x-broker-cache`** header:
+`/v1/responses`, `/v1/embeddings`, and `/v1/rerank` carries an **`x-broker-cache`** header:
 
 - `hit` — served from cache (no inference ran);
 - `miss` — served fresh (and stored if eligible);

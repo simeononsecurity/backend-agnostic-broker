@@ -4,7 +4,8 @@
 - Date: 2026-10-18
 - Supersedes: none
 - Related: `broker/openai_compat.py`, `broker/app.py`, `docs/api-reference.md`,
-  competitive research (`docs/research/competitive-landscape.md`)
+  competitive research (`docs/research/competitive-landscape.md`);
+  **Extended by [ADR 0013](0013-rerank-endpoint.md)** (`/v1/rerank`)
 
 ## Context
 

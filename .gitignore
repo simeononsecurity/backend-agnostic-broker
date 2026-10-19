@@ -18,11 +18,13 @@ venv/
 .coverage
 htmlcov/
 
-# Local registry with real paths/hosts (ship only the example)
-registry.yaml
+# Local registry with real paths/hosts (ship only the example). Anchored to the
+# repo root so committed example registries (e.g. examples/*/registry.yaml) are
+# NOT ignored.
+/registry.yaml
 
 # Virtual API keys — hashed secrets, local-only (ship only keys.example.yaml)
-keys.yaml
+/keys.yaml
 
 # OS / editor
 .DS_Store

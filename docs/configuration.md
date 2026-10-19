@@ -229,6 +229,7 @@ carry **all** required labels; if none qualify the broker returns
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
 | `BROKER_MAX_REQUEST_BYTES` | int | `2000000` | Max request body size (413 if exceeded). |
+| `BROKER_RERANK_MAX_DOCUMENTS` | int | `1000` | Max documents accepted by `POST /v1/rerank` (ADR 0013); 400 if exceeded. Cohere recommends ≤1,000. |
 
 ## Security allow-lists
 

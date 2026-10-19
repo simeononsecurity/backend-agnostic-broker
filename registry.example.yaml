@@ -151,6 +151,47 @@ models:
       path: /api/tags
       expect_status: 200
 
+  # ---- llama.cpp reranker (POST /v1/rerank; ADR 0013) ----------------------
+  # Reranker models are addressed by name on /v1/rerank (never via `auto`). Run
+  # llama-server with --reranking --pooling rank and a reranker GGUF (e.g.
+  # bge-reranker-v2-m3); vLLM reranker models work the same way. Set
+  # supports_rerank: true so /v1/models advertises it and non-rerank models 400.
+  # Ollama/Strata rerank is NOT supported and returns 400.
+  - alias: bge-reranker
+    backend: llamacpp
+    runtime_model_id: bge-reranker-v2-m3
+    model_path: /models/bge-reranker-v2-m3-q8_0.gguf
+    base_url: http://127.0.0.1:8082
+    context_limit: 512
+    output_limit: 1
+    idle_timeout_seconds: 300
+    supports_rerank: true          # <- enables POST /v1/rerank for this model
+    router_eligible: false         # not a chat model; never a router target
+    tags: [rerank]
+    description: bge-reranker-v2-m3 cross-encoder reranker
+    startup_command:
+      - /usr/local/bin/llama-server
+      - --model
+      - "{model_path}"
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8082"
+      - --reranking
+      - --pooling
+      - rank
+      - --n-gpu-layers
+      - "{layer_split}"
+    readiness:
+      kind: http
+      path: /health
+      expect_status: 200
+      timeout_seconds: 120
+    gpu:
+      required: true
+      device_ids: [0]
+      layer_split: "99"
+
   # ---- llama.cpp (broker-managed process; model loads at startup) -----------
   - alias: qwen-llamacpp
     backend: llamacpp
