@@ -144,20 +144,38 @@ Manage keys with the CLI (run from the worktree / container):
 ```bash
 # Create a limited key — the secret is printed ONCE; store it immediately.
 python -m broker.keys create --label team-alpha --tenant alpha --scope user \
-    --rpm 60 --tpm 100000 --max-concurrency 4 \
+    --rpm 60 --rpm-burst 10 --tpm 100000 --max-concurrency 4 \
     --daily-tokens 1000000 --monthly-tokens 20000000 \
-    --daily-cost 5 --monthly-cost 100 --allowed-models chat,auto
+    --daily-cost 5 --monthly-cost 100 --allowed-models chat,auto \
+    --placement local --per-model chat:30:50000
 
 python -m broker.keys list                 # ids/labels/scopes only — no secrets
+python -m broker.keys rotate brk_1a2b3c4d --grace-days 7  # successor + grace overlap
 python -m broker.keys revoke brk_1a2b3c4d  # disables without deleting
 ```
 
-- **Rotation:** create a new key, migrate the caller, then `revoke` the old id.
-  The secret cannot be recovered — only its hash is stored. Reload the broker (or
-  rely on process restart) to pick up `keys.yaml` changes.
+- **Rotation (ADR 0016):** `broker.keys rotate <id> --grace-days N` (or
+  `POST /admin/keys/{id}/rotate`) mints a successor inheriting the predecessor's
+  label/tenant/scope/limits, prints the new secret **once**, and keeps the old key
+  valid for `N` days (`0` = revoke immediately) so callers cut over with no
+  downtime. Secrets are never recoverable — only hashes are stored.
+- **Admin key API (ADR 0016):** with `BROKER_ADMIN_ENABLED=true` and an admin-scope
+  key, `GET/POST /admin/keys`, `POST /admin/keys/{id}/rotate`, and
+  `DELETE /admin/keys/{id}` manage keys over HTTP; mutations rewrite `keys.yaml` and
+  reload the in-memory store. **Multi-replica:** the admin API writes the local
+  `keys.yaml`, so point every replica at a shared `keys.yaml` (or designate one node
+  as the key-management writer and reload the others) to keep them consistent.
 - **Expiry:** set `--expiry YYYY-MM-DD` (UTC); expired keys fail closed.
+- **Rate-limit algorithm (ADR 0016):** `BROKER_RATE_LIMIT_ALGO=gcra` switches rpm to
+  an atomic token-bucket with per-key burst (`limits.rpm_burst`);
+  `BROKER_RATE_LIMIT_TPM_ALGO=sliding` switches tpm to a weighted sliding-window
+  counter. Defaults (`sliding_log`/`fixed`) reproduce v0.5.0. A governance store
+  error **fails closed** (requests are denied) — if Redis is down with governance
+  on, expect 5xx/denied rather than an uncapped free-for-all.
 - **Cost budgets** require a registry `pricing` block (USD/million tokens); keys
   without priced models only accrue token budgets.
+- **Tenant budgets (ADR 0016):** a `tenants:` block in `keys.yaml` caps aggregate
+  token/cost across all keys of a tenant, enforced alongside per-key budgets.
 - **Counters & resets:** `rpm`/`tpm` reset on a rolling
   `BROKER_RATE_LIMIT_WINDOW_SECONDS` window; token/cost budgets reset at the UTC
   day/month boundary automatically (period-bucketed `StateStore` keys with TTL).

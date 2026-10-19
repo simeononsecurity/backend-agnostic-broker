@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Governance v2** (ADR 0016) — resolves every deferred per-key governance item:
+  - **Selectable rate-limit algorithms.** `BROKER_RATE_LIMIT_ALGO` =
+    `sliding_log` (exact, default) or `gcra` (atomic GCRA/token-bucket with
+    per-key burst via `limits.rpm_burst`), backed by a new atomic
+    `StateStore.gcra` primitive (in-process + Redis Lua, single round-trip).
+    `BROKER_RATE_LIMIT_TPM_ALGO` = `fixed` (default) or `sliding` (weighted
+    two-bucket sliding-window counter).
+  - **Per-model limits** — `limits.per_model: {model: {rpm, tpm}}` enforced on
+    the resolved model incl. the `auto` pick and every cascade hop.
+  - **Hierarchical tenant budgets** — a `tenants:` block in `keys.yaml` caps
+    aggregate daily/monthly token + cost across all keys of a tenant.
+  - **Per-key placement** — `limits.placement` unioned (fail-closed) into the
+    request placement requirement (`403 placement_denied`).
+  - **Key rotation** — `python -m broker.keys rotate <id> --grace-days N`
+    mints a successor with a grace overlap (`0` = revoke now).
+  - **Admin key-management API** — `GET/POST /admin/keys`,
+    `POST /admin/keys/{id}/rotate`, `DELETE /admin/keys/{id}` (admin-scope only,
+    secret shown once, never logged).
+  - Governance now **fails closed** on a `StateStore` error (request denied).
+  - **Rejected:** retrievable/encrypted keys — hash-only at rest is the security
+    property; rotation covers the operational need.
+- CLI `broker.keys create` gains `--rpm-burst`, `--placement`, `--per-model`;
+  new `rotate` subcommand.
+
+### Notes
+
+- **Defaults reproduce v0.5.0 byte-for-byte** (`sliding_log` rpm, `fixed` tpm, no
+  per-model/tenant limits, no per-key placement; governance inert with no keys
+  file). The `[dev]` extra now pulls `fakeredis[lua]` to exercise the Redis Lua
+  path in tests.
+
 ## [0.5.0] - 2026-10-19
 
 ### Added

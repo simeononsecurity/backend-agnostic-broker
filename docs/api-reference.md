@@ -32,6 +32,27 @@ type `authentication_error`.
   key requests a model outside its `allowed_models`; this also applies to the
   model the `auto` router selects (fail-closed).
 
+**Governance v2 (ADR 0016).** The same contract extends to:
+
+- **Per-model limits** — `limits.per_model: {model: {rpm, tpm}}` yields `429`
+  `rate_limit_exceeded` (message names the model) when a key exceeds a model's cap.
+  Enforced on the **resolved** model — the `auto` pick and every cascade hop — so
+  it cannot be bypassed via `auto` or an escalation.
+- **Tenant budgets** — a `tenants:` block caps aggregate token/cost across all keys
+  of a tenant; exhaustion is `429` `insufficient_quota` (message names the tenant),
+  enforced in addition to per-key budgets.
+- **Per-key placement** — `limits.placement: [labels]` is unioned into the request
+  placement requirement (it can only tighten it); an unsatisfiable requirement is
+  `403` `placement_denied`, intersecting with the `x-broker-placement` header.
+- **Rate-limit algorithm** — `rpm` uses the exact sliding-log by default or an
+  atomic **GCRA** token-bucket (`BROKER_RATE_LIMIT_ALGO=gcra`) with per-key burst
+  (`limits.rpm_burst`); `tpm` uses a fixed window by default or a weighted
+  **sliding-window counter** (`BROKER_RATE_LIMIT_TPM_ALGO=sliding`). The header
+  contract is unchanged.
+
+A governance store error **fails closed** (the request is denied) rather than
+silently removing the cap.
+
 **Rate-limit headers.** Responses to limited keys carry OpenAI-style headers so
 clients can self-pace: `x-ratelimit-limit-requests` / `-remaining-requests` /
 `-reset-requests` and the `-tokens` equivalents. `Retry-After` (seconds) is set on
@@ -342,6 +363,29 @@ unchanged models keep serving; added models are registered (not loaded).
 ```bash
 curl -s -X POST -H "X-Admin-Key: ***" http://127.0.0.1:8080/admin/registry/reload
 # -> {"added":["echo3"],"removed":["echo2"],"changed":[],"unchanged":["echo"],"models":2}
+```
+
+### Admin key management (ADR 0016)
+
+Manage virtual keys over HTTP (admin-scope only; same `require_admin` gate). The
+secret appears **exactly once**, in the create/rotate response, and is never stored
+or logged. Requires `BROKER_KEYS_PATH` (else `400` `keys_file_required`).
+
+- **`GET /admin/keys`** — list keys (id/label/tenant/scope/enabled/expiry/limits).
+  **Never** returns secrets or hashes.
+- **`POST /admin/keys`** — create. Body: `label?`, `tenant?`, `scope?`
+  (`user`|`admin`), `expiry?`, `limits?` (same schema as `keys.yaml`). Returns
+  `201` with the key view **plus** a one-time `secret`.
+- **`POST /admin/keys/{id}/rotate`** — mint a successor inheriting the
+  predecessor's settings; body `grace_days?` (default 7; `0` = revoke old now).
+  Returns `201` with the new one-time `secret`. `404` `key_not_found` if absent.
+- **`DELETE /admin/keys/{id}`** — revoke (sets `enabled:false`). `404` if absent.
+
+```bash
+curl -s -X POST -H "X-Admin-Key: ***" -H 'Content-Type: application/json' \
+  -d '{"label":"ci","tenant":"alpha","limits":{"rpm":10,"allowed_models":["chat"]}}' \
+  http://127.0.0.1:8080/admin/keys
+# -> 201 {"id":"brk_1a2b3c4d","scope":"user",...,"secret":"brk_1a2b3c4d_<shown once>"}
 ```
 
 ## OpenAPI
