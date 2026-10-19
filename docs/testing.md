@@ -13,13 +13,13 @@ so they exercise the real request path, lifecycle, locking, and security
 boundaries without any external runtime. The suite is CPU-only; optional GPU
 tests (if added) should be marked and excluded from CI.
 
-In the default CPU venv, 342 pass and 26 skip — the skips are the Redis-backed
+In the default CPU venv, 366 pass and 26 skip — the skips are the Redis-backed
 `StateStore` paths (counters, prefix index, response cache) and the OpenTelemetry
 span path, which need the optional `redis`/`otel` extras. In a venv with
-`pip install -e '.[dev,redis,otel]'` those run too: **366 passed, 2 skipped**
+`pip install -e '.[dev,redis,otel]'` those run too: **390 passed, 2 skipped**
 (the remaining 2 are import-guard paths that only fire when a package is *absent*).
 
-## Coverage map (368 collected)
+## Coverage map (392 collected)
 
 | File | Tests | Covers |
 |------|-------|--------|
