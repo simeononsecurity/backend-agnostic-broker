@@ -25,12 +25,19 @@ Errors are structured (`broker/errors.py`) and carry a `remediation` hint and a
 | `auto` routes via heuristic though you expected the LLM | — (works, logged) | The GGUF classifier is unavailable: `BROKER_ROUTER_MODEL_PATH` missing, `llama_cpp` not importable, or a missing runtime lib | Check `GET /status.router.backend`; use the `-llm` image (bundles the model + `libgomp1`) or set `BROKER_ROUTER_MODEL_PATH`; see logs for the fallback reason. |
 | `auto` picks a sub-optimal model | — (valid but imperfect) | The bundled 0.5B classifier is accuracy-limited on small catalogs | Refine per-model `tags`/`priority`/`cost_tier` or add a `router.overrides` rule; use `router_backend=heuristic`, or a larger GGUF via `ROUTER_MODEL_URL`. |
 | `-llm` image: `libgomp.so.1: cannot open shared object file` | runtime import error | OpenMP runtime missing (only if you built a custom image) | The provided Dockerfile installs `libgomp1` for the llm variant; ensure it's present. |
+| Startup aborts: "BROKER_REDIS_URL is set but the 'redis' package is not installed" | `config_error` (500) | Redis shared state enabled without the optional dep | `pip install 'backend-agnostic-broker[redis]'`, or unset `BROKER_REDIS_URL` to use in-process state. |
+| A pool member stops receiving traffic | — (works, logged) | Cooldowns are on (`BROKER_COOLDOWN_FAILURES>0`) and the member hit the failure threshold | Check `GET /healthz/backends` → `cooldown.in_cooldown`/`seconds_remaining`; it half-opens automatically after `BROKER_COOLDOWN_SECONDS`. Fix the backend, or disable with `BROKER_COOLDOWN_FAILURES=0`. |
+| Requests slower under load after enabling retries | — (expected) | Backoff sleeps between retry attempts | Lower `BROKER_RETRY_BACKOFF_BASE_MS`/`MAX_MS` or `BROKER_RETRY_MAX_ATTEMPTS`; retrying is bounded by `BROKER_REQUEST_TIMEOUT_SECONDS`. |
 
 ## Diagnostics
 
 - `GET /status` shows each model's state, pid, inflight, idle seconds, and
-  `last_error`. The `router` block shows the active backend (`llm`/`heuristic`),
-  cache size, and recent `auto` decisions (`chosen`, `via`, `latency_ms`).
+  `last_error`, plus `state_backend` (`in_process`/`redis`), `retry_max_attempts`,
+  `cooldowns_enabled`, and per-model `cooldown` when cooldowns are on. The
+  `router` block shows the active backend (`llm`/`heuristic`), cache size, and
+  recent `auto` decisions (`chosen`, `via`, `latency_ms`).
+- `GET /healthz/backends` shows per-member liveness and `cooldown`
+  (`failures`, `in_cooldown`, `seconds_remaining`).
 - `GET /metrics` shows request/latency/in-flight/loaded gauges.
 - Logs: set `BROKER_LOG_LEVEL=DEBUG` for verbose output.
 - Reproduce the full local check suite via `docs/EVIDENCE.md`.
