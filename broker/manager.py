@@ -49,8 +49,8 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import random
 import time
-from collections import OrderedDict
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -66,6 +66,7 @@ from .errors import (
 from .lifecycle import LifecycleMachine, State
 from .registry import ModelEntry, Registry
 from .router import AutoRouter
+from .state import make_state_store
 
 log = logging.getLogger("broker.manager")
 
@@ -171,8 +172,14 @@ class ModelManager:
         self.global_sem = asyncio.Semaphore(settings.max_concurrent_requests)
         self._route_lock = asyncio.Lock()
         self._route_counter = itertools.count(1)
-        # Sticky routing: (public_name, session_key) -> member alias. LRU-ordered.
-        self._sticky: OrderedDict[tuple[str, str], str] = OrderedDict()
+        # Shared routing/runtime state (ADR 0009): in-process by default, or
+        # Redis when BROKER_REDIS_URL is set (multi-replica). Owns the sticky
+        # session map, per-member cooldowns, counters, and a generic KV.
+        self.state = make_state_store(settings)
+        # Back-compat view of the sticky map for in-process deployments/tests:
+        # (public_name, session_key) -> member alias, LRU-ordered. None under
+        # Redis (the shared store is authoritative there).
+        self._sticky = getattr(self.state, "sticky", None)
         # Auto-router ("auto" alias). Lazy-constructed; classification serialized.
         self.router: AutoRouter | None = None
         self._router_lock = asyncio.Lock()
@@ -265,14 +272,43 @@ class ModelManager:
         """
         return min(tier, key=lambda m: (m.machine.inflight, m._route_seq))
 
-    def _remember_sticky(self, name: str, route_key: str, alias: str) -> None:
-        """Record/refresh a session->member pairing with LRU eviction."""
-        k = (name, route_key)
-        self._sticky[k] = alias
-        self._sticky.move_to_end(k)
-        cap = self.settings.route_sticky_max_entries
-        while cap > 0 and len(self._sticky) > cap:
-            self._sticky.popitem(last=False)
+    def _attempt_budget(self, n_members: int) -> int:
+        """How many serve attempts a request gets.
+
+        Default (``retry_max_attempts == 0``) is legacy: one attempt per pool
+        member (a single failover pass, no sleep). A positive value caps total
+        attempts and enables re-trying members after a backoff delay.
+        """
+        n = self.settings.retry_max_attempts
+        return n if n > 0 else n_members
+
+    def _backoff_delay_s(self, attempt: int) -> float:
+        """Full-jitter capped exponential backoff (AWS pattern), in seconds.
+
+        ``delay = uniform(0, min(max_ms, base_ms * 2**attempt))``. Returns 0 when
+        ``retry_backoff_base_ms`` is 0 (the default) so the legacy path never
+        sleeps. ``attempt`` is 0-based across retries.
+        """
+        base = self.settings.retry_backoff_base_ms
+        if base <= 0:
+            return 0.0
+        cap = self.settings.retry_backoff_max_ms
+        hi = min(cap, base * (2**attempt))
+        return random.uniform(0, hi) / 1000.0
+
+    async def _note_success(self, m: ManagedModel) -> None:
+        """Reset a member's cooldown after a successful serve (no-op if off)."""
+        if self.settings.cooldown_failures > 0:
+            await self.state.record_success(m.entry.alias)
+
+    async def _note_failure(self, m: ManagedModel) -> None:
+        """Record a member failure; bench it on reaching the threshold (off=no-op)."""
+        if self.settings.cooldown_failures > 0:
+            await self.state.record_failure(
+                m.entry.alias,
+                threshold=self.settings.cooldown_failures,
+                cooldown_seconds=self.settings.cooldown_seconds,
+            )
 
     async def _select_member(
         self,
@@ -309,15 +345,37 @@ class ModelManager:
             if not tier:
                 tier = pool  # last resort: retry a failed member (self-heal)
 
+            # Member cooldowns (ADR 0009): when enabled, cooldown state is the
+            # authoritative benching signal (it supersedes the transient
+            # `healthy` flag). Benched members are skipped; a member whose window
+            # has elapsed rejoins as a half-open trial even if a prior failover
+            # left healthy=False. If EVERY member is benched, fall through to the
+            # healthy-based `tier` so the pool can still self-heal.
+            if self.settings.cooldown_failures > 0:
+                now = time.time()
+                benched = set()
+                for m in pool:
+                    if (await self.state.get_cooldown(m.entry.alias, now=now)).in_cooldown:
+                        benched.add(m.entry.alias)
+                live = [
+                    m
+                    for m in pool
+                    if m.entry.alias not in benched and m.machine.state != State.FAILED
+                ]
+                if not live:
+                    live = [m for m in pool if m.entry.alias not in benched]
+                if live:
+                    tier = live
+
             strategy = self.settings.route_strategy
             chosen: ManagedModel | None = None
             if strategy == "sticky" and route_key is not None and len(members) > 1:
-                assigned = self._sticky.get((name, route_key))
+                assigned = await self.state.sticky_get(name, route_key)
                 if assigned is not None:
                     chosen = next((m for m in tier if m.entry.alias == assigned), None)
                 if chosen is None:  # new session, or pinned member unavailable
                     chosen = self._assign_member(tier)
-                self._remember_sticky(name, route_key, chosen.entry.alias)
+                await self.state.sticky_set(name, route_key, chosen.entry.alias)
             elif strategy == "round_robin":
                 chosen = min(tier, key=lambda m: (m._route_seq,))
             else:  # least_busy
@@ -335,25 +393,58 @@ class ModelManager:
         await m.ensure_ready()
         return m
 
-    async def chat(
-        self, name: str, payload: dict, request_id: str, route_key: str | None = None
+    async def _route_and_serve(
+        self,
+        name: str,
+        members: list[ManagedModel],
+        route_key: str | None,
+        serve,
     ) -> dict:
-        name = await self._resolve_auto(name, payload)
-        members = self._members_for(name)
+        """Select a pool member, serve, and retry within the pool on failure.
+
+        Shared driver for chat + embeddings. Retries stay WITHIN the requested
+        public model's pool — never a different model (the no-silent-cross-model
+        invariant). Between attempts it waits a full-jitter backoff (zero by
+        default). The attempt budget and member re-trying are gated by
+        ``retry_max_attempts`` so the default is a single failover pass with no
+        sleep, exactly as v0.4.0. Overall retrying also respects the request
+        timeout as a deadline.
+        """
         exclude: set[str] = set()
         last: Exception | None = None
-        for _ in range(len(members)):
+        cap = self._attempt_budget(len(members))
+        deadline: float | None = None
+        if self.settings.retry_max_attempts > 0 and self.settings.request_timeout_seconds > 0:
+            deadline = time.monotonic() + self.settings.request_timeout_seconds
+        attempt = 0
+        while attempt < cap:
+            if attempt > 0:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                delay = self._backoff_delay_s(attempt - 1)
+                if delay > 0:
+                    await asyncio.sleep(delay)
             m = await self._select_member(name, members, exclude, route_key)
             if m is None:
-                break
+                # Exhausted distinct members. With retries enabled, clear the
+                # exclusion set and try members again (within the same pool).
+                if self.settings.retry_max_attempts > 0 and exclude:
+                    exclude = set()
+                    m = await self._select_member(name, members, exclude, route_key)
+                if m is None:
+                    break
+            attempt += 1
             try:
-                return await self._serve_chat(m, name, payload, request_id)
-            except _FAILOVER_ERRORS as exc:  # member unavailable → try another
+                result = await serve(m)
+                await self._note_success(m)
+                return result
+            except _FAILOVER_ERRORS as exc:  # member unavailable → retry/failover
                 m.healthy = False
+                await self._note_failure(m)
                 exclude.add(m.entry.alias)
                 last = exc
                 log.warning(
-                    "pool %s: member %s failed (%s); failing over", name, m.entry.alias, exc
+                    "pool %s: member %s failed (%s); retry/failover", name, m.entry.alias, exc
                 )
                 continue
         if last is not None:
@@ -362,6 +453,18 @@ class ModelManager:
             f"no healthy backend available for model {name!r}",
             model=name,
             remediation="check GET /healthz/backends",
+        )
+
+    async def chat(
+        self, name: str, payload: dict, request_id: str, route_key: str | None = None
+    ) -> dict:
+        name = await self._resolve_auto(name, payload)
+        members = self._members_for(name)
+        return await self._route_and_serve(
+            name,
+            members,
+            route_key,
+            lambda m: self._serve_chat(m, name, payload, request_id),
         )
 
     async def _serve_chat(
@@ -404,11 +507,29 @@ class ModelManager:
         exclude: set[str] = set()
         last: Exception | None = None
         chosen: ManagedModel | None = None
-        # Select + ready a member, with failover *before* the stream starts.
-        for _ in range(len(members)):
+        # Select + ready a member, with retry/failover *before* the stream
+        # starts. Once bytes are flowing we NEVER retry (a half-emitted stream
+        # can't be transparently restarted). Retries stay within this pool.
+        cap = self._attempt_budget(len(members))
+        deadline: float | None = None
+        if self.settings.retry_max_attempts > 0 and self.settings.request_timeout_seconds > 0:
+            deadline = time.monotonic() + self.settings.request_timeout_seconds
+        attempt = 0
+        while attempt < cap:
+            if attempt > 0:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                delay = self._backoff_delay_s(attempt - 1)
+                if delay > 0:
+                    await asyncio.sleep(delay)
             m = await self._select_member(name, members, exclude, route_key)
             if m is None:
-                break
+                if self.settings.retry_max_attempts > 0 and exclude:
+                    exclude = set()
+                    m = await self._select_member(name, members, exclude, route_key)
+                if m is None:
+                    break
+            attempt += 1
             try:
                 await self._maybe_evict(m.entry.alias)
                 await m.ensure_ready()
@@ -418,6 +539,7 @@ class ModelManager:
                 m.healthy = False
                 m.machine.inflight -= 1  # release reservation; we won't serve here
                 m.machine.touch()
+                await self._note_failure(m)
                 exclude.add(m.entry.alias)
                 last = exc
                 continue
@@ -439,6 +561,7 @@ class ModelManager:
         try:
             async for chunk in m.adapter.stream_chat(payload, request_id):
                 yield chunk
+            await self._note_success(m)  # stream completed cleanly → reset cooldown
         finally:
             m.machine.inflight -= 1
             m.machine.touch()
@@ -457,28 +580,11 @@ class ModelManager:
         selection, concurrency gating, lazy-load, and failover as chat.
         """
         members = self._members_for(name)
-        exclude: set[str] = set()
-        last: Exception | None = None
-        for _ in range(len(members)):
-            m = await self._select_member(name, members, exclude, route_key)
-            if m is None:
-                break
-            try:
-                return await self._serve_embeddings(m, name, payload, request_id)
-            except _FAILOVER_ERRORS as exc:
-                m.healthy = False
-                exclude.add(m.entry.alias)
-                last = exc
-                log.warning(
-                    "pool %s: member %s failed (%s); failing over", name, m.entry.alias, exc
-                )
-                continue
-        if last is not None:
-            raise last
-        raise BackendUnavailableError(
-            f"no healthy backend available for model {name!r}",
-            model=name,
-            remediation="check GET /healthz/backends",
+        return await self._route_and_serve(
+            name,
+            members,
+            route_key,
+            lambda m: self._serve_embeddings(m, name, payload, request_id),
         )
 
     async def _serve_embeddings(
@@ -617,6 +723,7 @@ class ModelManager:
 
     async def _backend_health_entry(self, m: ManagedModel) -> dict[str, Any]:
         probe = await self._probe_member(m)
+        cd = await self.state.get_cooldown(m.entry.alias)
         return {
             "alias": m.entry.alias,
             "model": m.public_name,
@@ -627,6 +734,7 @@ class ModelManager:
             "status": probe["status"],
             "detail": probe["detail"],
             "inflight": m.machine.inflight,
+            "cooldown": cd.to_dict(),
         }
 
     async def ollama_ps(self) -> dict[str, Any]:
@@ -662,9 +770,11 @@ class ModelManager:
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
         await asyncio.gather(*(m.stop() for m in self.models.values()), return_exceptions=True)
+        await self.state.close()
 
     # --- status ----------------------------------------------------------
     async def status(self) -> dict[str, Any]:
+        cooldowns_on = self.settings.cooldown_failures > 0
         models = []
         for m in self.models.values():
             snap = m.machine.snapshot()
@@ -672,6 +782,8 @@ class ModelManager:
             snap["backend"] = m.adapter.name
             snap["healthy"] = m.healthy
             snap["last_health"] = m.last_health
+            if cooldowns_on:
+                snap["cooldown"] = (await self.state.get_cooldown(m.entry.alias)).to_dict()
             try:
                 snap["adapter"] = await m.adapter.collect_status()
             except Exception as exc:  # noqa: BLE001
@@ -682,7 +794,10 @@ class ModelManager:
             "max_loaded_models": self.settings.max_loaded_models,
             "max_concurrent_requests": self.settings.max_concurrent_requests,
             "route_strategy": self.settings.route_strategy,
-            "sticky_sessions": len(self._sticky),
+            "sticky_sessions": await self.state.sticky_len(),
+            "state_backend": self.state.backend,
+            "retry_max_attempts": self.settings.retry_max_attempts,
+            "cooldowns_enabled": cooldowns_on,
             "router": self.router.status() if self.router else {"enabled": False},
             "pools": {
                 name: [mm.entry.alias for mm in members] for name, members in self.pools.items()
