@@ -7,3 +7,7 @@ OpenAPI/CHANGELOG/tests whenever you touch code), when to write an ADR, the
 quality gates, the security/redaction rules, the git/release rules, and a map of
 where everything lives. Human contributor guidance is in
 [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
+
+Two skills carry the detailed best-practice workflows AGENTS.md points to:
+- **`maintaining-docs`** — load before updating or auditing documentation.
+- **`writing-adrs`** — load before adding or changing an ADR.

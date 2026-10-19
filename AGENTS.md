@@ -8,6 +8,11 @@ This repo is a **backend-agnostic, OpenAI-compatible local AI broker** (Python /
 FastAPI) that lazily loads models and routes requests to Ollama, vLLM, llama.cpp,
 and Strata. It is small, well-documented, and heavily tested — keep it that way.
 
+> **Skills (for Hermes agents):** load **`maintaining-docs`** before touching any
+> documentation and **`writing-adrs`** before adding or changing an ADR. Those
+> skills carry the detailed best-practice workflow, the ADR template, and the
+> checklists that back the rules in §3 and §4 — use them, don't reinvent them.
+
 ---
 
 ## 1. Golden rules (non-negotiable)
@@ -36,6 +41,8 @@ and Strata. It is small, well-documented, and heavily tested — keep it that wa
 ## 2. Start-of-task checklist
 
 - [ ] Read this file and [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md).
+- [ ] Load the `maintaining-docs` / `writing-adrs` skills if the task touches docs
+      or decisions.
 - [ ] Skim [`docs/architecture.md`](docs/architecture.md) and the relevant ADRs
       in [`docs/adr/`](docs/adr/) for the area you're touching.
 - [ ] Use the venv: `make venv && make install` (or `.venv/bin/python`).
@@ -46,7 +53,8 @@ and Strata. It is small, well-documented, and heavily tested — keep it that wa
 ## 3. The Change Contract — update these when you touch that
 
 For **every** change, work through this table. If a row's trigger applies, the
-listed updates are **required in the same commit**.
+listed updates are **required in the same commit**. The **`maintaining-docs`**
+skill expands this with Diátaxis, writing style, and a de-stale audit pass.
 
 | If you change… | You MUST also update… |
 |----------------|------------------------|
@@ -76,6 +84,10 @@ listed updates are **required in the same commit**.
 
 ## 4. When to write an ADR
 
+> Load the **`writing-adrs`** skill — it carries the significance test, the full
+> Nygard/MADR section rules, the immutability/superseding workflow, and the ADR
+> template. The summary below is the gist.
+
 Add a numbered file to [`docs/adr/`](docs/adr/) (next number, zero-padded:
 `000N-short-slug.md`) whenever you:
 
@@ -87,7 +99,8 @@ Add a numbered file to [`docs/adr/`](docs/adr/) (next number, zero-padded:
 **Format** (match the existing ADRs): title, `Status`, `Date`, `Supersedes`,
 `Related`, then `## Context`, `## Decision`, `## Alternatives considered`,
 `## Consequences`. Keep it short and honest — record what was rejected and why.
-Never silently reverse a past ADR; write a new one that supersedes it.
+**Never silently reverse a past ADR; write a new one that supersedes it** and set
+the old one's status to `Superseded by ADR-NNNN`.
 
 Existing ADRs: `0001` language choice · `0002` architecture review ·
 `0003` pools/sticky/health · `0004` auto router · `0005` image variants &
@@ -174,6 +187,8 @@ coverage map. **CI** — `.github/workflows/` (PR tests + tagged release).
 **Config/examples** — `.env.example`, `registry.example.yaml`, `docker-compose*.yml`.
 **Build/tasks** — `Dockerfile`, `Makefile` (run `make help`), `scripts/`.
 **Project log** — `NOTES.md` (selected path, environment, running decisions).
+**Agent skills** — `maintaining-docs` (doc best practices) and `writing-adrs`
+(ADR best practices) encode the detailed workflows behind §3 and §4.
 
 When unsure where something lives: `make help`, then grep `broker/` and read the
 matching `docs/` page and ADR before changing code.
