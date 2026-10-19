@@ -3,7 +3,7 @@
 Run the suite:
 
 ```bash
-make test                 # pytest -q  (67 tests)
+make test                 # pytest -q  (125 tests)
 make cov                  # with coverage
 python -m pytest -q tests/test_security.py   # one file
 ```
@@ -13,15 +13,19 @@ so they exercise the real request path, lifecycle, locking, and security
 boundaries without any external runtime. The suite is CPU-only; optional GPU
 tests (if added) should be marked and excluded from CI.
 
-## Coverage map (67 tests)
+## Coverage map (125 tests)
 
 | File | Tests | Covers |
 |------|-------|--------|
 | `tests/test_config.py` | 5 | Typed config + fail-fast `validate_runtime` (auth without keys, bad port, missing registry, policy/log-format validation). |
-| `tests/test_registry.py` | 6 | Registry parsing/validation, unknown-field rejection, duplicate-alias detection, backend filtering. |
+| `tests/test_registry.py` | 10 | Registry parsing/validation, unknown-field rejection, duplicate-alias detection, backend filtering, pool + router config. |
 | `tests/test_lifecycle.py` | 5 | State machine legal/illegal transitions, idle timing, snapshots. |
 | `tests/test_adapters.py` | 5 | Adapter contract conformance + fake backend behavior. |
 | `tests/test_api.py` | 10 | `/v1/models`, `/v1/chat/completions`, `/healthz`, `/readyz`, `/status`, `/metrics`, structured errors, request IDs, size limit. |
+| `tests/test_routing.py` | 8 | Load-balancing pools: single public model, concurrent spread, failover, streaming failover, round-robin, pool/alias collision. |
+| `tests/test_sticky.py` | 9 | Sticky session routing: pin by header/`user`/IP, distinct-session spread, re-pin on failure, LRU bound, `/status`. |
+| `tests/test_health_probe.py` | 8 | Non-loading health: `/healthz/backends`, periodic probe marks dead backends failed (never loads), `/api/ps` aggregation. |
+| `tests/test_router.py` | 29 | `auto` router: flag extraction, Stage-1 capability filter, overrides, heuristic task routing, fallback, cache, GBNF/prompt builders, manager + API end-to-end. |
 | `tests/test_auth.py` | 6 | Bearer + `X-API-Key`, missing/invalid key, unauthenticated probes. |
 | `tests/test_streaming.py` | 1 | SSE streaming (`chat.completion.chunk` + `[DONE]`). |
 | `tests/test_lazy_load.py` | 4 | No model loads at startup; a request loads only its selected model; no fallback. |

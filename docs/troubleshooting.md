@@ -21,11 +21,16 @@ Errors are structured (`broker/errors.py`) and carry a `remediation` hint and a
 | `429 rate_limit_error` | `rate_limit_error` | Concurrency/loaded-model cap hit | Raise `BROKER_MAX_LOADED_MODELS`/concurrency, or retry; check for a model stuck busy. |
 | `413 request_too_large` | `request_too_large` | Body over `BROKER_MAX_REQUEST_BYTES` | Reduce payload or raise the limit. |
 | Ollama: "ollama backend is external; remove startup_command" | `config_error` | `startup_command` set for Ollama | Remove it; Ollama manages its own process (set only `base_url`). |
+| `auto`: `400 ... no registered model can satisfy this request` | `invalid_request_error` | No model passes the Stage-1 capability filter (e.g. an image request but no vision model) | Add a capable model, or send a concrete `model` id. |
+| `auto` routes via heuristic though you expected the LLM | — (works, logged) | The GGUF classifier is unavailable: `BROKER_ROUTER_MODEL_PATH` missing, `llama_cpp` not importable, or a missing runtime lib | Check `GET /status.router.backend`; use the `-llm` image (bundles the model + `libgomp1`) or set `BROKER_ROUTER_MODEL_PATH`; see logs for the fallback reason. |
+| `auto` picks a sub-optimal model | — (valid but imperfect) | The bundled 0.5B classifier is accuracy-limited on small catalogs | Refine per-model `tags`/`priority`/`cost_tier` or add a `router.overrides` rule; use `router_backend=heuristic`, or a larger GGUF via `ROUTER_MODEL_URL`. |
+| `-llm` image: `libgomp.so.1: cannot open shared object file` | runtime import error | OpenMP runtime missing (only if you built a custom image) | The provided Dockerfile installs `libgomp1` for the llm variant; ensure it's present. |
 
 ## Diagnostics
 
 - `GET /status` shows each model's state, pid, inflight, idle seconds, and
-  `last_error`.
+  `last_error`. The `router` block shows the active backend (`llm`/`heuristic`),
+  cache size, and recent `auto` decisions (`chosen`, `via`, `latency_ms`).
 - `GET /metrics` shows request/latency/in-flight/loaded gauges.
 - Logs: set `BROKER_LOG_LEVEL=DEBUG` for verbose output.
 - Reproduce the full local check suite via `docs/EVIDENCE.md`.

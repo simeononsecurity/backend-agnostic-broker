@@ -61,7 +61,7 @@ Returns `200` whenever the process is up.
 
 ```bash
 curl -s http://127.0.0.1:8080/healthz
-# {"status":"ok","version":"0.1.0"}
+# {"status":"ok","version":"0.3.0"}
 ```
 
 ### `GET /readyz` — readiness (no auth)

@@ -1,5 +1,7 @@
 # Routing, Load Balancing & Health
 
+> Design rationale and alternatives: [ADR 0003](adr/0003-routing-and-health.md).
+
 This broker can spread traffic for one logical model across **multiple backend
 hosts** (a *pool*), fail over when a host is down, and liveness-probe backends
 **without ever loading a model**.

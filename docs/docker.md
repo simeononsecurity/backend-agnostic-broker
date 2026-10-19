@@ -7,13 +7,13 @@ The broker ships a hardened, multi-stage image (`Dockerfile`).
 ```bash
 make docker-build
 # or:
-docker build --build-arg VERSION=0.1.0 --build-arg VCS_REF=$(git rev-parse --short HEAD) \
-  -t backend-agnostic-broker:0.1.0 .
+docker build --build-arg VERSION=0.3.0 --build-arg VCS_REF=$(git rev-parse --short HEAD) \
+  -t backend-agnostic-broker:0.3.0 .
 ```
 
 Build args become OCI labels: `org.opencontainers.image.version` (`VERSION`) and
 `org.opencontainers.image.revision` (`VCS_REF`), plus title/description/source/
-licenses. Inspect with `docker inspect backend-agnostic-broker:0.1.0`.
+licenses. Inspect with `docker inspect backend-agnostic-broker:0.3.0`.
 
 ## Image variants (lean vs bundled router LLM)
 
@@ -64,7 +64,7 @@ docker run --rm -p 8080:8080 \
   -v "$(pwd)/registry.example.yaml:/config/registry.yaml:ro" \
   --read-only --tmpfs /tmp/broker --tmpfs /var/cache/broker \
   --cap-drop ALL --security-opt no-new-privileges:true \
-  backend-agnostic-broker:0.1.0
+  backend-agnostic-broker:0.3.0
 ```
 
 ## Smoke test

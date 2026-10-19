@@ -1,5 +1,7 @@
 # The `auto` router
 
+> Design rationale and alternatives: [ADR 0004](adr/0004-auto-router.md).
+
 `auto` is a virtual model id. Send a request with `"model": "auto"` and a tiny
 classifier picks the single best real model the broker currently exposes, then
 the request flows through normal pool routing + failover. **Only `auto` is

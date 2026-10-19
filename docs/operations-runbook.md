@@ -28,6 +28,7 @@
 | Shed load instead of queueing | `BROKER_LOAD_CONCURRENCY_POLICY=reject` (429 when saturated) |
 | Faster idle reclaim | lower `BROKER_IDLE_SWEEP_INTERVAL_SECONDS` |
 | Slow-loading runtimes | raise `startup_timeout_seconds` / `readiness.timeout_seconds` |
+| Sharpen `auto` routing | refine per-model `tags`/`priority`/`cost_tier`, add `router.overrides`, or set `BROKER_ROUTER_BACKEND=heuristic`\|`llm` |
 
 ## Capacity model
 
