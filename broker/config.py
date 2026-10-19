@@ -102,6 +102,22 @@ class Settings(BaseSettings):
     # Deterministic fallback model id (overrides registry router.default).
     router_default_model: str | None = None
 
+    # --- Auto-router: latency-budget routing (ADR 0011) ---
+    # Default per-request latency budget in ms (the x-broker-latency-budget-ms
+    # header, else registry router.latency_budget_ms, else this). None = no budget.
+    router_latency_budget_ms: float | None = None
+    # Rolling window (seconds) of the usage log used to estimate per-model latency.
+    router_latency_window_seconds: float = 3600.0
+    # Estimated extra latency (ms) added for a model that is not currently resident
+    # (cold start), since lazy-load means the first call also pays load time.
+    router_cold_start_ms: float = 1500.0
+
+    # --- Placement / data-residency pinning (ADR 0011, fail-closed) ---
+    # Baseline placement labels required of EVERY request (unioned with the
+    # x-broker-placement header). Empty = no baseline requirement. A request is
+    # only served by models carrying all required labels, else 403 placement_denied.
+    default_placement: list[str] = Field(default_factory=list)
+
     # --- Limits ---
     max_request_bytes: int = 2_000_000
 

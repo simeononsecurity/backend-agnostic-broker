@@ -74,6 +74,17 @@ class FakeAdapter(BackendAdapter):
 
     def _completion(self, payload: dict[str, Any], text: str) -> dict[str, Any]:
         prompt = " ".join(str(m.get("content", "")) for m in payload.get("messages", []))
+        # Deterministic response shaping for cascade tests: a model carrying one of
+        # these tags produces an escalation-triggering response. Production models
+        # never carry these tags, so default behavior is unchanged.
+        finish = "stop"
+        tags = set(self.entry.tags)
+        if "truncate" in tags:
+            finish = "length"
+        elif "refuse" in tags:
+            text = "I'm sorry, but I cannot help with that request."
+        elif "empty" in tags:
+            text = ""
         return {
             "id": f"chatcmpl-fake-{int(time.time() * 1000)}",
             "object": "chat.completion",
@@ -83,7 +94,7 @@ class FakeAdapter(BackendAdapter):
                 {
                     "index": 0,
                     "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
+                    "finish_reason": finish,
                 }
             ],
             "usage": {

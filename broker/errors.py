@@ -121,3 +121,14 @@ class RequestTooLargeError(BrokerError):
 
     http_status = 413
     error_type = "request_too_large"
+
+
+class PlacementDeniedError(BrokerError):
+    """No model satisfies the request's placement/residency requirement.
+
+    Fail-closed: the broker returns this rather than spilling to a model that
+    does not carry every required placement label (ADR 0011).
+    """
+
+    http_status = 403
+    error_type = "placement_denied"
