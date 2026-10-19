@@ -21,7 +21,7 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 | 3 | Per-key rate limits (rpm/tpm) + virtual keys + budgets | ✅ done | [0008](adr/0008-per-key-governance.md) |
 | 4 | Retries w/ exponential backoff + member cooldowns | ✅ done | [0009](adr/0009-routing-reliability-and-scale.md) |
 | 5 | Optional Redis shared state (multi-replica) | ✅ done | [0009](adr/0009-routing-reliability-and-scale.md) |
-| 6 | Prefix/cache-aware pool routing + load-aware scoring | 📋 planned | [0010](adr/0010-cache-aware-pool-routing.md) |
+| 6 | Prefix/cache-aware pool routing + load-aware scoring | ✅ done | [0010](adr/0010-cache-aware-pool-routing.md) |
 | 7 | Cascade mode for `auto` (cheap→escalate) | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
 | 8 | Latency-budget fallback + privacy/placement pinning | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
 | 9 | Router eval harness (CPT/APGR) | ✅ done | [0011](adr/0011-auto-router-evolution.md) |

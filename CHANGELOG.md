@@ -8,44 +8,6 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Per-key governance: virtual keys, rate limits & budgets** (ADR 0008). Opt-in
-  via `BROKER_KEYS_PATH` (a git-ignored `keys.yaml` of **hashed** virtual keys;
-  manage with `python -m broker.keys create|list|revoke`, secret shown once).
-  Each key has an id/label/tenant/scope (`user`|`admin`), optional expiry, and
-  limits: `rpm` (sliding window), `tpm` (windowed, pre-dispatch estimate +
-  post-response reconcile with real usage), `max_concurrency`, daily/monthly
-  **token budgets**, optional **cost budgets** (registry `pricing` block, USD per
-  million tokens), and a fail-closed `allowed_models` list (applies to the model
-  the `auto` router picks too). Counters live on the ADR 0009 `StateStore`
-  (in-process or Redis). Enforced before dispatch on
-  chat/completions/responses/embeddings with OpenAI-compatible errors: `429`
-  `rate_limit_exceeded` + `Retry-After` + `x-ratelimit-limit/remaining/reset-{requests,tokens}`
-  headers (also emitted on success), `429` `insufficient_quota` for budgets, and
-  `403` `model_not_allowed`. `GET /usage` is now **scoped** — a `user` key sees
-  only its own usage; an `admin` key sees all keys plus a per-key spend breakdown.
-  Legacy `BROKER_API_KEYS` keep working as **unlimited user keys**; with no keys
-  file and no limits, behavior is identical to v0.4.0. New settings
-  `BROKER_KEYS_PATH`, `BROKER_RATE_LIMIT_WINDOW_SECONDS`; new registry `pricing`
-  block; `keys.yaml` git-ignored (`keys.example.yaml` tracked).
-
-### Changed
-
-- `GET /usage` responses now include a `scope` field and (for `user` scope) the
-  caller's `api_key_id`; `admin` scope adds a `by_key` breakdown.
-
-### Security
-
-- **Auth no longer 500s on a non-ASCII API key.** `hmac.compare_digest` raises
-  `TypeError` on a non-ASCII `str`, so a request presenting a key with a non-ASCII
-  (e.g. latin-1) byte in `Authorization`/`X-API-Key` previously returned **500**
-  instead of **401** on the unauthenticated-reachable auth path (pre-existing in
-  v0.4.0 `broker/auth.py`, and the same class in the new virtual-key verification).
-  Both paths now compare the UTF-8/surrogateescape **byte** encodings (and reject
-  absurdly long keys early), so malformed keys fail closed with a clean `401`.
-  Regression tests cover non-ASCII and over-long keys on the data-plane auth path.
-
-### Added (routing reliability & shared state — ADR 0009)
-
 - **Retries with full-jitter backoff** (ADR 0009): `BROKER_RETRY_MAX_ATTEMPTS`,
   `BROKER_RETRY_BACKOFF_BASE_MS`, `BROKER_RETRY_BACKOFF_MAX_MS`. Retries re-select
   a member **within the requested model's pool only** (never a different model),
@@ -63,8 +25,28 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `RedisStateStore`** (`BROKER_REDIS_URL`, `BROKER_REDIS_PREFIX`,
   `BROKER_ROUTE_STICKY_TTL_SECONDS`) shares state across replicas. `redis` is an
   optional extra (`pip install 'backend-agnostic-broker[redis]'`), import-guarded
-  → `ConfigError` if enabled-but-missing. The manager's sticky map is migrated
-  onto `StateStore`.
+  → `ConfigError` if enabled-but-missing. One shared `StateStore` instance backs
+  the sticky map, the ADR 0008 governance counters, the ADR 0010 prefix index, and
+  the ADR 0012 response cache.
+- **Cache-aware pool routing** (ADR 0010): opt-in `BROKER_ROUTE_STRATEGY=cache_aware`
+  routes each request to the pool member that already holds its prompt **prefix**
+  (warm KV cache), scoring `score = matched_fraction - beta·relative_load` and
+  falling back to `least_busy` when no member holds any prefix. Prompts are
+  normalized and sliced into fixed-size **chained** character blocks
+  (`BROKER_CACHE_AWARE_BLOCK_CHARS`); the prefix→member index lives on the
+  `StateStore` (shared via Redis when configured), LRU-bounded
+  (`BROKER_CACHE_AWARE_MAX_ENTRIES`) with a TTL (`BROKER_CACHE_AWARE_TTL_SECONDS`).
+  `BROKER_CACHE_AWARE_BETA` is the single cache-vs-load knob (**default `0.25`**,
+  tuned from the benchmark — `1.0` over-penalized affinity);
+  `BROKER_CACHE_AWARE_USE_METRICS` lets the **non-loading** health probe scrape
+  vLLM `/metrics` (`vllm:num_requests_waiting`) for a real load signal (falls back
+  to in-flight counts). Default (`sticky`) behavior is unchanged.
+  `scripts/bench_routing.py` ships four seeded scenarios (long-lived, cache
+  pressure, cross-session sharing, skewed/bursty) with a `--matrix` scenario×β mode
+  and a `--capacity-sweep`, and runs without `PYTHONPATH`; `docs/routing-and-health.md`
+  records the matrix, the default-β selection rule, and a "when to use cache_aware
+  vs sticky" guide (cache_aware wins under prefix reuse + cache pressure, `sticky`
+  wins under bursty skewed load).
 - **Auto-router evolution (ADR 0011)** — four opt-in, default-off routing features;
   with none configured, `auto` behaves exactly as v0.4.0:
   - **Cascade mode** (`router.mode: cascade`): serve the cheapest capable model
@@ -91,15 +73,49 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     offline on the heuristic backend.
   - New settings: `BROKER_ROUTER_LATENCY_BUDGET_MS`, `BROKER_ROUTER_LATENCY_WINDOW_SECONDS`,
     `BROKER_ROUTER_COLD_START_MS`, `BROKER_DEFAULT_PLACEMENT`. New error type
-    `placement_denied` (403); usage log gains `latency_percentiles`. 45 new tests.
+    `placement_denied` (403); usage log gains `latency_percentiles`.
     See [docs/auto-router.md](docs/auto-router.md),
     [ADR 0011](docs/adr/0011-auto-router-evolution.md), and the research note.
+- **Per-key governance: virtual keys, rate limits & budgets** (ADR 0008). Opt-in
+  via `BROKER_KEYS_PATH` (a git-ignored `keys.yaml` of **hashed** virtual keys;
+  manage with `python -m broker.keys create|list|revoke`, secret shown once).
+  Each key has an id/label/tenant/scope (`user`|`admin`), optional expiry, and
+  limits: `rpm` (sliding window), `tpm` (windowed, pre-dispatch estimate +
+  post-response reconcile with real usage), `max_concurrency`, daily/monthly
+  **token budgets**, optional **cost budgets** (registry `pricing` block, USD per
+  million tokens), and a fail-closed `allowed_models` list (applies to the model
+  the `auto` router picks and to each cascade hop). Counters live on the ADR 0009
+  `StateStore` (in-process or Redis). Enforced before dispatch on
+  chat/completions/responses/embeddings with OpenAI-compatible errors: `429`
+  `rate_limit_exceeded` + `Retry-After` + `x-ratelimit-limit/remaining/reset-{requests,tokens}`
+  headers (also emitted on success), `429` `insufficient_quota` for budgets, and
+  `403` `model_not_allowed`. `GET /usage` is now **scoped** — a `user` key sees
+  only its own usage; an `admin` key sees all keys plus a per-key spend breakdown.
+  Legacy `BROKER_API_KEYS` keep working as **unlimited user keys**; with no keys
+  file and no limits, behavior is identical to v0.4.0. New settings
+  `BROKER_KEYS_PATH`, `BROKER_RATE_LIMIT_WINDOW_SECONDS`; new registry `pricing`
+  block; `keys.yaml` git-ignored (`keys.example.yaml` tracked).
 
 ### Changed
 
 - `GET /status` now reports `state_backend`, `retry_max_attempts`,
-  `cooldowns_enabled`, and (when cooldowns are on) per-model `cooldown`.
+  `cooldowns_enabled`, a `cache_aware` block (`enabled`, and when active
+  `index_size`/`lookups`/`hits`/`hit_rate`/`block_chars`/`beta`), and (when
+  cooldowns are on) per-model `cooldown`.
 - `GET /healthz/backends` entries now include a per-member `cooldown` object.
+- `GET /usage` responses now include a `scope` field and (for `user` scope) the
+  caller's `api_key_id`; `admin` scope adds a `by_key` breakdown.
+
+### Security
+
+- **Auth no longer 500s on a non-ASCII API key.** `hmac.compare_digest` raises
+  `TypeError` on a non-ASCII `str`, so a request presenting a key with a non-ASCII
+  (e.g. latin-1) byte in `Authorization`/`X-API-Key` previously returned **500**
+  instead of **401** on the unauthenticated-reachable auth path (pre-existing in
+  v0.4.0 `broker/auth.py`, and the same class in the new virtual-key verification).
+  Both paths now compare the UTF-8/surrogateescape **byte** encodings (and reject
+  absurdly long keys early), so malformed keys fail closed with a clean `401`.
+  Regression tests cover non-ASCII and over-long keys on the data-plane auth path.
 
 ## [0.4.0] - 2026-10-18
 

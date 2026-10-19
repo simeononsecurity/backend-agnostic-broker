@@ -23,6 +23,7 @@ class FakeAdapter(BackendAdapter):
 
     # Class-level knobs the tests flip to simulate conditions.
     load_delay: float = 0.0
+    chat_delay: float = 0.0
     fail_on_start: bool = False
     fail_on_chat: bool = False
 
@@ -33,6 +34,9 @@ class FakeAdapter(BackendAdapter):
         self._pid: int | None = None
         self._cancelled: set[str] = set()
         self._load_count = 0
+        # Simulated real load signal for cache-aware routing tests (ADR 0010);
+        # None means "no real signal" so the manager falls back to in-flight.
+        self.sim_load: float | None = None
 
     def validate_config(self) -> None:
         # Fake backend needs nothing beyond an alias + runtime_model_id.
@@ -115,6 +119,8 @@ class FakeAdapter(BackendAdapter):
             raise BackendUnavailableError(
                 "model not ready", backend=self.name, model=self.entry.alias
             )
+        if self.chat_delay:
+            await asyncio.sleep(self.chat_delay)
         return self._completion(payload, f"echo: {self.entry.alias}")
 
     async def stream_chat(  # type: ignore[override]
@@ -198,6 +204,9 @@ class FakeAdapter(BackendAdapter):
             "model": self.entry.alias,
             "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
         }
+
+    async def collect_load(self) -> float | None:
+        return self.sim_load
 
     async def collect_status(self) -> dict[str, Any]:
         return {

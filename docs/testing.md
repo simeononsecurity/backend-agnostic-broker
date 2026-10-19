@@ -17,7 +17,7 @@ tests (if added) should be marked and excluded from CI.
 
 | File | Tests | Covers |
 |------|-------|--------|
-| `tests/test_config.py` | 8 | Typed config + fail-fast `validate_runtime` (auth without keys, auth satisfied by a keys file, bad port, missing registry, bad rate-limit window, policy/log-format validation). |
+| `tests/test_config.py` | 12 | Typed config + fail-fast `validate_runtime` (auth without keys, auth satisfied by a keys file, bad port, missing registry, bad rate-limit window, policy/log-format/route-strategy validation, retry/cooldown/cache-aware bounds, legacy defaults). |
 | `tests/test_registry.py` | 12 | Registry parsing/validation, unknown-field rejection, duplicate-alias detection, backend filtering, pool + router config, `pricing` block (ADR 0008) parse + negative rejection. |
 | `tests/test_lifecycle.py` | 5 | State machine legal/illegal transitions, idle timing, snapshots. |
 | `tests/test_adapters.py` | 5 | Adapter contract conformance + fake backend behavior. |
@@ -26,6 +26,8 @@ tests (if added) should be marked and excluded from CI.
 | `tests/test_sticky.py` | 9 | Sticky session routing: pin by header/`user`/IP, distinct-session spread, re-pin on failure, LRU bound, `/status`. |
 | `tests/test_retry.py` | 8 | Retries + full-jitter backoff (ADR 0009): backoff bounds, default single-pass-no-sleep, retries stay within the pool (never cross-model), attempt cap, transient recovery, no retry mid-stream. |
 | `tests/test_cooldown.py` | 5 | Member cooldowns (ADR 0009): bench after N failures + selection skip, half-open trial after expiry, success resets, `/status` + `/healthz/backends` visibility, default-off. |
+| `tests/test_cache_routing.py` | 25 | Cache-aware routing (ADR 0010): prompt normalization + chained block hashing, longest-prefix match, LRU/TTL index eviction, hit-rate stats, vLLM `/metrics` parse; manager routing (warm-member reuse, no-match→least_busy, load flips choice, beta=0 affinity, 3-member longest-prefix); invariants (unhealthy/cooldown excluded, failover, single-member, sticky map untouched, default builds no router, embeddings); StateStore index in-process + Redis (fakeredis); bench smoke run. |
+| `tests/test_bench_routing.py` | 5 | Cache-aware **default-β regression** (ADR 0010 follow-up): drives `scripts/bench_routing.py` seeded scenarios through the real manager and pins that the config default β (0.25) beats `sticky` on hit rate *and* TTFT p95 for `cache_pressure` + `cross_session`, roughly doubles the cache-pressure hit rate, and respects the low-pressure load-balance bound the default was selected by. |
 | `tests/test_state.py` | 31 | `StateStore` contract parametrized over in-process + Redis (fakeredis, skips if absent): sticky/LRU, counters + sliding window, cooldown transitions, half-open claim, bytes/JSON KV, factory fail-fast. |
 | `tests/test_health_probe.py` | 8 | Non-loading health: `/healthz/backends`, periodic probe marks dead backends failed (never loads), `/api/ps` aggregation. |
 | `tests/test_router.py` | 29 | `auto` router: flag extraction, Stage-1 capability filter, overrides, heuristic task routing, fallback, cache, GBNF/prompt builders, manager + API end-to-end. |

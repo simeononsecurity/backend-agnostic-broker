@@ -89,3 +89,37 @@ def test_retry_cooldown_defaults_preserve_legacy(settings):
     assert settings.cooldown_failures == 0
     assert settings.redis_url is None
     settings.validate_runtime()  # valid as-is
+
+
+def test_cache_aware_is_a_valid_route_strategy(fake_registry_file):
+    s = Settings(route_strategy="cache_aware", registry_path=str(fake_registry_file))
+    assert s.route_strategy == "cache_aware"
+
+
+def test_bad_route_strategy_rejected(fake_registry_file):
+    with pytest.raises(PydanticValidationError):
+        Settings(route_strategy="nonsense", registry_path=str(fake_registry_file))
+
+
+def test_cache_aware_defaults_preserve_legacy(settings):
+    # Cache-aware settings exist but default strategy stays sticky (off).
+    assert settings.route_strategy == "sticky"
+    assert settings.cache_aware_beta == 0.25
+    assert settings.cache_aware_block_chars == 128
+    assert settings.cache_aware_use_metrics is False
+    settings.validate_runtime()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("cache_aware_beta", -0.1),
+        ("cache_aware_block_chars", 0),
+        ("cache_aware_max_entries", -1),
+        ("cache_aware_ttl_seconds", -1.0),
+    ],
+)
+def test_cache_aware_invalid_values_rejected(settings, field, value):
+    setattr(settings, field, value)
+    with pytest.raises(ConfigError):
+        settings.validate_runtime()
