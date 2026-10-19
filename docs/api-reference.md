@@ -55,8 +55,11 @@ limits) get no governance headers and are never rate-limited.
     the budget; never overrides the capability/placement filters. Non-positive or
     non-numeric → `400`.
   - `x-broker-route` (**response** header) — the model actually served, or a
-    cascade path like `tiny->coder`; for a streaming cascade it reads
-    `strong (cascade->single: streaming)`.
+    cascade path like `tiny->coder`. For a streaming cascade in the default
+    `fallback_single` mode it reads `strong (cascade->single: streaming)`; in the
+    opt-in `buffer` mode (chat only, ADR 0019) it reads the plan
+    `tiny->strong (cascade:buffer)` (the executed hop is in `GET /status`). TTFT is
+    recorded for every streaming request and feeds the latency budget (ADR 0019).
 - **Request-size limit** — bodies over `BROKER_MAX_REQUEST_BYTES` (default
   2,000,000) return `413 request_too_large`.
 - **Timeouts** — each request is bounded by the model's

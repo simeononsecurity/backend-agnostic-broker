@@ -3,6 +3,8 @@
 - Status: Accepted
 - Date: 2026-10-18
 - Supersedes: none (extends ADR 0004)
+- Extended by: ADR 0019 (TTFT estimation, calibrated cascade scorer, buffered
+  streaming cascade, code/math heuristic)
 - Related: `docs/auto-router.md`, `docs/research/adr-0011-auto-router-evolution.md`,
   ADR 0004 (auto router), ADR 0007 (usage/decision store); prior art: RouteLLM,
   FrugalGPT, vLLM Semantic Router, LiteLLM tag routing, Portkey conditional routing.

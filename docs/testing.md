@@ -3,7 +3,7 @@
 Run the suite:
 
 ```bash
-make test                 # pytest -q  (368 collected: 342 passed, 26 skipped)
+make test                 # pytest -q  (392 collected: 366 passed, 26 skipped)
 make cov                  # with coverage
 python -m pytest -q tests/test_security.py   # one file
 ```
@@ -41,6 +41,7 @@ span path, which need the optional `redis`/`otel` extras. In a venv with
 | `tests/test_placement.py` | 10 | Placement pinning (ADR 0011), fail-closed: auto-filter, explicit + pool + embeddings `403 placement_denied`, pool member filtering, header parse/validation, config default. |
 | `tests/test_router_latency.py` | 7 | Latency-budget routing (ADR 0011): faster-capable pick, no-op when fast enough, capability safety, config default, header parse/validation. |
 | `tests/test_router_eval.py` | 11 | Eval harness: RouteLLM metric primitives (PGR/frontier/APGR/CPT/oracle) vs hand-computed values incl. no-clamping + `invalid`-on-degenerate; quality ceiling is a true upper bound; router swept curve distinct from and bounded by the oracle; direct metrics in range; markdown renders; dataset labels valid. |
+| `tests/test_router_v2.py` | 21 | Router v2 (ADR 0019): TTFT recorded + old-schema DB migration + ttft metric excludes non-stream; latency budget uses TTFT for streaming vs end-to-end otherwise; reliability scorer (threshold knob, hard gates, logprob feature, disabled-preserves-booleans, validation); buffered streaming cascade never mixes two models (kept-replay + escalate-stream) and completions stays fallback_single; frozen held-out split disjoint from train; pinned code/math accuracy on train + held-out. |
 | `tests/test_auth.py` | 9 | Bearer + `X-API-Key`, missing/invalid key, unauthenticated probes, non-ASCII + over-long keys → 401 not 500. |
 | `tests/test_streaming.py` | 1 | SSE streaming (`chat.completion.chunk` + `[DONE]`). |
 | `tests/test_openai_endpoints.py` | 18 | `/v1/completions`, `/v1/responses`, `/v1/embeddings` shims/adapters: translation, streaming, pool routing, no silent fallback. |
@@ -51,6 +52,7 @@ span path, which need the optional `redis`/`otel` extras. In a venv with
 | `tests/test_unload.py` | 4 | Idle unload sweep; unload while idle; not while serving. |
 | `tests/test_security.py` | 17 | SSRF guard, path traversal, executable allow-list, flag/shell-injection rejection, no-shell argv. |
 | `tests/test_docs_examples.py` | 4 | Documentation/API examples run against the real API. |
+| `tests/test_example_auto_router.py` | 3 | The `examples/auto-router/` registry loads (every router feature parses) and routes real requests through the fake backend (route header + image override). |
 | `tests/test_cache.py` | 18 | Response cache (ADR 0012): key stability + scope/model/endpoint isolation, sampling/tools/format in key, deterministic-only default, hit/miss/bypass headers, per-key isolation, errors-not-cached, embeddings cached, disabled pass-through, StateStore-backed roundtrip + TTL + LRU eviction + max-bytes. |
 | `tests/test_admin.py` | 19 | Admin runtime control (ADR 0012): disabled blocks, admin-key required, model list, load/unload, refuse/drain/timeout on in-flight, draining member skipped, registry reload add/remove, unchanged-instance kept, invalid-registry rollback; **admin scope reconciliation** — non-ASCII/over-long admin key → 401 (not 500) on every header, and an ADR 0008 admin-scope virtual key authorizes `/admin` while a user-scope key is denied. |
 | `tests/test_tracing.py` | 4 | Tracing (ADR 0012): no-op when disabled, app serves with tracing off, `ConfigError` when enabled without otel (skipped if installed), `gen_ai.*` spans asserted via in-memory exporter with **no content captured** (skipped without the SDK). |

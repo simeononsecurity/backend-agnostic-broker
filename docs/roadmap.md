@@ -25,6 +25,9 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 | 7 | Cascade mode for `auto` (cheap→escalate) | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
 | 8 | Latency-budget fallback + privacy/placement pinning | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
 | 9 | Router eval harness (CPT/APGR) | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
+| 7b | Cascade v2: calibrated reliability scorer + **buffered streaming cascade** | ✅ done | [0019](adr/0019-router-v2.md) |
+| 8b | **TTFT** latency estimation for streaming requests | ✅ done | [0019](adr/0019-router-v2.md) |
+| 9b | Heuristic code/math accuracy + **frozen held-out** eval split | ✅ done | [0019](adr/0019-router-v2.md) |
 
 ## P2 — ops & experience
 

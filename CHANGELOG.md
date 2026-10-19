@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Router v2** (ADR 0019), resolving every deferred item from ADR 0011. All new
+  behavior is **opt-in and default-off** — a request/registry with none of the new
+  knobs reproduces v0.5.0 exactly.
+  - **TTFT estimation.** The usage log records **time-to-first-token** (`ttft_ms`)
+    for streaming requests via a backward-compatible additive schema migration (an
+    existing `usage.sqlite3` is upgraded in place; old rows keep NULL). The
+    latency-budget router uses the **TTFT** p90 for a **streaming** request and the
+    **end-to-end** p90 otherwise (`UsageLog.latency_percentiles(metric=...)`).
+  - **Calibrated cascade reliability scorer** (`router.cascade.scorer`, opt-in).
+    Reduces the cheap hop's answer to one reliability score in `[0,1]` — graded
+    length + optional token-logprob features with hard refusal/truncation gates —
+    and escalates when `score < threshold`, giving one tunable knob in place of the
+    booleans (which remain the default). The trained FrugalGPT-style scorer was
+    **rejected** (needs labeled data + a model); see ADR 0019.
+  - **Buffered streaming cascade** (`router.cascade.stream_mode: buffer`, opt-in).
+    The chat endpoint buffers the cheap hop, scores it, then **replays** it as a
+    stream or **streams the stronger hop live** — never mixing two models' output in
+    one stream. Default `fallback_single` (= v0.5.0); completions/responses keep
+    `fallback_single`.
+  - **Heuristic code/math accuracy.** The cost term is normalized to a true
+    tie-breaker (a cheap generalist no longer outscores the one capable model on a
+    code/math prompt) and the greedy `"write a"` creative keyword was removed. The
+    labeled set grew to **82 train** + a **frozen 24-prompt held-out** split. Per
+    task, before → after: **code 0.64 → 1.00** (held-out 0.50 → 1.00), **math
+    0.09 → 1.00** (held-out 0.00 → 1.00); no held-out task regresses. Thresholds and
+    the frozen split are pinned by tests.
+  - Example: `examples/auto-router/` (registry with tags/cost tiers + cascade +
+    scorer + buffer + latency budget + placement, a README, and a tested pytest).
+
 ## [0.5.0] - 2026-10-19
 
 ### Added

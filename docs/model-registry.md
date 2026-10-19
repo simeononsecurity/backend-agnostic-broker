@@ -79,6 +79,26 @@ the request escalates once to a stronger capable model (ADR 0011).
 | `min_chars` | int | `1` | Minimum acceptable answer length (characters, stripped). |
 | `escalate_on_refusal` | bool | `true` | Escalate when the answer matches a refusal regex. |
 | `refusal_patterns` | list[str] | _(built-in set)_ | Refusal regexes (validated at load). |
+| `stream_mode` | str | `fallback_single` | Streaming cascade mode (ADR 0019): `fallback_single` (= v0.5.0, serve the single strong pick) or `buffer` (chat endpoint buffers the cheap hop, scores it, then replays it or streams the stronger hop — never mixing two models). |
+| `scorer` | object | _(disabled)_ | Opt-in calibrated reliability scorer (ADR 0019); see below. |
+
+#### `cascade.scorer` (ScorerConfig) — ADR 0019
+
+Opt-in. When `enabled`, the cheap hop's answer is reduced to one reliability score
+in `[0, 1]` and the hop escalates when `score < threshold`, instead of the booleans
+above. The score is a weighted mean of **graded** features (length adequacy +
+optional token-logprob confidence) with **hard gates** (refusal / truncation cap the
+score to 0). Default-off preserves v0.5.0 behavior.
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `enabled` | bool | `false` | Use the scorer instead of the boolean signals. |
+| `threshold` | float | `0.5` | Escalate when reliability `< threshold` (must be in `[0,1]`). |
+| `target_chars` | int | `200` | Answer length (stripped) at which the length feature saturates to 1. |
+| `weight_length` | float | `1.0` | Weight of the length-adequacy feature (`>= 0`). |
+| `weight_logprob` | float | `0.0` | Weight of the token-logprob confidence feature, used only when the response carries logprobs (`>= 0`). |
+| `gate_refusal` | bool | `true` | A refusal match caps the score to 0 (always escalate). |
+| `gate_truncation` | bool | `true` | `finish_reason == "length"` caps the score to 0 (always escalate). |
 
 ### `pricing` (top-level, optional) — ADR 0008
 

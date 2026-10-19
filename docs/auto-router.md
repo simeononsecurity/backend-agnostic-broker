@@ -167,11 +167,12 @@ incapable model.
 - No model loads at broker startup — the classifier model loads lazily on first
   `auto` request and stays resident.
 
-## Advanced routing (ADR 0011, all opt-in)
+## Advanced routing (ADR 0011 + 0019, all opt-in)
 
-These four features are **off by default**; with none configured, `auto` behaves
-exactly as above. Design rationale and prior art: [ADR 0011](adr/0011-auto-router-evolution.md)
-and [docs/research/adr-0011-auto-router-evolution.md](research/adr-0011-auto-router-evolution.md).
+These features are **off by default**; with none configured, `auto` behaves
+exactly as above. Design rationale and prior art: [ADR 0011](adr/0011-auto-router-evolution.md),
+[ADR 0019](adr/0019-router-v2.md), and the research notes under
+[docs/research/](research/).
 
 ### 1. Cascade mode (cheap → escalate once)
 
@@ -193,9 +194,58 @@ router:
 
 Both hops are recorded (usage log + `GET /status` → `router.recent_decisions`),
 and the response header **`x-broker-route`** shows the path (`tiny` or
-`tiny->coder`). **Streaming**: a live stream cannot be cheaply re-scored, so a
-streaming cascade request **falls back to the single strong pick** and the route
-header reads `strong (cascade->single: streaming)`.
+`tiny->coder`).
+
+#### Calibrated reliability scorer (ADR 0019, opt-in)
+
+Instead of the fixed booleans, set `router.cascade.scorer.enabled: true` to reduce
+the cheap hop's answer to one **reliability score** in `[0, 1]` and escalate when
+`score < threshold`. The score combines **graded** features (answer-length adequacy
+and, when the response carries token logprobs, mean token probability) with **hard
+safety gates** (a refusal match or a truncation caps the score to 0, exactly like
+the booleans). This gives one calibrated knob — slide `threshold` up to demand more
+certainty (escalate more), down to let the cheap model carry more load.
+
+```yaml
+router:
+  mode: cascade
+  cascade:
+    scorer:
+      enabled: true
+      threshold: 0.5        # escalate when reliability < 0.5
+      target_chars: 200     # answer length at which the length feature saturates
+      weight_length: 1.0
+      weight_logprob: 0.0   # >0 uses token logprobs when the response has them
+      gate_refusal: true    # a refusal always escalates
+      gate_truncation: true # finish_reason == "length" always escalates
+```
+
+The scorer is **off by default**; disabled, the boolean signals above are used
+unchanged. It is a heuristic aggregator (one tunable threshold + an optional logprob
+signal), not a trained reliability model — see [ADR 0019](adr/0019-router-v2.md) for
+why the trained FrugalGPT-style scorer was rejected.
+
+#### Streaming: fallback-to-single (default) or buffer (ADR 0019)
+
+A live stream cannot be re-scored, so `router.cascade.stream_mode` decides:
+
+- **`fallback_single`** (default, = v0.5.0): a streaming cascade request is served
+  by the single strong pick; the route header reads `strong (cascade->single:
+  streaming)`.
+- **`buffer`**: the **chat** endpoint buffers the cheap hop fully, scores it, then
+  **replays** the buffered answer as a stream (kept path) or **streams the stronger
+  hop live** (escalated path). Only one model's output is ever emitted into a
+  stream — never a mix. The kept path pays the cheap model's full generation time as
+  perceived TTFT (inherent to buffering). The route header reads
+  `tiny->strong (cascade:buffer)`; the executed path is in `GET /status`. The
+  completions/responses streaming endpoints always use `fallback_single`.
+
+```yaml
+router:
+  mode: cascade
+  cascade:
+    stream_mode: buffer   # chat streaming cascade; default is fallback_single
+```
 
 ### 2. Latency budget
 
@@ -204,8 +254,14 @@ Send `x-broker-latency-budget-ms: 2000` (or set `router.latency_budget_ms` /
 from the usage log (ADR 0007) — p90 over `BROKER_ROUTER_LATENCY_WINDOW_SECONDS`,
 plus `BROKER_ROUTER_COLD_START_MS` when the model is not currently resident — and,
 if the chosen model would exceed the budget, picks the fastest capable candidate
-instead. It **never** violates the Stage-1 capability filter or placement. The
-estimate is end-to-end latency (not time-to-first-token).
+instead. It **never** violates the Stage-1 capability filter or placement.
+
+**TTFT for streaming (ADR 0019).** For a **streaming** request the estimate uses
+**time-to-first-token** (the latency a streaming client actually perceives before
+the first token), summarized only over prior *streamed* samples; for a
+**non-streaming** request it uses **end-to-end** latency. A model with no streamed
+samples yet has no TTFT estimate and is simply not ranked by the budget (rather than
+treated as instant). TTFT is recorded automatically for every streaming request.
 
 ### 3. Placement / data-residency pinning (fail-closed)
 
@@ -226,55 +282,70 @@ curl -s localhost:8080/v1/chat/completions -H "Authorization: Bearer ***" \
 ### 4. Evaluation harness
 
 `scripts/router_eval.py` measures routing quality against a labeled set
-(`tests/data/router_eval.jsonl`, ≥40 prompts) instead of vibe-checking it. It runs
-the **heuristic** backend offline (no GPU/network) and optionally the LLM backend
-when a GGUF is available. It reports two families of numbers: **direct metrics**
-(always valid) and **RouteLLM metrics** (PGR / APGR / CPT), each computed both
-from the **router's own swept cost–quality curve** and from an **oracle upper
+(`tests/data/router_eval.jsonl`, 82 prompts, plus a frozen held-out split
+`tests/data/router_eval_heldout.jsonl`, 24 prompts) instead of vibe-checking it. It
+runs the **heuristic** backend offline (no GPU/network) and optionally the LLM
+backend when a GGUF is available. It reports two families of numbers: **direct
+metrics** (always valid) and **RouteLLM metrics** (PGR / APGR / CPT), each computed
+both from the **router's own swept cost–quality curve** and from an **oracle upper
 bound** derived from the labels. The exact definitions and citations are in the
-research note (`docs/research/adr-0011-auto-router-evolution.md`).
+research notes (`docs/research/adr-0011-auto-router-evolution.md`,
+`docs/research/adr-0019-router-v2.md`).
 
 ```bash
-python scripts/router_eval.py                 # markdown report (heuristic backend)
+python scripts/router_eval.py                                        # train set
+python scripts/router_eval.py --dataset tests/data/router_eval_heldout.jsonl
 python scripts/router_eval.py --format json   # metrics as JSON
-python scripts/router_eval.py --out report.md # write the report
 python scripts/router_eval.py --backend llm   # use the GGUF classifier
 ```
 
-A CI run of the harness on the heuristic backend over the bundled 45-prompt set:
+A CI run of the harness on the heuristic backend over the bundled **82-prompt
+train** set (`tests/data/router_eval.jsonl`) with the improved ADR 0019 heuristic:
 
 | Direct metric | Value |
 |---------------|-------|
-| Prompts | 45 |
-| Accuracy (chosen is acceptable) | 0.867 |
-| Cheapest-capable accuracy | 0.822 |
-| Mean cost_tier (router) | 2.289 |
-| Mean cost_tier (oracle / cheapest-capable) | 2.489 |
-| Router strong-call fraction (top tier) | 0.022 |
-
-RouteLLM metrics. `r(M_w)` is the globally cheapest model's accuracy; `r(M_s)` is
-the **quality ceiling** — a perfect oracle that always picks an acceptable model
-(see "What the metrics mean" below). PGR / APGR / CPT in the *Router curve* column
-come from re-routing the whole set while sweeping `router.weights.cost` over 12
-points; the *Oracle upper bound* is the cost-optimal label frontier (a ceiling the
-router cannot beat), shown for reference only.
+| Prompts | 82 |
+| Accuracy (chosen is acceptable) | 1.000 |
+| Cheapest-capable accuracy | 0.842 |
+| Mean cost_tier (router) | 2.878 |
+| Mean cost_tier (oracle / cheapest-capable) | 2.573 |
+| Router strong-call fraction (top tier) | 0.146 |
 
 | RouteLLM metric | Router curve | Oracle upper bound |
 |-----------------|--------------|--------------------|
-| r(M_w) / r(M_s) | 0.267 / 1.000 | — |
-| PGR (operating point) | 0.818 | — |
-| APGR | 0.724 | 0.849 |
-| CPT(50%) | 0.194 | 0.144 |
-| CPT(80%) | 0.322 | 0.272 |
+| r(M_w) / r(M_s) | 0.220 / 1.000 | — |
+| PGR (operating point) | 1.000 | — |
+| APGR | 0.789 | 0.834 |
+| CPT(50%) | 0.335 | — |
+| CPT(80%) | 0.335 | — |
 
-Per-task accuracy exposes real weaknesses — e.g. `math` ≈ 0.33 and `code` ≈ 0.60
-with the default weights, because a single tag match (+capability) can be
-outweighed by the cheap-model cost bonus. That is exactly the kind of regression
-the harness exists to surface (the motivating `tiny`-for-code mis-route); tune
-`router.weights` or add overrides and re-run to measure the effect. The swept
-curve confirms this directly: dropping `router.weights.cost` toward 0 lifts
-accuracy to ≈0.91 (PGR ≈0.88) by letting capability outweigh the cheap-model
-bonus — so the default weights are *not* this set's optimum.
+#### ADR 0019 code/math improvement — before vs after (train and frozen held-out)
+
+The heuristic's cost term is now **normalized** so it is a tie-breaker that cannot
+outweigh a single capability match, and the greedy `"write a"` creative keyword was
+removed (it mis-tagged code prompts). The labeled set grew to **82 train** prompts
+plus a **frozen 24-prompt held-out** split (`tests/data/router_eval_heldout.jsonl`)
+that is **not used for tuning**. Per-task accuracy, old heuristic → new heuristic:
+
+| Task | Train before | Train after | Held-out before | Held-out after |
+|------|--------------|-------------|-----------------|----------------|
+| code | 0.636 | **1.000** | 0.500 | **1.000** |
+| math | 0.091 | **1.000** | 0.000 | **1.000** |
+| chat | 1.000 | 1.000 | 1.000 | 1.000 |
+| reasoning | 0.833 | 1.000 | 1.000 | 1.000 |
+| creative | 1.000 | 1.000 | 1.000 | 1.000 |
+| tools / json | 1.000 | 1.000 | 1.000 | 1.000 |
+| vision / long-context | 1.000 | 1.000 | 1.000 | 1.000 |
+| **overall accuracy** | **0.768** | **1.000** | 0.792 | **1.000** |
+
+No held-out task regresses (every task is flat or improves); code and math rise
+sharply on both splits. The accuracy thresholds are pinned by
+`tests/test_router_v2.py` (code ≥ 0.90 / 0.80, math ≥ 0.90 / 0.80 on train /
+held-out), and the held-out split is enforced disjoint-from-train by a test. The
+cost of capability-first routing is a higher mean cost_tier (2.57 → 2.88 on train);
+the swept cost–quality curve still spans the full range, so APGR/CPT stay
+meaningful (lowering `router.weights.cost` no longer *raises* accuracy — the default
+operating point already reaches the ceiling on this set).
 
 #### What the metrics mean (and the limits of label-based evaluation)
 
