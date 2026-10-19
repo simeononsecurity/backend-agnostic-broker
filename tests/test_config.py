@@ -153,3 +153,14 @@ def test_cache_aware_invalid_values_rejected(settings, field, value):
     setattr(settings, field, value)
     with pytest.raises(ConfigError):
         settings.validate_runtime()
+
+
+def test_rerank_max_documents_default(settings):
+    assert settings.rerank_max_documents == 1000
+    settings.validate_runtime()  # default is valid
+
+
+def test_rerank_max_documents_must_be_positive(settings):
+    settings.rerank_max_documents = 0
+    with pytest.raises(ConfigError):
+        settings.validate_runtime()
