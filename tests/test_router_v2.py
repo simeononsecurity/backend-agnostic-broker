@@ -435,10 +435,6 @@ def test_stream_mode_validation():
 
 INDEP = DATA / "router_eval_independent.jsonl"
 
-# v0.5.0 per-task accuracy (measured on each set with the v0.5.0 heuristic), the
-# floor the ADR 0019 follow-up must not drop below on the protected task types.
-_V050_PROTECTED = ("chat", "creative", "json", "tools", "vision", "long-context")
-
 
 def test_train_is_in_sample_and_not_saturated():
     # TRAIN is in-sample: accuracy is high but MUST stay strictly below the oracle
