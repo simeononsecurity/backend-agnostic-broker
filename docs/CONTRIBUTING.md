@@ -3,6 +3,10 @@
 Thanks for contributing to `backend-agnostic-broker`. This project is
 security-sensitive; the rules below are not optional.
 
+> **AI agents:** read [`AGENTS.md`](../AGENTS.md) first — it defines the
+> mandatory change contract (update docs/ADRs/OpenAPI/CHANGELOG/tests with every
+> code change), the quality gates, and where everything lives.
+
 ## Setup
 
 ```bash

@@ -85,6 +85,7 @@ docker compose up -d --build
 
 | Topic | Doc |
 |---|---|
+| **AI-agent rules** | [AGENTS.md](AGENTS.md) (read first) |
 | **Getting started** | [docs/getting-started.md](docs/getting-started.md) |
 | Architecture overview | [docs/architecture.md](docs/architecture.md) |
 | ADRs | [docs/adr/](docs/adr/) |
