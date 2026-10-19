@@ -146,7 +146,10 @@ def _result_to_sse_chunks(result: dict, model: str) -> list[bytes]:
             {"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": None}
         ],
     }
-    final = {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
+    final: dict[str, Any] = {
+        **base,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+    }
     return [
         f"data: {json.dumps(first)}\n\n".encode(),
         f"data: {json.dumps(final)}\n\n".encode(),
