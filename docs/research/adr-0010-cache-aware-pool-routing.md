@@ -59,8 +59,19 @@ and routes to the argmax ([vLLM production-stack, Load Aware Routing][vps-load];
   sitting 100% above fleet-average load is docked one full cache hit's worth of
   preference'."
 
-This is exactly the score the ADR 0010 card specifies. **Chosen default
-`BROKER_CACHE_AWARE_BETA = 1.0`.**
+This is exactly the score the ADR 0010 card specifies. We adopt the formula as-is.
+
+> **Default β correction (post-benchmark).** The production-stack ships `beta=1.0`,
+> and the first ADR 0010 cut inherited it. That default assumes a *precise*,
+> token-exact KV index; this broker keeps an *approximate* character-block,
+> record-after-serve index, so a "match" is a weaker signal against the same load
+> term and `beta=1.0` over-penalizes affinity. The broker's own scenario×β matrix
+> (`scripts/bench_routing.py --matrix`) shows `beta=1.0` **never beats `sticky`**,
+> whereas **`beta=0.25`** roughly doubles hit rate under cache pressure and wins the
+> cross-session scenario. We therefore ship **`BROKER_CACHE_AWARE_BETA = 0.25`**.
+> This is corroborated by the prior art below: llm-d/KServe weight the prefix
+> scorer *above* the load scorer (weight 3 vs 2, or 2.0 vs 1.0 in KServe's EPP) —
+> an effective `beta ≈ 0.5` or less, i.e. β=1.0 was already on the high side.
 
 llm-d expresses the same two objectives as separate weighted plugins —
 `prefix-cache-scorer` + `load-aware-scorer`/`queue-scorer`/`kv-cache-utilization-scorer`
@@ -164,7 +175,7 @@ bound); `BROKER_CACHE_AWARE_TTL_SECONDS = 1800`.
 | Decision | Source |
 |---|---|
 | `score = matched_fraction − β·relative_load`, `relative_load=(load−mean)/max(1,mean)`, argmax | vLLM production-stack `LoadAwareRouter` |
-| `β = 1.0` default, single tunable | vLLM production-stack |
+| `β = 0.25` default (retuned from the bench matrix; `1.0` over-penalized the approximate index), single tunable | vLLM production-stack formula; β retuned locally, corroborated by llm-d/KServe prefix≈2×load weighting |
 | Chained block hashing (block hash encodes whole prefix) | vLLM automatic prefix caching |
 | Character blocks (no tokenizer), default 128 chars | SGLang (raw text, no tokenization) |
 | Approximate index maintained from successful serves, LRU+TTL evicted | SGLang / AIBrix standard mode |

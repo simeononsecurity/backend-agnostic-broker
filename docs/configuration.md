@@ -86,7 +86,7 @@ no effect and the broker behaves exactly as v0.4.0.
 
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
-| `BROKER_CACHE_AWARE_BETA` | float | `1.0` | Load-penalty weight in `score = matched_fraction - beta*relative_load`. `0` = pure prefix affinity; higher spreads load harder. |
+| `BROKER_CACHE_AWARE_BETA` | float | `0.25` | Load-penalty weight in `score = matched_fraction - beta*relative_load`. `0` = pure prefix affinity; higher spreads load harder. Default `0.25` is tuned from the `scripts/bench_routing.py` scenario×β matrix (see [routing-and-health.md](routing-and-health.md#cache-aware-routing-adr-0010)); `1.0` over-penalized affinity. |
 | `BROKER_CACHE_AWARE_BLOCK_CHARS` | int | `128` | Characters per prefix block (~4 chars/token). Larger = smaller index, coarser matching. Only full blocks are hashed. |
 | `BROKER_CACHE_AWARE_MAX_ENTRIES` | int | `10000` | Prefix-index LRU bound per replica. `0` = unbounded (TTL still applies). |
 | `BROKER_CACHE_AWARE_TTL_SECONDS` | float | `1800` | TTL on prefix-index entries, approximating KV-cache residency. `0` = no expiry. |

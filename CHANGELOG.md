@@ -16,12 +16,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`BROKER_CACHE_AWARE_BLOCK_CHARS`); the prefix→member index lives on the
   `StateStore` (shared via Redis when configured), LRU-bounded
   (`BROKER_CACHE_AWARE_MAX_ENTRIES`) with a TTL (`BROKER_CACHE_AWARE_TTL_SECONDS`).
-  `BROKER_CACHE_AWARE_BETA` is the single cache-vs-load knob;
+  `BROKER_CACHE_AWARE_BETA` is the single cache-vs-load knob (**default `0.25`**,
+  tuned from the benchmark — `1.0` over-penalized affinity);
   `BROKER_CACHE_AWARE_USE_METRICS` lets the **non-loading** health probe scrape
   vLLM `/metrics` (`vllm:num_requests_waiting`) for a real load signal (falls back
   to in-flight counts). Default (`sticky`) behavior is unchanged.
-  `scripts/bench_routing.py` compares strategies on a simulated shared-prefix
-  workload.
+  `scripts/bench_routing.py` ships four seeded scenarios (long-lived, cache
+  pressure, cross-session sharing, skewed/bursty) with a `--matrix` scenario×β mode
+  and a `--capacity-sweep`, and runs without `PYTHONPATH`; `docs/routing-and-health.md`
+  records the matrix, the default-β selection rule, and a "when to use cache_aware
+  vs sticky" guide (cache_aware wins under prefix reuse + cache pressure, `sticky`
+  wins under bursty skewed load).
 - **Retries with full-jitter backoff** (ADR 0009): `BROKER_RETRY_MAX_ATTEMPTS`,
   `BROKER_RETRY_BACKOFF_BASE_MS`, `BROKER_RETRY_BACKOFF_MAX_MS`. Retries re-select
   a member **within the requested model's pool only** (never a different model),

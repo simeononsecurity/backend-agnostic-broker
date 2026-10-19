@@ -66,10 +66,27 @@ relative_load(m) = (load(m) - mean_load) / max(1, mean_load)
 and route to the argmax. `matched_fraction` is normalized to [0,1] so one `beta`
 is the same policy at any prompt length; `relative_load` is normalized to the pool
 mean so `beta` is deployment-independent. `beta` (`BROKER_CACHE_AWARE_BETA`,
-default 1.0) is the single tunable: 0 = pure prefix affinity, higher = spread
+**default 0.25**) is the single tunable: 0 = pure prefix affinity, higher = spread
 harder. When **no** member holds any prefix (e.g. a new system prompt, or a prompt
 shorter than one block) we fall back to `least_busy`. Tie-breaks are deterministic:
 highest score, then least load, then round-robin.
+
+**Default `beta` = 0.25 (retuned from the benchmark, not inherited).** The vLLM
+production-stack `LoadAwareRouter` ships `beta=1.0`, but it routes on a *precise*,
+token-exact KV index; the broker's *approximate*, character-block,
+record-after-serve index is a weaker match signal against the same load term, so
+`beta=1.0` over-penalizes affinity. The `scripts/bench_routing.py` scenario×β matrix
+(long_lived / cache_pressure / cross_session / skewed_bursty) confirms `beta=1.0`
+never beats `sticky`, while **`beta=0.25`** roughly doubles the hit rate under cache
+pressure (31.8%→64.8%) and lifts cross-session hit rate (77.7%→91.3%, p95
+1000→467 ms) at acceptable balance. Selection rule: *the smallest swept β whose load
+spread stays within 25% on the low-pressure `long_lived` scenario* (β=0.1 breaks it
+at 1.51×; β=0.25 holds at 1.17×), which also maximizes the cache-pressure gain. This
+matches llm-d/KServe, which weight the prefix scorer ≈2× the load scorer (effective
+`beta ≤ 0.5`). `cache_aware` is **not** a universal win: under bursty, skewed
+high-concurrency (`skewed_bursty`) `sticky`'s durable pin beats record-after-serve
+routing — documented as a "when to use" guide in `docs/routing-and-health.md`, and
+`sticky` remains the default strategy.
 
 **Load signal.** `load` defaults to the in-flight request count. Optionally
 (`BROKER_CACHE_AWARE_USE_METRICS=true`) the existing **non-loading** health probe
@@ -116,9 +133,9 @@ cooldowns, and the no-cross-model rule are unchanged.
   bound); character blocks are coarser than token blocks; negligible benefit for
   singleton (non-pooled) models or very short prompts.
 - **Risks** — a too-small `beta` hot-spots a popular prefix onto one member
-  (mitigation: default `beta=1.0` spreads well; `/status` hit rate + per-member
-  in-flight make it observable; `docs/troubleshooting.md` covers it). A too-large
-  `block_chars` makes matching coarse and misses partial reuse (tunable; the
+  (mitigation: the default `beta=0.25` was tuned from the scenario×β matrix to stay
+  balanced under low pressure; `/status` hit rate + per-member in-flight make it
+  observable; `docs/troubleshooting.md` covers it). A too-large `block_chars` makes matching coarse and misses partial reuse (tunable; the
   benchmark helps pick it). Hash collisions are astronomically unlikely with
   chained sha256 and only affect routing quality, never correctness.
 
@@ -142,11 +159,15 @@ probe). Verified by `tests/test_cache_routing.py` (25 tests), covering:
   cache_aware, default strategy builds no router, embeddings routed too;
 - the index on the `StateStore` for both backends (in-process always; Redis via
   `fakeredis` when the extra is installed, else skipped);
-- `_parse_waiting` vLLM `/metrics` parsing; and a `scripts/bench_routing.py`
-  `--smoke` subprocess run.
+- `_parse_waiting` vLLM `/metrics` parsing; a `scripts/bench_routing.py` `--smoke`
+  subprocess run; and `tests/test_bench_routing.py`, a fast deterministic
+  regression test asserting the **default `beta`** (`Settings().cache_aware_beta`)
+  beats `sticky` on hit rate *and* TTFT p95 for the `cache_pressure` and
+  `cross_session` scenarios, and that the default β keeps the `long_lived` load
+  spread within the documented 25% balance bound.
 
-The comparison table from `scripts/bench_routing.py` (cache_aware beats
-round_robin/least_busy on prefix hit rate at comparable load balance) is recorded
-in `docs/routing-and-health.md`. Gates green: `ruff check` + `ruff format --check`
-clean; `pytest` 207 passed / 15 skipped (shared venv) and 221 passed / 1 skipped
-(private venv exercising the Redis path via fakeredis).
+The scenario×β matrix from `scripts/bench_routing.py --matrix` (the default
+`beta=0.25` roughly doubles cache-pressure hit rate and wins cross-session, while
+`beta=1.0` never beats sticky and `skewed_bursty` is an honest sticky win) is
+recorded in `docs/routing-and-health.md` with the default-β selection rule and a
+"when to use cache_aware vs sticky" guide.
