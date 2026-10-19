@@ -37,6 +37,60 @@ image sets `BROKER_ROUTER_MODEL_PATH=/models/router.gguf` so `router_backend=aut
 uses the GGUF classifier; if the file is absent it falls back to the heuristic.
 See [auto-router.md](auto-router.md).
 
+## Pull published images (GHCR)
+
+Each tagged release publishes both variants to GHCR:
+
+```bash
+docker pull ghcr.io/simeononsecurity/backend-agnostic-broker:latest       # lean
+docker pull ghcr.io/simeononsecurity/backend-agnostic-broker:latest-llm   # bundled CPU classifier
+# or pin a version: :0.3.0  /  :0.3.0-llm
+```
+
+> Packages are **private** by default — run `docker login ghcr.io` first, or set
+> the package visibility to public on GitHub. See [ci.md](ci.md).
+
+## Run the bundled-LLM image
+
+The `-llm` image is self-contained: it ships the CPU `llama-cpp-python` runtime
+(incl. `libgomp1`) and a Q4 GGUF, and points `BROKER_ROUTER_MODEL_PATH` at it, so
+`router_backend=auto` uses the LLM classifier out of the box.
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e BROKER_AUTH_ENABLED=false \
+  -e 'BROKER_ENABLED_BACKENDS=["fake"]' \
+  -e BROKER_REGISTRY_PATH=/config/registry.yaml \
+  -v "$(pwd)/registry.example.yaml:/config/registry.yaml:ro" \
+  --tmpfs /tmp/broker --tmpfs /var/cache/broker \
+  ghcr.io/simeononsecurity/backend-agnostic-broker:latest-llm
+```
+
+Confirm the classifier is actually in use (not the heuristic fallback):
+
+```bash
+curl -s localhost:8080/status \
+  | python3 -c 'import sys,json;r=json.load(sys.stdin)["router"];print("backend:",r["backend"]);print("last via:",(r["recent_decisions"][-1]["via"] if r["recent_decisions"] else "-"))'
+# want:  backend: llm   AND a decision with  via: llm
+# (backend:llm alone can still fall back to heuristic if the model fails to load)
+```
+
+**Use a different classifier model** without rebuilding — mount a GGUF and point at
+it (the runtime is only present in the `-llm` image; a mounted model on the lean
+image stays on the heuristic because `llama-cpp-python` isn't installed there):
+
+```bash
+docker run ... \
+  -v "$(pwd)/my-router.gguf:/models/router.gguf:ro" \
+  -e BROKER_ROUTER_MODEL_PATH=/models/router.gguf \
+  -e BROKER_ROUTER_BACKEND=llm \
+  -e BROKER_ROUTER_THREADS=4 -e BROKER_ROUTER_MODEL_CTX=2048 \
+  ghcr.io/simeononsecurity/backend-agnostic-broker:latest-llm
+```
+
+Model prioritization for `auto` (tags, `priority`, `cost_tier`, overrides) is
+configured in the **registry**, not the image — see [auto-router.md](auto-router.md).
+
 ## Image design
 
 - **Multi-stage**: a `pydeps` stage installs `requirements.txt` into a relocatable

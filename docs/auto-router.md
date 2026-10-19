@@ -71,6 +71,33 @@ docker build --build-arg WITH_ROUTER_LLM=1 -t broker:router .
 
 Good base models: Qwen2.5-0.5B/1.5B-Instruct, Llama-3.2-1B-Instruct, SmolLM2.
 
+### Run it outside the container
+
+On a non-container deploy, install the CPU wheel and point the broker at a GGUF:
+
+```bash
+pip install llama-cpp-python          # needs a C/C++ toolchain to build; libgomp at runtime
+export BROKER_ROUTER_MODEL_PATH=/path/to/router.gguf
+export BROKER_ROUTER_BACKEND=llm      # force the LLM (auto would also pick it up)
+# optional: BROKER_ROUTER_THREADS, BROKER_ROUTER_MODEL_CTX
+```
+
+### Verify it's really using the LLM
+
+`router.backend` reports the *configured* backend; a decision can still fall back
+to the heuristic if the model fails to load. Check **both** the backend and the
+`via` of a real decision:
+
+```bash
+curl -s localhost:8080/status \
+  | python3 -c 'import sys,json;r=json.load(sys.stdin)["router"];print(r["backend"], r["recent_decisions"][-1]["via"] if r["recent_decisions"] else "-")'
+# want:  llm llm      (not  llm heuristic)
+```
+
+A common cause of a silent `via: heuristic` fallback is a missing OpenMP runtime
+(`libgomp.so.1`) for the compiled wheel — the `-llm` image installs it; a custom
+build must too.
+
 ## Customization (three knobs, all data)
 
 1. **Per-model tags / metadata** (registry entry) — the main control surface:

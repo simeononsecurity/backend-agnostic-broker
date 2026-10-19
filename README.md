@@ -32,7 +32,9 @@ backend over the network, all with copy-paste examples.
 - **`auto` router**: send `"model": "auto"` and a tiny CPU classifier (GBNF-constrained
   llama.cpp GGUF, or a zero-dependency heuristic) picks the best model per request
   from the live registry — with capability filtering, data-driven overrides, and a
-  deterministic fallback. See [docs/auto-router.md](docs/auto-router.md).
+  deterministic fallback. The LLM classifier ships self-contained in the **`-llm`**
+  image; prioritize models via registry `tags` / `priority` / `cost_tier` /
+  `overrides`. See [docs/auto-router.md](docs/auto-router.md).
 - Broker-managed process supervision for runtimes that only load a model at
   process startup (vLLM, llama.cpp, Strata); native lazy loading for Ollama.
 - Per-model load locking, configurable global/per-model concurrency, idle unload
@@ -40,6 +42,7 @@ backend over the network, all with copy-paste examples.
 - Typed, fail-fast configuration (env vars / mounted registry / Compose).
 - Hardened Docker image: multi-stage, non-root, read-only root fs, dropped
   capabilities, CPU fallback for CI, GPU passthrough only via explicit config.
+  Published in two variants — **lean** and **`-llm`** (bundled CPU router classifier).
 
 ## Quick start (local, fake backend)
 
@@ -74,12 +77,26 @@ curl -s http://127.0.0.1:8080/readyz
 
 ## Quick start (Docker)
 
+Pull a published image — two variants are published per release:
+
 ```bash
-make docker-build
-make docker-smoke          # build + container smoke test
-# or the full stack:
-docker compose up -d --build
+# lean (the `auto` router uses the zero-dependency heuristic):
+docker pull ghcr.io/simeononsecurity/backend-agnostic-broker:latest
+# self-contained LLM router (bundled CPU llama.cpp classifier + Q4 GGUF):
+docker pull ghcr.io/simeononsecurity/backend-agnostic-broker:latest-llm
 ```
+
+…or build locally:
+
+```bash
+make docker-build                                          # lean image
+docker build --build-arg WITH_ROUTER_LLM=1 -t broker:llm . # bundled LLM router
+make docker-smoke                                          # build + container smoke test
+docker compose up -d --build                               # or the full stack
+```
+
+See [docs/docker.md](docs/docker.md) for running/configuring the `-llm` image and
+[docs/auto-router.md](docs/auto-router.md) for configuring and prioritizing `auto`.
 
 ## Documentation
 

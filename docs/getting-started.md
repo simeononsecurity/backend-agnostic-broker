@@ -301,6 +301,10 @@ docker compose up -d --build
 docker compose logs -f broker
 ```
 
+Releases are published to GHCR in two variants: **lean** (`:latest`) and a
+self-contained **`-llm`** image (`:latest-llm`) that bundles the CPU `auto`-router
+classifier. Pull and run them per [docs/docker.md](docker.md).
+
 For GPU passthrough and the remote-backend-from-container networking notes, see
 [docs/docker.md](docker.md) and [docs/docker-compose.md](docker-compose.md).
 
