@@ -308,6 +308,35 @@ class Settings(BaseSettings):
     response_cache_max_bytes: int = 1_000_000
     response_cache_deterministic_only: bool = True
 
+    # --- Semantic (embedding-similarity) response cache (ADR 0014) ---
+    # A second, OPT-IN cache layer consulted only AFTER an exact-cache miss, for
+    # chat/completions/responses (not embeddings). Default OFF; defaults reproduce
+    # v0.5.0. It embeds the prompt text via the broker's OWN /v1/embeddings path
+    # (semantic_cache_model = a registry alias) and serves the closest stored
+    # response whose cosine similarity clears the threshold. STRICT scoping: the
+    # key/tenant + placement + namespace + resolved model + endpoint + ALL
+    # non-prompt params (sampling, tools, tool_choice, response_format, seed,
+    # max_tokens, ...) must match EXACTLY — only the prompt text is fuzzy — so a
+    # semantic hit can never cross a scope/model/param boundary.
+    #   require_resident (default true): consult/populate the semantic cache ONLY
+    #     when the embedding model is already resident, so a chat request NEVER
+    #     silently loads an extra model (lazy-load invariant). Set false to allow
+    #     on-demand embedding-model loading (documented opt-in exception).
+    #   threshold: cosine similarity in [0,1]; default 0.95 is precision-favoring
+    #     (see ADR 0014 / docs/research): a false positive serves a wrong answer.
+    #   max_entries: per-bucket bound on stored (embedding,response) pairs (LRU).
+    #   max_buckets: global bound on the NUMBER of buckets (LRU). Together with
+    #     max_entries and the TTL this keeps the semantic index bounded even when
+    #     a caller varies non-prompt params to create many buckets. Per-process
+    #     (best-effort under Redis, where the TTL is the authoritative bound).
+    semantic_cache_enabled: bool = False
+    semantic_cache_model: str | None = None
+    semantic_cache_threshold: float = 0.95
+    semantic_cache_ttl_seconds: float = 300.0
+    semantic_cache_max_entries: int = 128
+    semantic_cache_max_buckets: int = 1024
+    semantic_cache_require_resident: bool = True
+
     # --- Admin runtime control (ADR 0012) ---
     # Privileged runtime-control surface (GET /admin/models, model unload/load,
     # registry hot-reload), default OFF. When enabled it is gated by a dedicated
@@ -352,6 +381,13 @@ class Settings(BaseSettings):
     # (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL/HEADERS, ...).
     tracing_enabled: bool = False
     tracing_service_name: str = "backend-agnostic-broker"
+    # Opt-in span content capture (ADR 0014): OFF by default. When tracing is
+    # enabled AND this is true, the `inference` span carries truncated
+    # gen_ai.input.messages / gen_ai.output.messages (OTel GenAI `spanOnly` mode).
+    # Prompts/responses may contain PII — never enable without an informed choice.
+    # Disabled is byte-for-byte v0.5.0 (no span carries message content).
+    tracing_capture_content: bool = False
+    tracing_content_max_chars: int = 2000
 
     # --- Usage accounting (request + routing-decision log; see ADR 0007) ---
     # One row per completed request (metadata + token counts only, never content).
@@ -485,6 +521,23 @@ class Settings(BaseSettings):
                 raise ConfigError("BROKER_RESPONSE_CACHE_MAX_ENTRIES must be >= 0 (0 = unbounded)")
             if self.response_cache_max_bytes < 0:
                 raise ConfigError("BROKER_RESPONSE_CACHE_MAX_BYTES must be >= 0 (0 = no cap)")
+        if self.semantic_cache_enabled:
+            if not self.semantic_cache_model:
+                raise ConfigError(
+                    "BROKER_SEMANTIC_CACHE_ENABLED=true but BROKER_SEMANTIC_CACHE_MODEL is not set",
+                    remediation="set BROKER_SEMANTIC_CACHE_MODEL to a registry alias served "
+                    "via /v1/embeddings",
+                )
+            if not (0.0 <= self.semantic_cache_threshold <= 1.0):
+                raise ConfigError("BROKER_SEMANTIC_CACHE_THRESHOLD must be in [0, 1]")
+            if self.semantic_cache_ttl_seconds < 0:
+                raise ConfigError("BROKER_SEMANTIC_CACHE_TTL_SECONDS must be >= 0 (0 = no TTL)")
+            if self.semantic_cache_max_entries < 1:
+                raise ConfigError("BROKER_SEMANTIC_CACHE_MAX_ENTRIES must be >= 1")
+            if self.semantic_cache_max_buckets < 1:
+                raise ConfigError("BROKER_SEMANTIC_CACHE_MAX_BUCKETS must be >= 1")
+        if self.tracing_content_max_chars < 0:
+            raise ConfigError("BROKER_TRACING_CONTENT_MAX_CHARS must be >= 0")
         if (
             self.admin_enabled
             and self.auth_enabled

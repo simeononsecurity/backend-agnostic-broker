@@ -133,6 +133,41 @@ and check the `x-broker-cache` response header. By default only deterministic
 `BROKER_RESPONSE_CACHE_DETERMINISTIC_ONLY=false` to cache all (accepting that a
 sampled answer will be replayed).
 
+## Semantic cache + cache extensions (ADR 0014)
+
+Off by default. Enable with `BROKER_SEMANTIC_CACHE_ENABLED=true` **and**
+`BROKER_SEMANTIC_CACHE_MODEL=<embedding alias>` (a registry model served via
+`/v1/embeddings`; startup fails fast if unset). It is consulted after an exact
+miss for chat/completions/responses and serves paraphrases of a prior prompt.
+
+- **Warm the embedding model first.** With `BROKER_SEMANTIC_CACHE_REQUIRE_RESIDENT=true`
+  (default) the cache is a no-op until the embedding model is resident — a chat
+  request will **not** load it. Preload it (`POST /admin/models/<alias>/load`),
+  send it an `/v1/embeddings` request, or use an always-on external daemon. Set
+  `BROKER_SEMANTIC_CACHE_REQUIRE_RESIDENT=false` to allow on-demand loading.
+- **Tune the threshold.** Start at `0.95`. Watch `GET /status` → `semantic_cache`
+  (`hits`, `misses`, `hit_rate`, `skipped_not_resident`). A false positive serves
+  a wrong answer — raise toward `0.99` if you see them; lower only after measuring.
+- **Per-request controls.** `x-broker-cache-ttl: <s>` clamps this entry's TTL —
+  finite, `>= 0`, can only shorten the operator TTL; `0` = do not store; non-finite
+  / overflowing values → `400`. `x-broker-cache-namespace: <token>`
+  isolates/invalidates a caller's cache (rotate the token to drop its namespace);
+  `Cache-Control: max-age=0` bypasses. A `semantic-hit` response carries
+  `x-broker-cache-similarity`.
+- **Bounded growth.** The semantic index is bounded on both axes —
+  `BROKER_SEMANTIC_CACHE_MAX_ENTRIES` (per bucket) and
+  `BROKER_SEMANTIC_CACHE_MAX_BUCKETS` (number of buckets, LRU) — so a client
+  varying non-prompt params cannot grow Redis without limit. Watch `GET /status` →
+  `semantic_cache` for `live_buckets`, `not_stored`, and `skipped_model_mismatch`.
+- **Streaming** requests now replay cache hits as SSE; only non-streaming requests
+  populate the cache.
+
+### Span content capture (ADR 0014)
+
+`BROKER_TRACING_CAPTURE_CONTENT=true` (requires tracing on) adds truncated
+prompt/response content to the `inference` span. **PII risk** — leave off unless
+needed; tune `BROKER_TRACING_CONTENT_MAX_CHARS` and keep trace retention short.
+
 ## Runtime control (ADR 0012)
 
 Enable with `BROKER_ADMIN_ENABLED=true` and set `BROKER_ADMIN_API_KEYS` (a

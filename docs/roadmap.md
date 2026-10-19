@@ -39,9 +39,9 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 
 | # | Item | Status | ADR |
 |---|------|--------|-----|
-| 10 | Response caching (exact, then optional semantic) | ✅ done — exact cache; semantic deferred | [0012](adr/0012-caching-runtime-control-observability.md) |
+| 10 | Response caching (exact, then optional semantic) | ✅ done — exact cache ([0012](adr/0012-caching-runtime-control-observability.md)); semantic cache + streaming replay + per-request TTL/namespace controls ([0014](adr/0014-semantic-cache-and-cache-extensions.md)) | [0012](adr/0012-caching-runtime-control-observability.md) · [0014](adr/0014-semantic-cache-and-cache-extensions.md) |
 | 11 | Runtime control: manual unload + registry hot-reload | ✅ done — unload/load + transactional reload | [0012](adr/0012-caching-runtime-control-observability.md) |
-| 12 | OpenTelemetry tracing + optional web UI/playground | ✅ done — tracing; web UI deferred | [0012](adr/0012-caching-runtime-control-observability.md) |
+| 12 | OpenTelemetry tracing + optional web UI/playground | ✅ tracing (metadata [0012](adr/0012-caching-runtime-control-observability.md); **opt-in span content capture** [0014](adr/0014-semantic-cache-and-cache-extensions.md)); ❌ web UI still deferred ([0012](adr/0012-caching-runtime-control-observability.md), `BROKER_UI_ENABLED` reserved) | [0012](adr/0012-caching-runtime-control-observability.md) · [0014](adr/0014-semantic-cache-and-cache-extensions.md) |
 
 ## Notes
 
@@ -56,8 +56,9 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
   `Accepted` when implementation starts, and add a `## Confirmation` section.
 - Invariants that constrain every item: lazy load, **no silent cross-model
   fallback**, non-loading health, security guards (see `AGENTS.md`).
-- Deferred follow-ups: semantic (embedding-similarity) response cache (item 10);
-  web UI/playground (item 12, `BROKER_UI_ENABLED` reserved).
+- Item 10 semantic (embedding-similarity) response cache — ✅ done
+  ([ADR 0014](adr/0014-semantic-cache-and-cache-extensions.md)).
+- Item 12 web UI/playground — ✅ done ([ADR 0015](adr/0015-web-ui-playground.md)).
 - **Item 6 cache-aware deferrals — all resolved by [ADR 0018](adr/0018-cache-aware-v2.md):**
   - ✅ queueing model for `scripts/bench_routing.py` (TTFT p50/p95/p99 incl. queueing,
     throughput, utilization) + re-validated default β (`0.25`→`0.5`).

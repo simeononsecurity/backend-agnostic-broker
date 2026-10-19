@@ -144,6 +144,58 @@ def chat_to_response(result: dict[str, Any], model: str) -> dict[str, Any]:
 # --- response translation (streaming) ----------------------------------------
 
 
+def chat_result_to_sse_chunks(result: dict[str, Any], model: str) -> list[bytes]:
+    """Build a well-formed chat.completion.chunk SSE replay from a stored result.
+
+    Used by the cache (ADR 0014) to serve a ``stream: true`` request from a
+    response that was stored by a prior non-streaming call. Emits, per choice, a
+    role delta, a content delta (and any tool_calls), a finish chunk, then the
+    terminal ``data: [DONE]``. Feeding this through ``chat_sse_to_text_sse`` /
+    ``chat_sse_to_responses_sse`` yields the other endpoints' stream formats.
+    """
+    cid = result.get("id") or f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = result.get("created", int(time.time()))
+    served = result.get("model", model)
+    base = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": served}
+    chunks: list[dict[str, Any]] = []
+    choices = result.get("choices") or [{}]
+    for ch in choices:
+        idx = ch.get("index", 0)
+        msg = ch.get("message", {}) or {}
+        role = msg.get("role") or "assistant"
+        content = msg.get("content") or ""
+        finish = ch.get("finish_reason") or "stop"
+        chunks.append(
+            {**base, "choices": [{"index": idx, "delta": {"role": role}, "finish_reason": None}]}
+        )
+        if content:
+            chunks.append(
+                {
+                    **base,
+                    "choices": [
+                        {"index": idx, "delta": {"content": content}, "finish_reason": None}
+                    ],
+                }
+            )
+        if msg.get("tool_calls"):
+            chunks.append(
+                {
+                    **base,
+                    "choices": [
+                        {
+                            "index": idx,
+                            "delta": {"tool_calls": msg["tool_calls"]},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+        chunks.append({**base, "choices": [{"index": idx, "delta": {}, "finish_reason": finish}]})
+    out = [f"data: {json.dumps(c)}\n\n".encode() for c in chunks]
+    out.append(b"data: [DONE]\n\n")
+    return out
+
+
 def _iter_sse_events(buf: str):
     """Split an SSE buffer into complete events; return (events, remainder)."""
     events = []

@@ -1,0 +1,19 @@
+# Caching example registry (ADR 0012 + ADR 0014).
+# Uses the dependency-free `fake` backend so the example runs with no GPU or
+# model download. For a real deployment, replace `backend: fake` with your actual
+# backend (ollama / vllm / llamacpp / strata) and keep one embedding-capable model
+# for the semantic cache (BROKER_SEMANTIC_CACHE_MODEL).
+models:
+  - alias: echo-chat
+    backend: fake
+    runtime_model_id: fake-echo-chat
+    idle_timeout_seconds: 60
+    context_limit: 4096
+    supports_streaming: true
+
+  # Embedding model used by the semantic cache. In production point this at a real
+  # embedding model (e.g. an Ollama nomic-embed-text or an OpenAI-compatible endpoint).
+  - alias: echo-embed
+    backend: fake
+    runtime_model_id: fake-echo-embed
+    idle_timeout_seconds: 300

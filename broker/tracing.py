@@ -43,10 +43,19 @@ class Tracer:
     """Base tracer. The no-op implementation; real tracing subclasses it."""
 
     enabled: bool = False
+    #: Opt-in span content capture (ADR 0014); always off on the no-op tracer.
+    capture_content: bool = False
+    content_max_chars: int = 0
 
     @contextmanager
     def span(self, name: str, attributes: dict[str, Any] | None = None):
         yield _NULL_SPAN
+
+    def truncate(self, text: str) -> str:
+        """Clip captured content to ``content_max_chars`` (0 = unlimited)."""
+        if self.content_max_chars and len(text) > self.content_max_chars:
+            return text[: self.content_max_chars]
+        return text
 
 
 class _OtelTracer(Tracer):
@@ -117,4 +126,7 @@ def make_tracer(settings: Any) -> Tracer:
         tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
         trace.set_tracer_provider(tp)
 
-    return _OtelTracer(trace.get_tracer("broker"))
+    tracer = _OtelTracer(trace.get_tracer("broker"))
+    tracer.capture_content = bool(getattr(settings, "tracing_capture_content", False))
+    tracer.content_max_chars = int(getattr(settings, "tracing_content_max_chars", 0))
+    return tracer

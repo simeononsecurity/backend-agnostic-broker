@@ -14,10 +14,11 @@ boundaries without any external runtime. The suite is CPU-only; optional GPU
 tests (if added) should be marked and excluded from CI.
 
 In the default CPU venv the Redis-backed `StateStore` paths (counters, prefix index,
-response cache, cooldown/half-open, sticky LRU, prefix-index sorted-set LRU) and the
-OpenTelemetry span path skip — they need the optional `redis`/`otel` extras. In a venv
-with `pip install -e '.[dev,redis,otel]'` those run too (the remaining 2 skips are
-import-guard paths that only fire when a package is *absent*).
+response cache, cooldown/half-open, sticky LRU, prefix-index sorted-set LRU,
+semantic-cache TTL) and the OpenTelemetry span path skip — they need the optional
+`redis`/`otel` extras. In a venv with `pip install -e '.[dev,redis,otel]'` those run
+too (the remaining 2 skips are import-guard paths that only fire when a package is
+*absent*).
 
 ## Coverage map
 
@@ -68,6 +69,12 @@ import-guard paths that only fire when a package is *absent*).
 | `tests/test_cache.py` | 18 | Response cache (ADR 0012): key stability + scope/model/endpoint isolation, sampling/tools/format in key, deterministic-only default, hit/miss/bypass headers, per-key isolation, errors-not-cached, embeddings cached, disabled pass-through, StateStore-backed roundtrip + TTL + LRU eviction + max-bytes. |
 | `tests/test_admin.py` | 19 | Admin runtime control (ADR 0012): disabled blocks, admin-key required, model list, load/unload, refuse/drain/timeout on in-flight, draining member skipped, registry reload add/remove, unchanged-instance kept, invalid-registry rollback; **admin scope reconciliation** — non-ASCII/over-long admin key → 401 (not 500) on every header, and an ADR 0008 admin-scope virtual key authorizes `/admin` while a user-scope key is denied. |
 | `tests/test_tracing.py` | 4 | Tracing (ADR 0012): no-op when disabled, app serves with tracing off, `ConfigError` when enabled without otel (skipped if installed), `gen_ai.*` spans asserted via in-memory exporter with **no content captured** (skipped without the SDK). |
+| `tests/test_semantic_cache.py` | 19 | Semantic cache (ADR 0014): pure cosine + bucket-key (non-prompt exact, only the **last user turn** fuzzy) + query_text; **system prompt / history separation** and non-text-part exactness (stub-embedder MISS on differing system/history, HIT on reworded last turn); StateStore lookup hit-above/miss-below threshold, threshold setting respected, per-bucket LRU bound + **global bucket-count bound**, TTL expiry; HTTP semantic-hit on repeat + `x-broker-cache-similarity`, miss for dissimilar prompt, **isolation across keys and params**, **require-resident gate (no extra model load, then hit after warming)**, disabled pass-through, `/status` block, missing-model `ConfigError`. |
+| `tests/test_cache_streaming.py` | 5 | Streaming cache replay (ADR 0014): non-stream populates → stream replays for chat (`chat.completion.chunk`), completions (`text_completion`), responses (`response.*` events), all ending `[DONE]`; streaming miss never stores; semantic streaming replay. |
+| `tests/test_cache_controls.py` | 15 | Per-request cache controls (ADR 0014): `x-broker-cache-ttl` expiry + invalid→400, **non-finite/overflow (`nan`/`inf`/`-inf`/`1e400`/400-digit)→400**, **`0`=do-not-store**, **huge finite clamped to operator ceiling**, `_clamp_ttl` only-shortens unit test; `x-broker-cache-namespace` isolation + invalid→400, `Cache-Control: max-age=0` bypass, rejected `s-maxage` is ignored (normal caching). |
+| `tests/test_cache_model_scope.py` | 2 | GAP 3 (ADR 0014 follow-up): a cascade escalating to a different model is **not stored** (`skipped_model_mismatch`; second request still misses); a clean cascade on the primary stores and hits. |
+| `tests/test_cache_redis_ttl.py` | 4 | Redis-backed TTL ceiling (ADR 0014 follow-up): every write carries a **finite** TTL within the operator ceiling (huge override clamped), default TTL finite, `x-broker-cache-ttl: 0` stores nothing. Skipped without the `[redis]` extra + `fakeredis`. |
+| `tests/test_tracing_content.py` | 3 | Opt-in span content capture (ADR 0014): off by default (no content on any span), on → truncated `gen_ai.input.messages`/`gen_ai.output.messages` JSON, truncation limit honored (skipped without the otel SDK). |
 
 ## Live rerank verification (ADR 0013)
 

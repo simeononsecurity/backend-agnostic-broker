@@ -3,6 +3,8 @@
 - Status: Accepted
 - Date: 2026-10-19
 - Supersedes: none
+- Extended by: ADR 0014 (semantic cache, streaming replay, per-request cache
+  controls, opt-in span content — resolves this ADR's deferred items)
 - Related: ADR 0009 (StateStore — the cache's backing store); ADR 0008 (per-key
   governance — the admin-scope seam); `docs/roadmap.md` items 10/11/12;
   research: `docs/research/adr-0012-caching-runtime-control-observability.md`.

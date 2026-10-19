@@ -381,11 +381,40 @@ non-streaming response on `/v1/chat/completions`, `/v1/completions`,
 - `miss` — served fresh (and stored if eligible);
 - `bypass` — the cache was skipped for this request.
 
-Bypass the cache per request with `Cache-Control: no-cache` (or `no-store`) or
-`x-broker-cache: bypass`. The cache is keyed per API-key/tenant scope, so a cached
-answer never crosses a key boundary; only deterministic requests (`temperature ==
-0` or an explicit `seed`) are cached by default; errors and streaming responses
+Bypass the cache per request with `Cache-Control: no-cache` (or `no-store`,
+`max-age=0`) or `x-broker-cache: bypass`. The cache is keyed per API-key/tenant
+scope, so a cached answer never crosses a key boundary; only deterministic
+requests (`temperature == 0` or an explicit `seed`) are cached by default; errors
 are never cached. See [configuration.md](configuration.md#response-cache-adr-0012).
+
+### Semantic cache header + streaming replay (ADR 0014)
+
+When the semantic cache is enabled (`BROKER_SEMANTIC_CACHE_ENABLED`), a response
+served from the embedding-similarity layer (after an exact miss) carries
+`x-broker-cache: semantic-hit` plus **`x-broker-cache-similarity`** (the cosine
+score, e.g. `0.9873`). Only the **last user turn's text** is matched fuzzily —
+key/tenant, placement, namespace, resolved model, endpoint, all non-prompt params,
+**the system prompt, and the whole conversation history** must match exactly, so a
+semantic hit never crosses a scope, system prompt, or history boundary. The layer
+stores only when the served model equals the keyed model (a cascade escalation to
+another model is not stored).
+
+**Streaming requests** (`stream: true`) now also consult the cache: on a hit the
+broker returns a well-formed SSE replay (`chat.completion.chunk` /
+`text_completion` / Responses events + `[DONE]`) with the `x-broker-cache` header,
+instead of bypassing. Only non-streaming responses *populate* the cache.
+
+### Per-request cache controls (ADR 0014)
+
+| Header | Effect |
+|--------|--------|
+| `x-broker-cache-ttl: <seconds>` | Clamp this request's stored-entry TTL. Finite, `>= 0`; may only **shorten** the operator TTL (`BROKER_RESPONSE_CACHE_TTL_SECONDS` / `BROKER_SEMANTIC_CACHE_TTL_SECONDS`). `0` = do not store this response. Non-finite (`nan`/`inf`/`-inf`, overflowing literals like `1e400`) or negative → `400`. |
+| `x-broker-cache-namespace: <token>` | Partition the caller's cache scope (rotate to invalidate). Charset: letters/digits/`.`/`-`/`_`/`:`. |
+| `Cache-Control: max-age=0` | Bypass (same as `no-cache`). |
+
+`s-maxage` and request `max-age>0` freshness directives are **rejected** (ignored):
+the broker keeps no stored-age and has no revalidation protocol — use
+`x-broker-cache-ttl` instead.
 
 ## Admin runtime control (ADR 0012)
 

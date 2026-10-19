@@ -23,13 +23,15 @@ Design (prior art: LiteLLM exact caching, RFC 9111):
 * **Bypass is honored at the HTTP layer** (``Cache-Control: no-cache``/``no-store``
   or ``x-broker-cache: bypass``) — this module just reads/writes.
 
-Semantic (embedding-similarity) caching is deferred — see ADR 0012.
+Semantic (embedding-similarity) caching is implemented separately by
+:class:`SemanticCache` below (ADR 0014).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import OrderedDict
 from typing import Any
 
@@ -37,6 +39,28 @@ from .state import StateStore
 
 #: KV namespace prefix (sits under the StateStore's own ``kv`` namespace).
 _PREFIX = "respcache"
+
+
+def _clamp_ttl(operator_ttl: float, ttl_override: float | None) -> float | None:
+    """Resolve a write TTL so a per-request override can only SHORTEN the operator
+    TTL (ADR 0014 follow-up).
+
+    * no override -> the operator TTL (``None`` when it is 0/unbounded);
+    * override (finite, > 0) -> ``min(override, operator)`` when the operator TTL
+      is finite, else the override (a finite request TTL still bounds an
+      otherwise-unbounded operator entry).
+
+    A write therefore always carries a finite TTL whenever the operator TTL is
+    finite; a client can never extend an entry beyond the operator's ceiling.
+    ``ttl_override == 0`` is handled by the callers as "do not store" (never
+    "store forever"), so it never reaches here.
+    """
+    operator = operator_ttl if operator_ttl > 0 else None
+    if ttl_override is None:
+        return operator
+    if operator is None:
+        return ttl_override
+    return min(float(ttl_override), operator)
 
 
 class ResponseCache:
@@ -56,6 +80,11 @@ class ResponseCache:
         self.hits = 0
         self.misses = 0
         self.stores = 0
+        #: writes skipped because ``x-broker-cache-ttl: 0`` ("do not store").
+        self.not_stored = 0
+        #: writes skipped because the served model != the keyed model (ADR 0014
+        #: follow-up GAP 3: a cascade escalated to a different model).
+        self.skipped_model_mismatch = 0
 
     # --- key / policy (pure, unit-testable) ------------------------------
     @staticmethod
@@ -119,16 +148,22 @@ class ResponseCache:
         except (ValueError, TypeError):
             return None
 
-    async def store(self, key: str, value: dict) -> bool:
-        """Store a successful result. Returns False if skipped (too large).
+    async def store(self, key: str, value: dict, *, ttl_override: float | None = None) -> bool:
+        """Store a successful result. Returns False if skipped.
 
         Enforces ``max_bytes`` (per-entry cap) and ``max_entries`` (LRU bound on
-        the in-process index). TTL comes from ``response_cache_ttl_seconds``.
+        the in-process index). TTL comes from ``response_cache_ttl_seconds``,
+        clamped by any per-request ``x-broker-cache-ttl`` override (ADR 0014
+        follow-up): the override may only SHORTEN the operator TTL, and ``0``
+        means "do not store this response" — never "store forever".
         """
+        if ttl_override is not None and ttl_override <= 0:
+            self.not_stored += 1
+            return False
         data = json.dumps(value, default=str).encode("utf-8")
         if self.max_bytes > 0 and len(data) > self.max_bytes:
             return False
-        ttl = self.ttl if self.ttl > 0 else None
+        ttl = _clamp_ttl(self.ttl, ttl_override)
         await self.state.kv_set(self._k(key), data, ttl=ttl)
         self._index[key] = None
         self._index.move_to_end(key)
@@ -153,6 +188,232 @@ class ResponseCache:
             "hits": self.hits,
             "misses": self.misses,
             "stores": self.stores,
+            "not_stored": self.not_stored,
+            "skipped_model_mismatch": self.skipped_model_mismatch,
             "hit_rate": round(self.hits / total, 4) if total else 0.0,
             "live_entries": len(self._index),
+        }
+
+
+#: KV namespace prefix for the semantic index (under the StateStore ``kv`` ns).
+_SEM_PREFIX = "semcache"
+
+#: The request field that carries the conversation. Only the TEXT of its LAST
+#: user turn is compared fuzzily (by embedding); every other message (system /
+#: developer, earlier turns) and any non-text content parts of that last user
+#: turn are part of the exact ``bucket_key`` — so a semantic hit can differ ONLY
+#: in the wording of the final user message, never in the system prompt, the
+#: conversation history, or any non-prompt parameter. Completions (``prompt``)
+#: and responses (``input`` + ``instructions``) are normalized to ``messages``
+#: upstream, so this single rule covers all three endpoints.
+_FUZZY_FIELDS = ("messages",)
+
+
+class SemanticCache:
+    """Embedding-similarity response cache (ADR 0014).
+
+    A second cache layer consulted only after an exact-cache miss, for
+    chat/completions/responses. It partitions stored responses into **buckets**
+    keyed by every non-prompt request field (scope, resolved model, endpoint,
+    sampling/tools/response_format/seed/..., the ADR 0012 scope, the system
+    prompt, and the whole conversation history) so that only the *last user
+    turn's text* is fuzzy — a semantic hit can never cross a scope, model,
+    parameter, system-prompt, or history boundary. Within a bucket the query
+    embedding is compared to each stored embedding by cosine similarity (pure
+    Python — no numpy); a hit fires when the best similarity clears ``threshold``.
+
+    Growth is bounded two ways so a client cannot grow Redis without limit:
+    ``max_entries`` caps stored (embedding, response) pairs *within* a bucket, and
+    ``max_buckets`` caps the *number* of buckets (LRU eviction). As with the exact
+    cache the index is per-process (best-effort under Redis, where the TTL is the
+    authoritative bound); every write carries a finite TTL whenever the operator
+    TTL is finite.
+
+    Embedding + residency live outside this class (the app supplies them via the
+    manager's own ``/v1/embeddings`` path): this class is given a ready embedding
+    vector and is otherwise a pure StateStore policy, keeping it unit-testable.
+    """
+
+    def __init__(self, state: StateStore, settings: Any) -> None:
+        self.state = state
+        self.enabled: bool = settings.semantic_cache_enabled
+        self.model: str | None = settings.semantic_cache_model
+        self.threshold: float = settings.semantic_cache_threshold
+        self.ttl: float = settings.semantic_cache_ttl_seconds
+        self.max_entries: int = settings.semantic_cache_max_entries
+        self.max_buckets: int = settings.semantic_cache_max_buckets
+        self.require_resident: bool = settings.semantic_cache_require_resident
+        # Per-process LRU index of live bucket keys, used to bound the NUMBER of
+        # buckets (best-effort under Redis, where TTL is the real bound).
+        self._buckets: OrderedDict[str, None] = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+        self.stores = 0
+        self.not_stored = 0
+        self.skipped_not_resident = 0
+        #: writes skipped because the served model != the keyed model (GAP 3).
+        self.skipped_model_mismatch = 0
+
+    # --- pure helpers (unit-testable) ------------------------------------
+    @staticmethod
+    def cosine(a: list[float], b: list[float]) -> float:
+        """Cosine similarity of two equal-length vectors (0.0 on degenerate input)."""
+        if not a or not b or len(a) != len(b):
+            return 0.0
+        dot = 0.0
+        na = 0.0
+        nb = 0.0
+        for x, y in zip(a, b, strict=False):
+            dot += x * y
+            na += x * x
+            nb += y * y
+        if na <= 0.0 or nb <= 0.0:
+            return 0.0
+        return dot / (math.sqrt(na) * math.sqrt(nb))
+
+    @staticmethod
+    def _split_last_user(messages: Any) -> tuple[list, str]:
+        """Partition ``messages`` into ``(exact_remainder, fuzzy_text)``.
+
+        Only the TEXT of the LAST user message is fuzzy. Every other message
+        (system/developer, earlier user/assistant/tool turns) and any non-text
+        content parts of that last user message stay in ``exact_remainder`` — so a
+        semantic hit can differ ONLY in the wording of the final user turn. The
+        last user message is kept in the remainder with its text content removed
+        (role/name/non-text parts preserved) so its *presence and shape* still
+        scope the bucket.
+        """
+        msgs = list(messages or [])
+        last_user: int | None = None
+        for i in range(len(msgs) - 1, -1, -1):
+            m = msgs[i]
+            if isinstance(m, dict) and m.get("role") == "user":
+                last_user = i
+                break
+        exact: list = []
+        fuzzy_parts: list[str] = []
+        for i, m in enumerate(msgs):
+            if i != last_user or not isinstance(m, dict):
+                exact.append(m)
+                continue
+            content = m.get("content")
+            base = {k: v for k, v in m.items() if k != "content"}
+            if isinstance(content, str):
+                fuzzy_parts.append(content)
+                exact.append(base)  # text content dropped (it is the fuzzy part)
+            elif isinstance(content, list):
+                remainder = []
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        fuzzy_parts.append(part["text"])  # text part is fuzzy
+                    else:
+                        remainder.append(part)  # non-text part stays exact
+                base["content"] = remainder
+                exact.append(base)
+            else:
+                exact.append(m)  # unexpected content shape: keep it exact
+        return exact, "\n".join(fuzzy_parts)
+
+    @staticmethod
+    def bucket_key(*, scope: str, model: str, endpoint: str, payload: dict) -> str:
+        """Exact-match bucket key: everything except the fuzzy last-user-turn text.
+
+        The ``messages`` field is reduced to its exact remainder (system prompt,
+        conversation history, and the last user turn minus its text) so differing
+        system prompts or histories land in DIFFERENT buckets. Routing-only fields
+        (``model``, ``stream``, ``user``) are dropped; the resolved model is pinned
+        via the explicit ``model`` argument.
+        """
+        skip = set(_FUZZY_FIELDS) | {"model", "stream", "user"}
+        body = {k: v for k, v in payload.items() if k not in skip}
+        exact_messages, _ = SemanticCache._split_last_user(payload.get("messages"))
+        body["messages"] = exact_messages
+        blob = json.dumps(
+            {"scope": scope, "model": model, "endpoint": endpoint, "body": body},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def query_text(payload: dict) -> str:
+        """The single fuzzy string to embed: the LAST user turn's text only."""
+        _, fuzzy = SemanticCache._split_last_user(payload.get("messages"))
+        return fuzzy
+
+    # --- read / write ----------------------------------------------------
+    def _k(self, bucket: str) -> str:
+        return f"{_SEM_PREFIX}:{bucket}"
+
+    async def lookup(self, bucket: str, embedding: list[float]) -> tuple[dict, float] | None:
+        """Return ``(result, similarity)`` for the best stored match ≥ threshold.
+
+        Updates hit/miss stats. ``None`` on a miss (empty bucket or no match).
+        """
+        raw = await self.state.kv_get_json(self._k(bucket))
+        best_val: dict | None = None
+        best_sim = -1.0
+        for entry in raw or []:
+            emb = entry.get("e")
+            sim = self.cosine(embedding, emb if isinstance(emb, list) else [])
+            if sim > best_sim:
+                best_sim = sim
+                best_val = entry.get("v")
+        if best_val is not None and best_sim >= self.threshold:
+            self.hits += 1
+            if bucket in self._buckets:
+                self._buckets.move_to_end(bucket)  # refresh LRU recency on a hit
+            return best_val, best_sim
+        self.misses += 1
+        return None
+
+    async def store(
+        self, bucket: str, embedding: list[float], value: dict, *, ttl_override: float | None = None
+    ) -> None:
+        """Append ``(embedding, value)`` to a bucket; bound per-bucket entries and
+        the total number of buckets, both LRU.
+
+        TTL follows ``semantic_cache_ttl_seconds`` clamped by any per-request
+        ``x-broker-cache-ttl`` override (ADR 0014 follow-up): the override may only
+        SHORTEN the operator TTL, and ``0`` means "do not store" — never "forever".
+        """
+        if ttl_override is not None and ttl_override <= 0:
+            self.not_stored += 1
+            return
+        raw = await self.state.kv_get_json(self._k(bucket))
+        entries = list(raw) if isinstance(raw, list) else []
+        entries.append({"e": embedding, "v": value})
+        if self.max_entries > 0 and len(entries) > self.max_entries:
+            entries = entries[-self.max_entries :]
+        ttl = _clamp_ttl(self.ttl, ttl_override)
+        await self.state.kv_set_json(self._k(bucket), entries, ttl=ttl)
+        self.stores += 1
+        # Bound the NUMBER of buckets (global cap), evicting the LRU bucket so a
+        # caller varying non-prompt params cannot grow the keyspace without limit.
+        self._buckets[bucket] = None
+        self._buckets.move_to_end(bucket)
+        while self.max_buckets > 0 and len(self._buckets) > self.max_buckets:
+            old, _ = self._buckets.popitem(last=False)
+            if old != bucket:
+                await self.state.kv_delete(self._k(old))
+
+    def stats(self) -> dict[str, Any]:
+        total = self.hits + self.misses
+        return {
+            "enabled": self.enabled,
+            "model": self.model,
+            "threshold": self.threshold,
+            "ttl_seconds": self.ttl,
+            "max_entries": self.max_entries,
+            "max_buckets": self.max_buckets,
+            "require_resident": self.require_resident,
+            "hits": self.hits,
+            "misses": self.misses,
+            "stores": self.stores,
+            "not_stored": self.not_stored,
+            "skipped_not_resident": self.skipped_not_resident,
+            "skipped_model_mismatch": self.skipped_model_mismatch,
+            "hit_rate": round(self.hits / total, 4) if total else 0.0,
+            "live_buckets": len(self._buckets),
         }

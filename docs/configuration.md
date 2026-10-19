@@ -320,10 +320,73 @@ bypass. Per-request bypass via `Cache-Control: no-cache`/`no-store` or
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
 | `BROKER_RESPONSE_CACHE_ENABLED` | bool | `false` | Master switch for the exact response cache. |
-| `BROKER_RESPONSE_CACHE_TTL_SECONDS` | float | `300` | Entry TTL; `0` = no TTL (rely on `max_entries`). |
+| `BROKER_RESPONSE_CACHE_TTL_SECONDS` | float | `300` | Operator TTL ceiling for stored entries; `0` = no TTL (rely on `max_entries`). A per-request `x-broker-cache-ttl` may only shorten it. |
 | `BROKER_RESPONSE_CACHE_MAX_ENTRIES` | int | `1000` | In-process LRU bound on live entries; `0` = unbounded (Redis uses TTL). |
 | `BROKER_RESPONSE_CACHE_MAX_BYTES` | int | `1000000` | Per-entry cap; a larger serialized result is not stored. `0` = no cap. |
 | `BROKER_RESPONSE_CACHE_DETERMINISTIC_ONLY` | bool | `true` | Cache only deterministic requests (`temperature == 0` or an explicit `seed`); embeddings always. Set `false` to cache all. |
+
+### Streaming replay + per-request controls (ADR 0014)
+
+Streaming requests (`stream: true`) now **consult** the cache and, on a hit, are
+served as a well-formed SSE replay instead of bypassing; only non-streaming
+responses *populate* the cache. Per request:
+
+| Header | Effect |
+|--------|--------|
+| `x-broker-cache-ttl: <seconds>` | Clamp this request's stored-entry TTL. Finite, `>= 0`; may only **shorten** the operator TTL. `0` = do not store this response. Non-finite (`nan`/`inf`/`-inf`, overflow like `1e400`) or negative → `400`. |
+| `x-broker-cache-namespace: <token>` | Partition the caller's cache scope (rotate to invalidate). |
+| `Cache-Control: max-age=0` | Bypass (same as `no-cache`/`no-store`). |
+
+`s-maxage` and request `max-age>0` freshness are rejected (no stored-age /
+revalidation protocol).
+
+## Semantic cache (ADR 0014)
+
+Embedding-similarity cache, **default off**. A second layer consulted *after* an
+exact miss for chat/completions/responses: it embeds the prompt via the broker's
+own `/v1/embeddings` path (`BROKER_SEMANTIC_CACHE_MODEL`, a registry alias) and
+serves the closest stored response whose cosine similarity clears the threshold.
+**Strict scoping** — key/tenant + placement + namespace + resolved model +
+endpoint + every non-prompt param (sampling, `tools`, `response_format`, `seed`,
+...) **plus the system prompt and the whole conversation history** must match
+exactly; only the **last user turn's text** is fuzzy (and only its text — any
+non-text content parts stay exact) — so a semantic hit never crosses a scope,
+system prompt, or history boundary. Completions (`prompt`) and responses
+(`input` + `instructions`) are normalized to messages upstream, so the same rule
+covers all three endpoints. Pure-Python cosine over a bounded per-bucket index
+(no numpy); the **number of buckets** is also globally bounded
+(`BROKER_SEMANTIC_CACHE_MAX_BUCKETS`, LRU) so a caller varying non-prompt params
+cannot grow the index without limit; in-process or Redis via the StateStore. A
+semantic hit returns `x-broker-cache: semantic-hit` + `x-broker-cache-similarity`.
+
+The semantic layer stores only when the **served** model equals the model the
+request keyed on (the pre-resolution pick); if a cascade escalated to a different
+model the response is not stored (it would otherwise be served to a later request
+that resolved to the primary). Per-request `x-broker-cache-ttl` follows the same
+clamp rules as the exact cache (finite, may only shorten the operator TTL, `0` =
+do not store).
+
+**Lazy-load invariant.** With `BROKER_SEMANTIC_CACHE_REQUIRE_RESIDENT=true`
+(default) the cache is consulted/populated **only when the embedding model is
+already resident**, so a chat request *never silently loads an extra model*. Warm
+it with an explicit `/v1/embeddings` call or an admin preload, or point it at an
+always-on external daemon. Set `false` to allow on-demand embedding loads (the
+documented opt-in exception).
+
+The threshold default **0.95** is precision-favoring: the broker is multi-tenant
+with no built-in eval loop, and a false positive serves a *wrong* answer. See
+`docs/research/adr-0014-semantic-cache-and-cache-extensions.md` for the
+false-positive-vs-threshold survey (GPTCache, Redis, LiteLLM, respan).
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_SEMANTIC_CACHE_ENABLED` | bool | `false` | Master switch for the semantic layer. |
+| `BROKER_SEMANTIC_CACHE_MODEL` | str | — | **Required when enabled**: registry alias served via `/v1/embeddings`. |
+| `BROKER_SEMANTIC_CACHE_THRESHOLD` | float | `0.95` | Cosine similarity in `[0,1]`; higher = fewer false positives, lower hit rate. |
+| `BROKER_SEMANTIC_CACHE_TTL_SECONDS` | float | `300` | Operator TTL ceiling per bucket; `0` = no TTL. A per-request `x-broker-cache-ttl` may only shorten it. |
+| `BROKER_SEMANTIC_CACHE_MAX_ENTRIES` | int | `128` | Per-bucket bound on stored `(embedding, response)` pairs (LRU); `>= 1`. |
+| `BROKER_SEMANTIC_CACHE_MAX_BUCKETS` | int | `1024` | Global LRU bound on the **number** of buckets; `>= 1`. Keeps the index bounded even when a caller varies non-prompt params. |
+| `BROKER_SEMANTIC_CACHE_REQUIRE_RESIDENT` | bool | `true` | Consult/populate only when the embedding model is already resident; `false` allows on-demand loading. |
 
 ## Admin runtime control (ADR 0012)
 
@@ -353,6 +416,8 @@ a `500`). The admin surface stays locked even when data-plane auth is disabled.
 | `BROKER_METRICS_ENABLED` | bool | `true` | Expose `/metrics`. |
 | `BROKER_TRACING_ENABLED` | bool | `false` | OpenTelemetry tracing (ADR 0012). Requires the optional `otel` extra or startup fails fast. Spans carry `gen_ai.*` metadata only — never prompt/response content. OTLP exporter configured via standard `OTEL_*` env vars. No-op + zero overhead when off. |
 | `BROKER_TRACING_SERVICE_NAME` | str | `backend-agnostic-broker` | `service.name` resource attribute for spans (when the broker stands up its own provider). |
+| `BROKER_TRACING_CAPTURE_CONTENT` | bool | `false` | **(ADR 0014)** Opt-in span content capture. When tracing is enabled AND this is `true`, the `inference` span carries truncated `gen_ai.input.messages` / `gen_ai.output.messages` (OTel GenAI `spanOnly` mode). **WARNING: prompts/responses may contain PII** and become visible to anyone with trace access — never enable without an informed decision. Off = byte-for-byte v0.5.0 (no content on any span). |
+| `BROKER_TRACING_CONTENT_MAX_CHARS` | int | `2000` | Truncate each captured content attribute to this many characters (`0` = unlimited). |
 | `BROKER_USAGE_LOG_ENABLED` | bool | `true` | Record per-request usage to the SQLite usage log (metadata + token counts only; see `/usage`). |
 | `BROKER_USAGE_LOG_PATH` | str? | `<cache_dir>/usage.sqlite3` | Usage-log path; `:memory:` for ephemeral. Self-disables if unwritable. |
 
