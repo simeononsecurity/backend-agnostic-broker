@@ -18,7 +18,7 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 
 | # | Item | Status | ADR |
 |---|------|--------|-----|
-| 3 | Per-key rate limits (rpm/tpm) + virtual keys + budgets | 📋 planned | [0008](adr/0008-per-key-governance.md) |
+| 3 | Per-key rate limits (rpm/tpm) + virtual keys + budgets | ✅ done | [0008](adr/0008-per-key-governance.md) |
 | 4 | Retries w/ exponential backoff + member cooldowns | ✅ done | [0009](adr/0009-routing-reliability-and-scale.md) |
 | 5 | Optional Redis shared state (multi-replica) | ✅ done | [0009](adr/0009-routing-reliability-and-scale.md) |
 | 6 | Prefix/cache-aware pool routing + load-aware scoring | 📋 planned | [0010](adr/0010-cache-aware-pool-routing.md) |

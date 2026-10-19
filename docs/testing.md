@@ -3,7 +3,7 @@
 Run the suite:
 
 ```bash
-make test                 # pytest -q  (191 tests)
+make test                 # pytest -q  (239 tests)
 make cov                  # with coverage
 python -m pytest -q tests/test_security.py   # one file
 ```
@@ -13,12 +13,12 @@ so they exercise the real request path, lifecycle, locking, and security
 boundaries without any external runtime. The suite is CPU-only; optional GPU
 tests (if added) should be marked and excluded from CI.
 
-## Coverage map (191 tests)
+## Coverage map (239 tests)
 
 | File | Tests | Covers |
 |------|-------|--------|
-| `tests/test_config.py` | 5 | Typed config + fail-fast `validate_runtime` (auth without keys, bad port, missing registry, policy/log-format validation). |
-| `tests/test_registry.py` | 10 | Registry parsing/validation, unknown-field rejection, duplicate-alias detection, backend filtering, pool + router config. |
+| `tests/test_config.py` | 8 | Typed config + fail-fast `validate_runtime` (auth without keys, auth satisfied by a keys file, bad port, missing registry, bad rate-limit window, policy/log-format validation). |
+| `tests/test_registry.py` | 12 | Registry parsing/validation, unknown-field rejection, duplicate-alias detection, backend filtering, pool + router config, `pricing` block (ADR 0008) parse + negative rejection. |
 | `tests/test_lifecycle.py` | 5 | State machine legal/illegal transitions, idle timing, snapshots. |
 | `tests/test_adapters.py` | 5 | Adapter contract conformance + fake backend behavior. |
 | `tests/test_api.py` | 10 | `/v1/models`, `/v1/chat/completions`, `/healthz`, `/readyz`, `/status`, `/metrics`, structured errors, request IDs, size limit. |
@@ -33,6 +33,8 @@ tests (if added) should be marked and excluded from CI.
 | `tests/test_streaming.py` | 1 | SSE streaming (`chat.completion.chunk` + `[DONE]`). |
 | `tests/test_openai_endpoints.py` | 18 | `/v1/completions`, `/v1/responses`, `/v1/embeddings` shims/adapters: translation, streaming, pool routing, no silent fallback. |
 | `tests/test_usage.py` | 4 | Usage log (SQLite) + `GET /usage`: per-request metadata, key fingerprint, self-disable on unwritable path. |
+| `tests/test_keys.py` | 14 | Virtual keys (ADR 0008): secret format + SHA-256 hashing, constant-time resolve, wrong/unknown/disabled/expired → generic reject, legacy keys unlimited, CLI create/list/revoke (secret shown once, no plaintext on disk). |
+| `tests/test_governance.py` | 25 | Per-key governance (ADR 0008): rpm sliding window, tpm estimate + reconcile, concurrency cap + release, token & cost budget exhaustion + period bucketing, unlimited no-op; HTTP 429 (`rate_limit_exceeded`/`insufficient_quota`) + `Retry-After` + `x-ratelimit-*`, 403 `model_not_allowed`, scoped `/usage`, legacy backward-compat. Unit tests parametrized over in-process + Redis (fakeredis). |
 | `tests/test_lazy_load.py` | 4 | No model loads at startup; a request loads only its selected model; no fallback. |
 | `tests/test_unload.py` | 4 | Idle unload sweep; unload while idle; not while serving. |
 | `tests/test_security.py` | 17 | SSRF guard, path traversal, executable allow-list, flag/shell-injection rejection, no-shell argv. |

@@ -63,6 +63,29 @@ Data-driven policy for the `auto` alias (see [auto-router.md](auto-router.md)):
 Each override `when` supports `has_images`, `has_tools`, `needs_json`,
 `min_ctx_tokens`, and `regex` (matched against the last user message).
 
+### `pricing` (top-level, optional) — ADR 0008
+
+Per-model prices used to charge per-key **cost budgets** (see
+[configuration.md](configuration.md) and ADR 0008). Keyed by the **public** model
+name (a pool name, or a standalone alias). Prices are **USD per million tokens**.
+Models without an entry are treated as free, so cost budgets simply don't apply to
+them (token budgets need no pricing).
+
+```yaml
+pricing:
+  chat:                     # a pool or alias name
+    input_per_million: 0.20
+    output_per_million: 0.60
+```
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `input_per_million` | float | `0.0` | USD per 1,000,000 prompt (input) tokens. |
+| `output_per_million` | float | `0.0` | USD per 1,000,000 completion (output) tokens. |
+
+A request costs `prompt·input + completion·output`; the broker accumulates spend
+in integer micro-USD so counters stay exact.
+
 ### `gpu` (GPURequirements)
 
 | Field | Type | Default | Meaning |

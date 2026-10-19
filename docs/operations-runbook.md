@@ -93,3 +93,34 @@ never in committed files.
 - Keep `BROKER_ALLOWED_EXEC_DIRS` and `BROKER_ALLOWED_MODEL_ROOTS` tightly
   scoped. Rotate `BROKER_API_KEYS` via your secret store. Rebuild the image
   periodically to pick up base-image CVE fixes (see `docs/EVIDENCE.md` gate 19).
+
+## Virtual key lifecycle (ADR 0008)
+
+Per-key governance is opt-in via `BROKER_KEYS_PATH` (a git-ignored `keys.yaml`).
+Manage keys with the CLI (run from the worktree / container):
+
+```bash
+# Create a limited key — the secret is printed ONCE; store it immediately.
+python -m broker.keys create --label team-alpha --tenant alpha --scope user \
+    --rpm 60 --tpm 100000 --max-concurrency 4 \
+    --daily-tokens 1000000 --monthly-tokens 20000000 \
+    --daily-cost 5 --monthly-cost 100 --allowed-models chat,auto
+
+python -m broker.keys list                 # ids/labels/scopes only — no secrets
+python -m broker.keys revoke brk_1a2b3c4d  # disables without deleting
+```
+
+- **Rotation:** create a new key, migrate the caller, then `revoke` the old id.
+  The secret cannot be recovered — only its hash is stored. Reload the broker (or
+  rely on process restart) to pick up `keys.yaml` changes.
+- **Expiry:** set `--expiry YYYY-MM-DD` (UTC); expired keys fail closed.
+- **Cost budgets** require a registry `pricing` block (USD/million tokens); keys
+  without priced models only accrue token budgets.
+- **Counters & resets:** `rpm`/`tpm` reset on a rolling
+  `BROKER_RATE_LIMIT_WINDOW_SECONDS` window; token/cost budgets reset at the UTC
+  day/month boundary automatically (period-bucketed `StateStore` keys with TTL).
+- **Multi-replica caveat:** with Redis shared state a replica that crashes
+  mid-request can leak a `max_concurrency` slot until the next successful release;
+  if concurrency admission seems stuck, inspect/clear the `gov:conc:<id>` counter.
+- **Reporting:** `GET /usage` is scoped — a `user` key sees only its own spend; an
+  `admin` key sees all keys plus a `by_key` breakdown.

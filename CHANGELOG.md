@@ -8,6 +8,33 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Per-key governance: virtual keys, rate limits & budgets** (ADR 0008). Opt-in
+  via `BROKER_KEYS_PATH` (a git-ignored `keys.yaml` of **hashed** virtual keys;
+  manage with `python -m broker.keys create|list|revoke`, secret shown once).
+  Each key has an id/label/tenant/scope (`user`|`admin`), optional expiry, and
+  limits: `rpm` (sliding window), `tpm` (windowed, pre-dispatch estimate +
+  post-response reconcile with real usage), `max_concurrency`, daily/monthly
+  **token budgets**, optional **cost budgets** (registry `pricing` block, USD per
+  million tokens), and a fail-closed `allowed_models` list (applies to the model
+  the `auto` router picks too). Counters live on the ADR 0009 `StateStore`
+  (in-process or Redis). Enforced before dispatch on
+  chat/completions/responses/embeddings with OpenAI-compatible errors: `429`
+  `rate_limit_exceeded` + `Retry-After` + `x-ratelimit-limit/remaining/reset-{requests,tokens}`
+  headers (also emitted on success), `429` `insufficient_quota` for budgets, and
+  `403` `model_not_allowed`. `GET /usage` is now **scoped** — a `user` key sees
+  only its own usage; an `admin` key sees all keys plus a per-key spend breakdown.
+  Legacy `BROKER_API_KEYS` keep working as **unlimited user keys**; with no keys
+  file and no limits, behavior is identical to v0.4.0. New settings
+  `BROKER_KEYS_PATH`, `BROKER_RATE_LIMIT_WINDOW_SECONDS`; new registry `pricing`
+  block; `keys.yaml` git-ignored (`keys.example.yaml` tracked).
+
+### Changed
+
+- `GET /usage` responses now include a `scope` field and (for `user` scope) the
+  caller's `api_key_id`; `admin` scope adds a `by_key` breakdown.
+
+### Added (routing reliability & shared state — ADR 0009)
+
 - **Retries with full-jitter backoff** (ADR 0009): `BROKER_RETRY_MAX_ATTEMPTS`,
   `BROKER_RETRY_BACKOFF_BASE_MS`, `BROKER_RETRY_BACKOFF_MAX_MS`. Retries re-select
   a member **within the requested model's pool only** (never a different model),
