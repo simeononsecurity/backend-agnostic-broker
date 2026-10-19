@@ -17,6 +17,7 @@ the lifecycle hooks.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -106,6 +107,24 @@ class HTTPBackendAdapter(BackendAdapter):
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=self.entry.request_timeout_seconds)
         return self._client
+
+    def _json_or_unavailable(self, resp: httpx.Response, *, what: str) -> Any:
+        """Parse an upstream response body as JSON, or raise 502.
+
+        A runtime that returns a non-JSON body (HTML error page, truncated
+        stream, proxy banner) is a backend fault, not a broker bug. Translate the
+        decode failure into :class:`BackendUnavailableError` so it maps to a 502
+        and participates in pool failover/cooldown instead of crashing with a 500.
+        """
+        try:
+            return resp.json()
+        except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as exc:
+            raise BackendUnavailableError(
+                f"backend returned a non-JSON {what} response",
+                backend=self.name,
+                model=self.entry.alias,
+                remediation="check the runtime process/endpoint",
+            ) from exc
 
     def _build_startup_argv(self) -> list[str]:
         exe = self.entry.startup_command[0]
@@ -254,7 +273,7 @@ class HTTPBackendAdapter(BackendAdapter):
                 backend=self.name,
                 model=self.entry.alias,
             )
-        data = resp.json()
+        data = self._json_or_unavailable(resp, what="chat")
         # Present the public alias back to the caller.
         data["model"] = self.entry.alias
         return data
@@ -328,7 +347,7 @@ class HTTPBackendAdapter(BackendAdapter):
                 backend=self.name,
                 model=self.entry.alias,
             )
-        data = resp.json()
+        data = self._json_or_unavailable(resp, what="embeddings")
         if isinstance(data, dict):
             data["model"] = self.entry.alias
         return data
@@ -343,8 +362,6 @@ class HTTPBackendAdapter(BackendAdapter):
         every backend yields one consistent shape — the backend's own document
         echo is intentionally ignored.
         """
-        from ..openai_compat import build_rerank_response
-
         query = payload.get("query")
         documents = [str(d) for d in (payload.get("documents") or [])]
         top_n = payload.get("top_n")
@@ -378,7 +395,9 @@ class HTTPBackendAdapter(BackendAdapter):
                 backend=self.name,
                 model=self.entry.alias,
             )
-        data = resp.json()
+        from ..openai_compat import RerankContractError, build_rerank_response
+
+        data = self._json_or_unavailable(resp, what="rerank")
         raw = data.get("results") if isinstance(data, dict) else None
         if raw is None and isinstance(data, dict) and isinstance(data.get("data"), list):
             raw = data["data"]
@@ -388,27 +407,47 @@ class HTTPBackendAdapter(BackendAdapter):
                 backend=self.name,
                 model=self.entry.alias,
             )
+        # Normalize only the score key here (vLLM uses ``relevance_score``,
+        # some runtimes use ``score``); every value is then strictly validated
+        # by build_rerank_response. Do NOT drop/skip malformed items — a bad
+        # upstream result is a backend contract violation (502), not something
+        # to silently filter or coerce.
         scored: list[dict[str, Any]] = []
         for item in raw:
             if not isinstance(item, dict):
-                continue
-            idx = item.get("index")
-            score = item.get("relevance_score", item.get("score"))
-            if idx is None or score is None:
-                continue
-            scored.append({"index": idx, "relevance_score": score})
+                raise BackendUnavailableError(
+                    "rerank backend returned a non-object result",
+                    backend=self.name,
+                    model=self.entry.alias,
+                )
+            scored.append(
+                {
+                    "index": item.get("index"),
+                    "relevance_score": item.get("relevance_score", item.get("score")),
+                }
+            )
         usage = data.get("usage") if isinstance(data, dict) else None
         if not isinstance(usage, dict):
             usage = None
-        return build_rerank_response(
-            scored=scored,
-            documents=documents,
-            model=self.entry.alias,
-            request_id=str(data.get("id") or request_id),
-            top_n=top_n,
-            return_documents=return_documents,
-            usage=usage,
-        )
+        try:
+            # ``id`` stays broker-generated (``rerank-<request_id>``); the
+            # upstream id is never echoed verbatim.
+            return build_rerank_response(
+                scored=scored,
+                documents=documents,
+                model=self.entry.alias,
+                request_id=request_id,
+                top_n=top_n,
+                return_documents=return_documents,
+                usage=usage,
+            )
+        except RerankContractError as exc:
+            raise BackendUnavailableError(
+                f"rerank backend returned an invalid result: {exc}",
+                backend=self.name,
+                model=self.entry.alias,
+                remediation="check the runtime process/endpoint",
+            ) from exc
 
     async def collect_load(self) -> float | None:
         """Scrape ``vllm:num_requests_waiting`` from the runtime's /metrics.

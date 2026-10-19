@@ -120,3 +120,29 @@ locally in Docker with `--reranking --pooling rank` on `127.0.0.1`, with
 `BROKER_ALLOW_LOOPBACK_BACKENDS=true`. The exact commands, the registry entry,
 the request, the observed (correct) ordering, and the teardown (container +
 weights removed) are recorded in `docs/testing.md` and the research note.
+
+### Follow-up: strict upstream-result validation (no cache poisoning)
+
+Orchestrator verification found that a *malformed* upstream rerank body was
+either passed through (`200`) or crashed the request (`500`). The normalization
+path is now the **total validation authority**: `build_rerank_response` requires
+every result to be an object carrying a non-bool `int` `index` in
+`[0, len(documents))` that is unique across the response, and a finite real
+`relevance_score`; any violation raises `RerankContractError`, which
+`HTTPBackendAdapter.rerank` maps to `BackendUnavailableError` (`502`). Results
+are never partially emitted or silently coerced, the malformed body is never
+written to the response cache (errors propagate uncached), and the failure
+participates in pool failover/cooldown like any other backend error. A
+non-JSON upstream body is caught by a shared `_json_or_unavailable` helper now
+applied to the rerank, chat, and (non-stream) embeddings `resp.json()` call
+sites — closing the same latent `500` on those paths. The upstream `id` is no
+longer echoed: the response `id` stays broker-generated (`rerank-<request_id>`).
+
+`tests/test_rerank_upstream.py` drives the real vLLM adapter/app against a tiny
+in-process loopback upstream: one parametrized `502` case per contract violation
+(out-of-range / negative / duplicate / float / bool index; string score; string
+index; `NaN`/`Infinity` score; non-JSON body; results-not-a-list; non-object
+result), a well-formed case asserting the broker-generated `id`, a fewer-results-
+than-documents (top_n) positive case, chat/embeddings non-JSON ⇒ `502`, the
+cache-not-poisoned assertion, and pool failover past a member returning a
+malformed body.

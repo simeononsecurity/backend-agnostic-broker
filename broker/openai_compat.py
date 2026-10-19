@@ -10,6 +10,7 @@ transformers; the HTTP wiring lives in ``broker.app``.
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -260,6 +261,49 @@ async def chat_sse_to_responses_sse(
 # --- rerank normalization (ADR 0013) -----------------------------------------
 
 
+class RerankContractError(ValueError):
+    """An upstream rerank response violated the normalization contract.
+
+    Raised by :func:`build_rerank_response` when a scored result is not a usable
+    ``{index, relevance_score}`` pair (wrong type, out-of-range/duplicate index,
+    or a non-finite score). Adapters translate this into a
+    :class:`~broker.errors.BackendUnavailableError` (502) so a malformed upstream
+    body is treated as a backend fault — never partially passed through, silently
+    coerced, or written to the response cache.
+    """
+
+
+def _require_result_index(idx: Any, n_documents: int, seen: set[int]) -> int:
+    """Validate a single rerank ``index`` against the request's document count.
+
+    Must be a real ``int`` (JSON ``true``/``false`` are ``bool`` and rejected),
+    within ``[0, n_documents)``, and not already seen. Returns the int or raises
+    :class:`RerankContractError`.
+    """
+    if not isinstance(idx, int) or isinstance(idx, bool):
+        raise RerankContractError(f"rerank index must be a non-bool int, got {idx!r}")
+    if not (0 <= idx < n_documents):
+        raise RerankContractError(f"rerank index {idx} out of range for {n_documents} document(s)")
+    if idx in seen:
+        raise RerankContractError(f"duplicate rerank index {idx}")
+    return idx
+
+
+def _require_result_score(score: Any) -> float:
+    """Validate a single rerank ``relevance_score``.
+
+    Must be a real, finite number (``bool`` and ``str`` are rejected; ``NaN`` and
+    ``±Infinity`` are rejected so the response always JSON-serializes). Returns a
+    float or raises :class:`RerankContractError`.
+    """
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        raise RerankContractError(f"rerank score must be a number, got {score!r}")
+    val = float(score)
+    if not math.isfinite(val):
+        raise RerankContractError(f"rerank score must be finite, got {score!r}")
+    return val
+
+
 def build_rerank_response(
     *,
     scored: list[dict[str, Any]],
@@ -279,14 +323,24 @@ def build_rerank_response(
     *request* ``documents``) is attached only when ``return_documents`` is true —
     omitted entirely (never ``null``) otherwise, matching Cohere v2 / LiteLLM.
     ``index`` is always the original document ordinal.
+
+    Validation is strict and total: every scored item must be an object carrying
+    a non-bool ``int`` ``index`` in ``[0, len(documents))`` that is unique across
+    the response, and a finite real ``relevance_score``. Any violation raises
+    :class:`RerankContractError` (adapters map this to a 502) — results are never
+    partially emitted or silently coerced. Returning *fewer* results than
+    documents (``top_n``) is allowed.
     """
+    n = len(documents)
+    seen: set[int] = set()
     norm: list[dict[str, Any]] = []
     for item in scored:
-        idx = item.get("index")
-        score = item.get("relevance_score")
-        if idx is None or score is None:
-            continue
-        norm.append({"index": int(idx), "relevance_score": float(score)})
+        if not isinstance(item, dict):
+            raise RerankContractError(f"rerank result must be an object, got {item!r}")
+        idx = _require_result_index(item.get("index"), n, seen)
+        score = _require_result_score(item.get("relevance_score"))
+        seen.add(idx)
+        norm.append({"index": idx, "relevance_score": score})
     norm.sort(key=lambda r: (-r["relevance_score"], r["index"]))
     if isinstance(top_n, int) and not isinstance(top_n, bool) and top_n >= 0:
         norm = norm[:top_n]

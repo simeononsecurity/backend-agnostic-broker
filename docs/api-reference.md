@@ -288,6 +288,20 @@ embeddings-cosine substitute; Strata rerank is unverified. The documents count i
 bounded by `BROKER_RERANK_MAX_DOCUMENTS` (default 1000) and the body by
 `BROKER_MAX_REQUEST_BYTES`.
 
+**Upstream contract (`502`).** The broker is the normalization authority and
+validates the backend's reply strictly: every result must carry a non-bool
+integer `index` within `[0, len(documents))` that is unique across the response,
+and a finite numeric `relevance_score`. A malformed reply — an out-of-range,
+negative, duplicate, non-integer, or boolean `index`; a non-numeric or
+non-finite (`NaN`/`Infinity`) score; a non-JSON body; or a missing/wrong
+`results` array — is treated as a backend contract violation and returns `502`
+(`backend_unavailable`). Such a response is **never** partially passed through,
+silently coerced, or written to the response cache, and it participates in pool
+failover/cooldown like any other backend error. The response `id` is always
+broker-generated (`rerank-<request_id>`); the upstream `id` is never echoed.
+Returning *fewer* results than documents (e.g. the backend's own `top_n`) is
+allowed.
+
 ```bash
 curl -s -H "Authorization: Bearer ***" -H 'content-type: application/json' \
   -d '{"model":"bge-reranker","query":"What is the capital of France?",

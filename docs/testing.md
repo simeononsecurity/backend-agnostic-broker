@@ -3,7 +3,7 @@
 Run the suite:
 
 ```bash
-make test                 # pytest -q  (401 collected: 375 passed, 26 skipped)
+make test                 # pytest -q  (419 collected: 393 passed, 26 skipped)
 make cov                  # with coverage
 python -m pytest -q tests/test_security.py   # one file
 ```
@@ -13,13 +13,13 @@ so they exercise the real request path, lifecycle, locking, and security
 boundaries without any external runtime. The suite is CPU-only; optional GPU
 tests (if added) should be marked and excluded from CI.
 
-In the default CPU venv, 375 pass and 26 skip — the skips are the Redis-backed
+In the default CPU venv, 393 pass and 26 skip — the skips are the Redis-backed
 `StateStore` paths (counters, prefix index, response cache) and the OpenTelemetry
 span path, which need the optional `redis`/`otel` extras. In a venv with
-`pip install -e '.[dev,redis,otel]'` those run too: **399 passed, 2 skipped**
+`pip install -e '.[dev,redis,otel]'` those run too: **417 passed, 2 skipped**
 (the remaining 2 are import-guard paths that only fire when a package is *absent*).
 
-## Coverage map (401 collected)
+## Coverage map (419 collected)
 
 | File | Tests | Covers |
 |------|-------|--------|
@@ -45,6 +45,7 @@ span path, which need the optional `redis`/`otel` extras. In a venv with
 | `tests/test_streaming.py` | 1 | SSE streaming (`chat.completion.chunk` + `[DONE]`). |
 | `tests/test_openai_endpoints.py` | 18 | `/v1/completions`, `/v1/responses`, `/v1/embeddings` shims/adapters: translation, streaming, pool routing, no silent fallback. |
 | `tests/test_rerank.py` | 29 | `/v1/rerank` (ADR 0013): validation (query/documents/top_n/cap/object-docs), ordering + original-index + score-desc, `top_n`, `return_documents` on/off, non-rerank model `400`, unknown model `404`, auth `401`, per-key scoping, placement allow/deny, usage recorded, response-cache hit, `/v1/models` capability, OpenAPI path, pool failover, Ollama/Strata adapter `400`, and the shared `build_rerank_response` normalizer. |
+| `tests/test_rerank_upstream.py` | 18 | Strict upstream-result validation (ADR 0013 follow-up): one `502` case per contract violation (out-of-range/negative/duplicate/float/bool index, string score/index, `NaN`/`Infinity` score, non-JSON body, results-not-a-list, non-object result), well-formed + broker-generated `id`, fewer-results-than-documents allowed, chat/embeddings non-JSON ⇒ `502`, malformed body never cached, and pool failover past a malformed member — driven against an in-process loopback upstream. |
 | `tests/test_usage.py` | 4 | Usage log (SQLite) + `GET /usage`: per-request metadata, key fingerprint, self-disable on unwritable path. |
 | `tests/test_keys.py` | 16 | Virtual keys (ADR 0008): secret format + SHA-256 hashing, constant-time resolve, wrong/unknown/disabled/expired → generic reject, non-ASCII + over-long keys → None (no 500), legacy keys unlimited, CLI create/list/revoke (secret shown once, no plaintext on disk). |
 | `tests/test_governance.py` | 27 | Per-key governance (ADR 0008): rpm sliding window, tpm estimate + reconcile, concurrency cap + release, token & cost budget exhaustion + period bucketing, unlimited no-op; HTTP 429 (`rate_limit_exceeded`/`insufficient_quota`) + `Retry-After` + `x-ratelimit-*`, 403 `model_not_allowed`, non-ASCII/over-long keys → 401, scoped `/usage`, legacy backward-compat. Unit tests parametrized over in-process + Redis (fakeredis). |

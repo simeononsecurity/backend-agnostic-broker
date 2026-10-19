@@ -27,6 +27,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/v1/rerank` (Cohere recommends ≤1,000); the body is still bounded by
   `BROKER_MAX_REQUEST_BYTES`.
 
+### Fixed
+
+- **`/v1/rerank` strict upstream validation** (ADR 0013 follow-up): a malformed
+  reply from a vLLM/llama.cpp reranker is now a `502` (`backend_unavailable`)
+  instead of being passed through (`200`) or crashing (`500`). The broker
+  requires every result to carry a non-bool integer `index` in
+  `[0, len(documents))` that is unique across the response, and a finite numeric
+  `relevance_score`; out-of-range/negative/duplicate/non-integer/boolean indices,
+  non-numeric or `NaN`/`Infinity` scores, non-JSON bodies, and missing/wrong
+  `results` arrays all fail closed. A malformed body is never partially emitted,
+  silently coerced, or written to the response cache, and it participates in pool
+  failover/cooldown. The response `id` is always broker-generated
+  (`rerank-<request_id>`); the upstream `id` is no longer echoed. A shared
+  non-JSON guard also hardens the chat and (non-stream) embeddings passthroughs
+  against the same latent `500`.
+
 Defaults reproduce v0.5.0 exactly (new capability and endpoint are opt-in via the
 registry; no model loads at startup).
 
