@@ -61,6 +61,7 @@ from .config import Settings
 from .errors import (
     AuthorizationError,
     BackendUnavailableError,
+    BrokerError,
     ConcurrencyLimitError,
     ModelBusyError,
     ModelLoadError,
@@ -70,13 +71,17 @@ from .errors import (
 )
 from .lifecycle import LifecycleMachine, State
 from .registry import ModelEntry, Registry, load_registry
+from .reliability import ErrorClass, RetryPolicy, classify_error, retry_after_seconds
 from .router import AutoRouter, should_escalate
 from .state import make_state_store
 from .tracing import make_tracer
 
 log = logging.getLogger("broker.manager")
 
-#: Exceptions that make a pool member a failover candidate (try another member).
+#: Exceptions that make a pool member a failover candidate under the DEFAULT
+#: per-error policy (ADR 0009). ADR 0017's ``RetryPolicy`` is authoritative — it
+#: classifies every error and decides retry/cooldown per class — but this tuple
+#: documents the default-retryable set (timeout / connection / server_error).
 _FAILOVER_ERRORS = (BackendUnavailableError, ModelLoadError, TimeoutError_)
 
 
@@ -204,6 +209,9 @@ class ModelManager:
         # Redis when BROKER_REDIS_URL is set (multi-replica). Owns the sticky
         # session map, per-member cooldowns, counters, and a generic KV.
         self.state = make_state_store(settings)
+        # Per-error retry/cooldown policy (ADR 0017). Classifies every failure and
+        # decides retry + cooldown-counting per class; defaults reproduce ADR 0009.
+        self.retry_policy = RetryPolicy(settings)
         # Optional OpenTelemetry tracer (ADR 0012): no-op unless tracing_enabled.
         # Constructed here so an enabled-but-not-installed otel extra fails fast
         # at app creation (ConfigError), never mid-request.
@@ -431,23 +439,32 @@ class ModelManager:
             return float(m.last_load)
         return float(m.machine.inflight)
 
-    async def _select_cache_aware(
+    async def _cache_aware_fractions(
         self, name: str, tier: list[ManagedModel], prefix_blocks: list[str] | None
-    ) -> ManagedModel:
-        """Score members by prefix affinity minus relative load; argmax wins.
+    ) -> dict[str, float] | None:
+        """Fetch prefix-match fractions per member (async), or None to fall back.
 
-        ``score = matched_fraction - beta * (load - mean) / max(1, mean)`` (vLLM
-        production-stack LoadAwareRouter). With no prefix match for any member we
-        fall back to ``least_busy`` (the no-cache-holder case). Tie-breaks are
-        deterministic: highest score, then least load, then round-robin.
+        Returns None when cache-aware scoring should defer to ``least_busy``
+        (single member, no prefix blocks, or no member holds any prefix).
         """
         assert self.cache_router is not None
         if len(tier) == 1 or not prefix_blocks:
-            return self._least_busy(tier)
+            return None
         aliases = [m.entry.alias for m in tier]
         fractions = await self.cache_router.match_fractions(name, prefix_blocks, aliases)
+        return fractions or None
+
+    def _score_cache_aware(
+        self, tier: list[ManagedModel], fractions: dict[str, float] | None
+    ) -> ManagedModel:
+        """Score members by prefix affinity minus relative load; argmax wins (sync).
+
+        ``score = matched_fraction - beta * (load - mean) / max(1, mean)`` (vLLM
+        production-stack LoadAwareRouter). With no fractions we fall back to
+        ``least_busy``. Tie-breaks: highest score, then least load, then RR.
+        """
         if not fractions:
-            return self._least_busy(tier)  # no member holds any prefix
+            return self._least_busy(tier)
         loads = {m.entry.alias: self._member_load(m) for m in tier}
         mean = sum(loads.values()) / len(loads)
         beta = self.settings.cache_aware_beta
@@ -484,17 +501,45 @@ class ModelManager:
         return random.uniform(0, hi) / 1000.0
 
     async def _note_success(self, m: ManagedModel) -> None:
-        """Reset a member's cooldown after a successful serve (no-op if off)."""
-        if self.settings.cooldown_failures > 0:
-            await self.state.record_success(m.entry.alias)
+        """Reset a member's cooldown after a successful serve (no-op if off).
 
-    async def _note_failure(self, m: ManagedModel) -> None:
-        """Record a member failure; bench it on reaching the threshold (off=no-op)."""
+        Passes ``cooldown_decay_seconds`` so the exponential ejection multiplier
+        (ADR 0017) decays only after sustained success.
+        """
         if self.settings.cooldown_failures > 0:
+            await self.state.record_success(
+                m.entry.alias, decay_seconds=self.settings.cooldown_decay_seconds
+            )
+
+    async def _note_failure(
+        self, m: ManagedModel, error_class: ErrorClass, retry_after: float | None = None
+    ) -> None:
+        """Record a member failure and bench it (ADR 0017).
+
+        No-op unless cooldowns are enabled (``cooldown_failures > 0``). When the
+        failure carries an upstream ``Retry-After`` (a throttled member), bench it
+        immediately for ``min(Retry-After, cooldown_max_seconds or
+        retry_after_max_seconds)`` regardless of whether this class normally counts
+        toward the threshold — the member told us exactly how long it is out. Other
+        counted failures use the consecutive-failure threshold, whose window grows
+        on repeated ejections via ``cooldown_backoff_multiplier`` (capped by
+        ``cooldown_max_seconds``).
+        """
+        if self.settings.cooldown_failures <= 0:
+            return
+        if retry_after is not None and retry_after > 0:
+            cap = self.settings.cooldown_max_seconds or self.settings.retry_after_max_seconds
+            window = min(retry_after, cap) if cap > 0 else retry_after
+            if window > 0:
+                await self.state.bench(m.entry.alias, window)
+            return
+        if self.retry_policy.counts_toward_cooldown(error_class):
             await self.state.record_failure(
                 m.entry.alias,
                 threshold=self.settings.cooldown_failures,
                 cooldown_seconds=self.settings.cooldown_seconds,
+                multiplier=self.settings.cooldown_backoff_multiplier,
+                max_cooldown_seconds=self.settings.cooldown_max_seconds,
             )
 
     async def _select_member(
@@ -533,18 +578,29 @@ class ModelManager:
             if not tier:
                 tier = pool  # last resort: retry a failed member (self-heal)
 
-            # Member cooldowns (ADR 0009): when enabled, cooldown state is the
-            # authoritative benching signal (it supersedes the transient
+            # Member cooldowns (ADR 0009 + 0017): when enabled, cooldown state is
+            # the authoritative benching signal (it supersedes the transient
             # `healthy` flag). Benched members are skipped; a member whose window
-            # has elapsed rejoins as a half-open trial even if a prior failover
-            # left healthy=False. If EVERY member is benched, fall through to the
-            # healthy-based `tier` so the pool can still self-heal.
+            # has elapsed rejoins as a half-open trial. The ejection-percentage
+            # cap keeps the soonest-to-recover members eligible so a correlated
+            # failure can never strand the whole pool; if EVERY member is benched
+            # even after the cap, fall through to the healthy-based `tier`.
+            recovering: set[str] = set()
             if self.settings.cooldown_failures > 0:
                 now = time.time()
-                benched = set()
-                for m in pool:
-                    if (await self.state.get_cooldown(m.entry.alias, now=now)).in_cooldown:
-                        benched.add(m.entry.alias)
+                records = {
+                    m.entry.alias: await self.state.get_cooldown(m.entry.alias, now=now)
+                    for m in members
+                }
+                benched = {a for a, r in records.items() if r.in_cooldown}
+                benched = self._apply_ejection_cap(benched, records, len(members))
+                recovering = {
+                    m.entry.alias
+                    for m in pool
+                    if m.entry.alias not in benched
+                    and records.get(m.entry.alias, None) is not None
+                    and records[m.entry.alias].recovering
+                }
                 live = [
                     m
                     for m in pool
@@ -556,24 +612,97 @@ class ModelManager:
                     tier = live
 
             strategy = self.settings.route_strategy
-            chosen: ManagedModel | None = None
+            # Pre-fetch the async inputs selection needs so the pick (and the
+            # single-trial skip loop) can run synchronously without double writes.
+            sticky_assigned: str | None = None
             if strategy == "sticky" and route_key is not None and len(members) > 1:
-                assigned = await self.state.sticky_get(name, route_key)
-                if assigned is not None:
-                    chosen = next((m for m in tier if m.entry.alias == assigned), None)
-                if chosen is None:  # new session, or pinned member unavailable
-                    chosen = self._assign_member(tier)
-                await self.state.sticky_set(name, route_key, chosen.entry.alias)
-            elif strategy == "cache_aware":
-                chosen = await self._select_cache_aware(name, tier, prefix_blocks)
-            elif strategy == "round_robin":
-                chosen = min(tier, key=lambda m: (m._route_seq,))
-            else:  # least_busy
-                chosen = self._least_busy(tier)
+                sticky_assigned = await self.state.sticky_get(name, route_key)
+            fractions: dict[str, float] | None = None
+            if strategy == "cache_aware":
+                fractions = await self._cache_aware_fractions(name, tier, prefix_blocks)
 
+            chosen: ManagedModel | None = None
+            skip: set[str] = set()
+            single_trial = (
+                self.settings.cooldown_failures > 0
+                and self.settings.cooldown_half_open_single_trial
+            )
+            while True:
+                cand = [m for m in tier if m.entry.alias not in skip]
+                if not cand:
+                    break
+                pick = self._pick_member(
+                    strategy, name, cand, route_key, members, sticky_assigned, fractions
+                )
+                # Single-trial half-open (ADR 0017): exactly ONE request probes a
+                # recovering member; concurrent requests skip it until the trial
+                # resolves. Claim the trial lock only for the member we select.
+                if single_trial and pick.entry.alias in recovering:
+                    ttl = (
+                        self.settings.cooldown_half_open_ttl_seconds
+                        or self.settings.request_timeout_seconds
+                    )
+                    if not await self.state.try_half_open(pick.entry.alias, ttl):
+                        skip.add(pick.entry.alias)
+                        continue
+                chosen = pick
+                break
+            if chosen is None:
+                return None
+
+            if strategy == "sticky" and route_key is not None and len(members) > 1:
+                await self.state.sticky_set(name, route_key, chosen.entry.alias)
             chosen.machine.inflight += 1  # reserve the slot
             chosen._route_seq = next(self._route_counter)  # rotate tie-break
             return chosen
+
+    def _apply_ejection_cap(
+        self,
+        benched: set[str],
+        records: dict[str, Any],
+        pool_size: int,
+    ) -> set[str]:
+        """Cap the benched set at ``max_ejection_percent`` of the pool (ADR 0017).
+
+        Envoy outlier-detection semantics: never eject more than the configured
+        fraction of a cluster. 0 = no cap (v0.5.0). When more members are benched
+        than the cap allows, keep the soonest-to-recover ones eligible so the pool
+        is never stranded.
+        """
+        cap_pct = self.settings.max_ejection_percent
+        if cap_pct <= 0 or not benched:
+            return benched
+        max_benched = (cap_pct * pool_size) // 100
+        if len(benched) <= max_benched:
+            return benched
+        # Reinstate the soonest-to-recover members (smallest `until`) first.
+        by_recovery = sorted(benched, key=lambda a: records[a].until)
+        keep_benched = set(by_recovery[len(benched) - max_benched :])
+        return keep_benched
+
+    def _pick_member(
+        self,
+        strategy: str,
+        name: str,
+        cand: list[ManagedModel],
+        route_key: str | None,
+        members: list[ManagedModel],
+        sticky_assigned: str | None,
+        fractions: dict[str, float] | None,
+    ) -> ManagedModel:
+        """Select one member from ``cand`` per strategy (pure/synchronous)."""
+        if strategy == "sticky" and route_key is not None and len(members) > 1:
+            chosen: ManagedModel | None = None
+            if sticky_assigned is not None:
+                chosen = next((m for m in cand if m.entry.alias == sticky_assigned), None)
+            if chosen is None:  # new session, or pinned member unavailable
+                chosen = self._assign_member(cand)
+            return chosen
+        if strategy == "cache_aware":
+            return self._score_cache_aware(cand, fractions)
+        if strategy == "round_robin":
+            return min(cand, key=lambda m: (m._route_seq,))
+        return self._least_busy(cand)
 
     # --- request path ----------------------------------------------------
     async def acquire(self, alias: str) -> ManagedModel:
@@ -595,33 +724,48 @@ class ModelManager:
 
         Shared driver for chat + embeddings. Retries stay WITHIN the requested
         public model's pool — never a different model (the no-silent-cross-model
-        invariant). Between attempts it waits a full-jitter backoff (zero by
-        default). The attempt budget and member re-trying are gated by
-        ``retry_max_attempts`` so the default is a single failover pass with no
-        sleep, exactly as v0.4.0. Overall retrying also respects the request
-        timeout as a deadline.
+        invariant). Each failure is classified (ADR 0017) and the per-error policy
+        decides whether to retry and whether it benches the member; a 4xx client
+        error is re-raised immediately (never retried or counted). Between retries
+        it waits a full-jitter backoff (zero by default) or an upstream
+        ``Retry-After`` when present, clamped to the request-timeout deadline. The
+        attempt budget defaults to a single failover pass with no sleep (v0.5.0).
         """
         exclude: set[str] = set()
         last: Exception | None = None
+        last_class: ErrorClass | None = None
         cap = self._attempt_budget(len(members))
-        deadline: float | None = None
-        if self.settings.retry_max_attempts > 0 and self.settings.request_timeout_seconds > 0:
-            deadline = time.monotonic() + self.settings.request_timeout_seconds
+        class_attempts: dict[ErrorClass, int] = {}
+        deadline = self._retry_deadline()
+        pending_retry_after: float | None = None
         attempt = 0
         while attempt < cap:
-            if attempt > 0:
-                if deadline is not None and time.monotonic() >= deadline:
-                    break
-                delay = self._backoff_delay_s(attempt - 1)
-                if delay > 0:
-                    await asyncio.sleep(delay)
             m = await self._select_member(name, members, exclude, route_key, prefix_blocks)
-            if m is None:
-                # Exhausted distinct members. With retries enabled, clear the
-                # exclusion set and try members again (within the same pool).
-                if self.settings.retry_max_attempts > 0 and exclude:
-                    exclude = set()
-                    m = await self._select_member(name, members, exclude, route_key, prefix_blocks)
+            if m is not None:
+                # A fresh member is available: failover is IMMEDIATE — an upstream
+                # Retry-After is never slept while another member can serve. Only
+                # the inter-attempt full-jitter backoff (0 by default) applies, and
+                # only once past the first attempt (preserves v0.5.0).
+                if attempt > 0 and not await self._retry_wait(attempt, None, deadline):
+                    break
+            else:
+                # No un-excluded eligible member. Sleep-retry an excluded member
+                # only if the last failure is sleep-retryable and the budget allows
+                # (never for a lone backpressure member — that returns its
+                # 429/Retry-After to the client). Here the Retry-After IS honored,
+                # clamped to retry_after_max_seconds and the request deadline.
+                if not (
+                    self.settings.retry_max_attempts > 0
+                    and exclude
+                    and last_class is not None
+                    and self.retry_policy.is_retryable(last_class)
+                ):
+                    break
+                if not await self._retry_wait(attempt, pending_retry_after, deadline):
+                    break
+                pending_retry_after = None
+                exclude = set()
+                m = await self._select_member(name, members, exclude, route_key, prefix_blocks)
                 if m is None:
                     break
             attempt += 1
@@ -631,14 +775,35 @@ class ModelManager:
                 if self.cache_router is not None and prefix_blocks:
                     await self.cache_router.record(name, prefix_blocks, m.entry.alias)
                 return result
-            except _FAILOVER_ERRORS as exc:  # member unavailable → retry/failover
+            except BrokerError as exc:
+                error_class = classify_error(exc)
+                if not self.retry_policy.fails_over(error_class):
+                    # Client error (4xx) / other: the request itself is bad.
+                    # Propagate without benching or trying another member — matches
+                    # the "4xx never retried or counted" invariant and surfaces an
+                    # honest upstream status to the caller (never a 502).
+                    raise
                 m.healthy = False
-                await self._note_failure(m)
+                ra = retry_after_seconds(exc) if self.retry_policy.respect_retry_after else None
+                await self._note_failure(m, error_class, retry_after=ra)
                 exclude.add(m.entry.alias)
                 last = exc
+                last_class = error_class
                 log.warning(
-                    "pool %s: member %s failed (%s); retry/failover", name, m.entry.alias, exc
+                    "pool %s: member %s failed (%s: %s); retry/failover",
+                    name,
+                    m.entry.alias,
+                    error_class.value,
+                    exc,
                 )
+                class_attempts[error_class] = class_attempts.get(error_class, 0) + 1
+                class_cap = self.retry_policy.max_attempts_for(error_class)
+                if class_cap is not None and class_attempts[error_class] >= class_cap:
+                    break
+                # Carry a Retry-After only for sleep-retryable classes: it is used
+                # when we run out of fresh members. A failoverable-but-not-sleep
+                # class (backpressure) never sleeps the same member.
+                pending_retry_after = ra if self.retry_policy.is_retryable(error_class) else None
                 continue
         if last is not None:
             raise last
@@ -647,6 +812,48 @@ class ModelManager:
             model=name,
             remediation="check GET /healthz/backends",
         )
+
+    def _retry_deadline(self) -> float | None:
+        """Absolute monotonic deadline for a request's retries, or None (legacy).
+
+        With retries disabled (``retry_max_attempts == 0``) there is no deadline
+        (one failover pass, no sleep). With retries enabled, the deadline is the
+        request timeout; when that is 0 (unbounded) we still impose a finite
+        ``retry_after_max_seconds`` ceiling so a huge upstream Retry-After can
+        never become an unbounded sleep.
+        """
+        if self.settings.retry_max_attempts <= 0:
+            return None
+        rt = self.settings.request_timeout_seconds
+        if rt and rt > 0:
+            return time.monotonic() + rt
+        return time.monotonic() + self.settings.retry_after_max_seconds
+
+    async def _retry_wait(
+        self, attempt: int, pending_retry_after: float | None, deadline: float | None
+    ) -> bool:
+        """Sleep before a retry; return False if the deadline is already blown.
+
+        Uses an upstream ``Retry-After`` (seconds) when present, else the
+        full-jitter backoff. Every Retry-After wait is clamped to BOTH
+        ``retry_after_max_seconds`` and the remaining request budget, so neither a
+        hostile header nor an unbounded request timeout can produce an unbounded
+        sleep.
+        """
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        if pending_retry_after is not None:
+            delay = min(pending_retry_after, self.settings.retry_after_max_seconds)
+        else:
+            delay = self._backoff_delay_s(attempt - 1)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            delay = min(delay, remaining)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return True
 
     def _check_allowed(self, name: str, allowed_models: set[str] | None) -> None:
         """Fail-closed per-key model scoping (ADR 0008).
@@ -827,27 +1034,36 @@ class ModelManager:
         prefix_blocks = self._prefix_blocks(payload)
         exclude: set[str] = set()
         last: Exception | None = None
+        last_class: ErrorClass | None = None
         chosen: ManagedModel | None = None
         # Select + ready a member, with retry/failover *before* the stream
         # starts. Once bytes are flowing we NEVER retry (a half-emitted stream
         # can't be transparently restarted). Retries stay within this pool.
         cap = self._attempt_budget(len(members))
-        deadline: float | None = None
-        if self.settings.retry_max_attempts > 0 and self.settings.request_timeout_seconds > 0:
-            deadline = time.monotonic() + self.settings.request_timeout_seconds
+        class_attempts: dict[ErrorClass, int] = {}
+        deadline = self._retry_deadline()
+        pending_retry_after: float | None = None
         attempt = 0
         while attempt < cap:
-            if attempt > 0:
-                if deadline is not None and time.monotonic() >= deadline:
-                    break
-                delay = self._backoff_delay_s(attempt - 1)
-                if delay > 0:
-                    await asyncio.sleep(delay)
             m = await self._select_member(name, members, exclude, route_key, prefix_blocks)
-            if m is None:
-                if self.settings.retry_max_attempts > 0 and exclude:
-                    exclude = set()
-                    m = await self._select_member(name, members, exclude, route_key, prefix_blocks)
+            if m is not None:
+                # Fresh member: immediate failover (no Retry-After sleep); only the
+                # inter-attempt backoff applies, and only past the first attempt.
+                if attempt > 0 and not await self._retry_wait(attempt, None, deadline):
+                    break
+            else:
+                if not (
+                    self.settings.retry_max_attempts > 0
+                    and exclude
+                    and last_class is not None
+                    and self.retry_policy.is_retryable(last_class)
+                ):
+                    break
+                if not await self._retry_wait(attempt, pending_retry_after, deadline):
+                    break
+                pending_retry_after = None
+                exclude = set()
+                m = await self._select_member(name, members, exclude, route_key, prefix_blocks)
                 if m is None:
                     break
             attempt += 1
@@ -856,13 +1072,23 @@ class ModelManager:
                 await m.ensure_ready()
                 chosen = m
                 break
-            except _FAILOVER_ERRORS as exc:
-                m.healthy = False
+            except BrokerError as exc:
+                error_class = classify_error(exc)
                 m.machine.inflight -= 1  # release reservation; we won't serve here
                 m.machine.touch()
-                await self._note_failure(m)
+                if not self.retry_policy.fails_over(error_class):
+                    raise
+                m.healthy = False
+                ra = retry_after_seconds(exc) if self.retry_policy.respect_retry_after else None
+                await self._note_failure(m, error_class, retry_after=ra)
                 exclude.add(m.entry.alias)
                 last = exc
+                last_class = error_class
+                class_attempts[error_class] = class_attempts.get(error_class, 0) + 1
+                class_cap = self.retry_policy.max_attempts_for(error_class)
+                if class_cap is not None and class_attempts[error_class] >= class_cap:
+                    break
+                pending_retry_after = ra if self.retry_policy.is_retryable(error_class) else None
                 continue
         if chosen is None:
             if last is not None:
@@ -1216,6 +1442,9 @@ class ModelManager:
     async def _backend_health_entry(self, m: ManagedModel) -> dict[str, Any]:
         probe = await self._probe_member(m)
         cd = await self.state.get_cooldown(m.entry.alias)
+        cd_dict = cd.to_dict()
+        if self.settings.cooldown_failures > 0 and self.settings.cooldown_half_open_single_trial:
+            cd_dict["half_open_trial"] = await self.state.half_open_active(m.entry.alias)
         return {
             "alias": m.entry.alias,
             "model": m.public_name,
@@ -1226,7 +1455,7 @@ class ModelManager:
             "status": probe["status"],
             "detail": probe["detail"],
             "inflight": m.machine.inflight,
-            "cooldown": cd.to_dict(),
+            "cooldown": cd_dict,
         }
 
     async def ollama_ps(self) -> dict[str, Any]:
@@ -1275,7 +1504,10 @@ class ModelManager:
             snap["healthy"] = m.healthy
             snap["last_health"] = m.last_health
             if cooldowns_on:
-                snap["cooldown"] = (await self.state.get_cooldown(m.entry.alias)).to_dict()
+                cd_dict = (await self.state.get_cooldown(m.entry.alias)).to_dict()
+                if self.settings.cooldown_half_open_single_trial:
+                    cd_dict["half_open_trial"] = await self.state.half_open_active(m.entry.alias)
+                snap["cooldown"] = cd_dict
             try:
                 snap["adapter"] = await m.adapter.collect_status()
             except Exception as exc:  # noqa: BLE001
@@ -1290,6 +1522,15 @@ class ModelManager:
             "state_backend": self.state.backend,
             "retry_max_attempts": self.settings.retry_max_attempts,
             "cooldowns_enabled": cooldowns_on,
+            "reliability": {
+                "max_ejection_percent": self.settings.max_ejection_percent,
+                "cooldown_backoff_multiplier": self.settings.cooldown_backoff_multiplier,
+                "cooldown_max_seconds": self.settings.cooldown_max_seconds,
+                "half_open_single_trial": self.settings.cooldown_half_open_single_trial,
+                "retry_respect_retry_after": self.settings.retry_respect_retry_after,
+                "retry_after_max_seconds": self.settings.retry_after_max_seconds,
+                "redis_sticky_max_entries": self.settings.redis_sticky_max_entries,
+            },
             "cache_aware": (
                 {"enabled": True, **self.cache_router.stats()}
                 if self.cache_router is not None

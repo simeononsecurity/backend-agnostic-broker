@@ -100,10 +100,80 @@ class ModelLoadError(BrokerError):
 
 
 class BackendUnavailableError(BrokerError):
-    """The backend process/endpoint is unreachable."""
+    """The backend process/endpoint is unreachable.
+
+    Reserved for *transport* failures (connect error, read timeout, DNS, a
+    non-JSON body on an otherwise-2xx response): the broker could not get a valid
+    HTTP reply from the backend at all. When the backend *did* reply with an HTTP
+    error status, raise :class:`UpstreamHTTPError` instead so the per-error policy
+    (``broker.reliability``) can classify it by that status.
+    """
 
     http_status = 502
     error_type = "backend_unavailable"
+
+
+class UpstreamHTTPError(BrokerError):
+    """The backend RESPONDED with an HTTP error status >= 400 (ADR 0017).
+
+    Distinct from :class:`BackendUnavailableError` (a transport failure): the
+    backend was reachable and returned a status. Carrying the ``upstream_status``
+    and the upstream ``Retry-After`` lets :func:`broker.reliability.classify_error`
+    bucket the failure by *status* — ``408`` → timeout, ``429`` → backpressure,
+    other ``4xx`` → client_error (never retried, never benched), ``5xx`` →
+    server_error — instead of collapsing every upstream error into
+    ``CONNECTION`` and retrying a client's own bad request across the pool.
+
+    The client-facing ``http_status`` / ``error_type`` are derived from the
+    upstream status so a caller sees an honest result:
+
+    * ``429`` → ``429`` ``rate_limit_error`` (upstream backpressure)
+    * ``408`` → ``504`` ``timeout_error``
+    * other ``4xx`` → that same ``4xx`` with type ``upstream_client_error`` —
+      the request was bad, so it is **never** reported as a ``502``
+    * ``5xx`` / anything else → ``502`` ``backend_unavailable`` (the broker could
+      not obtain a good answer from any pool member)
+
+    The ``message`` must already be sanitized/truncated by the adapter; this class
+    never stores raw upstream bodies or secrets.
+    """
+
+    error_type = "backend_unavailable"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        upstream_status: int,
+        backend: str | None = None,
+        model: str | None = None,
+        state: str | None = None,
+        remediation: str | None = None,
+        code: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        st = int(upstream_status)
+        self.upstream_status = st
+        if st == 429:
+            client_status, etype = 429, "rate_limit_error"
+        elif st == 408:
+            client_status, etype = 504, "timeout_error"
+        elif 400 <= st < 500:
+            client_status, etype = st, "upstream_client_error"
+        else:  # 5xx and any unexpected status
+            client_status, etype = 502, "backend_unavailable"
+        super().__init__(
+            message,
+            backend=backend,
+            model=model,
+            state=state,
+            remediation=remediation,
+            code=code or etype,
+            headers=headers,
+        )
+        # Instance attributes override the class defaults for this envelope.
+        self.http_status = client_status
+        self.error_type = etype
 
 
 class TimeoutError_(BrokerError):

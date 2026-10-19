@@ -8,12 +8,20 @@ network beyond their configured base URLs, and no model loads at startup.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .errors import ConfigError
+
+# Valid error-class names for BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS (mirrors
+# broker.reliability.ErrorClass; kept as a literal here to avoid importing the
+# reliability module at settings-construction time).
+_ERROR_CLASS_NAMES = frozenset(
+    {"timeout", "connection", "server_error", "backpressure", "client_error", "other"}
+)
 
 
 class Settings(BaseSettings):
@@ -169,6 +177,70 @@ class Settings(BaseSettings):
     cooldown_failures: int = 0
     cooldown_seconds: float = 30.0
 
+    # --- Ejection cap + exponential cooldown growth (ADR 0017) ---
+    # These refine the ADR 0009 circuit breaker; all default to v0.5.0 behavior.
+    #   max_ejection_percent: Envoy-style cap on the fraction of a pool that may
+    #     be benched at once. 0 = no cap (v0.5.0: any/all members may be benched,
+    #     relying on the all-benched fall-through). >0 keeps at least
+    #     ceil((100-pct)/100 * N) members serving: when more are benched, the
+    #     soonest-to-recover ones are kept eligible so a correlated failure can
+    #     never strand the whole pool.
+    #   cooldown_backoff_multiplier: grow a member's cooldown window on repeated
+    #     ejections (Envoy base_ejection_time x consecutive-ejections). The Nth
+    #     consecutive ejection benches for cooldown_seconds * multiplier**(N-1).
+    #     1.0 = fixed window (v0.5.0).
+    #   cooldown_max_seconds: cap the grown window (Envoy max_ejection_time).
+    #     0 = no cap beyond the multiplier.
+    #   cooldown_decay_seconds: a successful serve resets the ejection multiplier
+    #     only after the member has been out of cooldown at least this long
+    #     (sustained success). 0 = reset on any success (punish only back-to-back
+    #     trial failures).
+    max_ejection_percent: int = 0
+    cooldown_backoff_multiplier: float = 1.0
+    cooldown_max_seconds: float = 0.0
+    cooldown_decay_seconds: float = 0.0
+
+    # --- Single-trial half-open probe (ADR 0017) ---
+    # When true, a recovering member (cooldown window elapsed) admits exactly ONE
+    # probe request via the StateStore try_half_open lock; concurrent requests
+    # skip it until the trial resolves (success closes the breaker, failure
+    # re-benches). Default off = ADR 0009 behavior (any post-expiry request may
+    # probe). ttl 0 = derive the trial-lock lifetime from request_timeout_seconds.
+    cooldown_half_open_single_trial: bool = False
+    cooldown_half_open_ttl_seconds: float = 0.0
+
+    # --- Per-error retry / cooldown policies (ADR 0017) ---
+    # Classify each failure (timeout / connection / server_error / backpressure /
+    # client_error) and decide per class whether it is retried and whether it
+    # counts toward a member's cooldown. 4xx client errors are NEVER retried or
+    # counted (hard-wired). Defaults reproduce ADR 0009's single failover set:
+    # timeout+connection+server_error retry and bench; backpressure (429) does
+    # not. Set retry_on_backpressure/cooldown_on_backpressure to opt a 429 in.
+    retry_on_timeout: bool = True
+    retry_on_connection: bool = True
+    retry_on_server_error: bool = True
+    retry_on_backpressure: bool = False
+    cooldown_on_timeout: bool = True
+    cooldown_on_connection: bool = True
+    cooldown_on_server_error: bool = True
+    cooldown_on_backpressure: bool = False
+    # Honor an upstream Retry-After header (RFC 9110; delay-seconds or HTTP-date)
+    # on a RETRIED error, clamped to the remaining retry budget. No effect on the
+    # legacy single-pass default unless a retried error actually carries one.
+    retry_respect_retry_after: bool = True
+    # Absolute ceiling (seconds) on how long the broker will EVER wait for an
+    # upstream Retry-After, and how long a throttled member is benched for its
+    # Retry-After. This is the finite safety cap that makes a hostile/huge
+    # Retry-After (or request_timeout_seconds == 0, i.e. unbounded) impossible to
+    # turn into an unbounded sleep: every Retry-After wait is min(header, this,
+    # remaining request deadline). Must be finite and >= 0 (0 = never sleep for
+    # Retry-After, only fail over).
+    retry_after_max_seconds: float = 120.0
+    # Optional per-class attempt cap (JSON, e.g. '{"timeout": 5, "server_error": 2}').
+    # A class listed here caps attempts for its failures; unlisted classes use
+    # retry_max_attempts. Keys must be ErrorClass names.
+    retry_max_attempts_by_class: dict[str, int] = Field(default_factory=dict)
+
     # --- Optional shared state via Redis (ADR 0009) ---
     # When BROKER_REDIS_URL is set, the sticky map, cooldowns, counters, and
     # cached values live in Redis so multiple broker replicas share one view.
@@ -179,6 +251,11 @@ class Settings(BaseSettings):
     # TTL (seconds) applied to Redis sticky keys (0 = no expiry). In-process
     # sticky is LRU-bounded by route_sticky_max_entries instead.
     route_sticky_ttl_seconds: float = 0.0
+    # Global LRU bound on Redis sticky entries, shared across replicas via a
+    # sorted-set index scored by last pin (ADR 0017). 0 = TTL-only (v0.5.0). >0
+    # caps the total sticky pairings one Redis prefix holds; the least-recently
+    # pinned entries are evicted (ZPOPMIN) once the bound is exceeded.
+    redis_sticky_max_entries: int = 0
 
     # --- Auto-router: latency-budget routing (ADR 0011) ---
     # Default per-request latency budget in ms (the x-broker-latency-budget-ms
@@ -328,8 +405,45 @@ class Settings(BaseSettings):
             raise ConfigError("BROKER_RETRY_BACKOFF_MAX_MS must be >= BROKER_RETRY_BACKOFF_BASE_MS")
         if self.cooldown_failures < 0:
             raise ConfigError("BROKER_COOLDOWN_FAILURES must be >= 0 (0 = disabled)")
-        if self.cooldown_seconds < 0:
-            raise ConfigError("BROKER_COOLDOWN_SECONDS must be >= 0")
+        if not math.isfinite(self.cooldown_seconds) or self.cooldown_seconds < 0:
+            raise ConfigError("BROKER_COOLDOWN_SECONDS must be a finite number >= 0")
+        if self.max_ejection_percent < 0 or self.max_ejection_percent > 100:
+            raise ConfigError("BROKER_MAX_EJECTION_PERCENT must be in 0..100 (0 = no cap)")
+        if (
+            not math.isfinite(self.cooldown_backoff_multiplier)
+            or self.cooldown_backoff_multiplier < 1.0
+        ):
+            raise ConfigError(
+                "BROKER_COOLDOWN_BACKOFF_MULTIPLIER must be a finite number >= 1.0 "
+                "(1.0 = fixed window)"
+            )
+        if not math.isfinite(self.cooldown_max_seconds) or self.cooldown_max_seconds < 0:
+            raise ConfigError(
+                "BROKER_COOLDOWN_MAX_SECONDS must be a finite number >= 0 (0 = no cap)"
+            )
+        if not math.isfinite(self.cooldown_decay_seconds) or self.cooldown_decay_seconds < 0:
+            raise ConfigError("BROKER_COOLDOWN_DECAY_SECONDS must be a finite number >= 0")
+        if (
+            not math.isfinite(self.cooldown_half_open_ttl_seconds)
+            or self.cooldown_half_open_ttl_seconds < 0
+        ):
+            raise ConfigError(
+                "BROKER_COOLDOWN_HALF_OPEN_TTL_SECONDS must be a finite number >= 0 (0 = derive)"
+            )
+        if not math.isfinite(self.retry_after_max_seconds) or self.retry_after_max_seconds < 0:
+            raise ConfigError(
+                "BROKER_RETRY_AFTER_MAX_SECONDS must be a finite number >= 0 (0 = never sleep)"
+            )
+        for _cls, _n in self.retry_max_attempts_by_class.items():
+            if _cls not in _ERROR_CLASS_NAMES:
+                raise ConfigError(
+                    f"BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS has unknown error class {_cls!r}",
+                    remediation=f"use one of: {', '.join(sorted(_ERROR_CLASS_NAMES))}",
+                )
+            if _n < 0:
+                raise ConfigError("BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS counts must be >= 0")
+        if self.redis_sticky_max_entries < 0:
+            raise ConfigError("BROKER_REDIS_STICKY_MAX_ENTRIES must be >= 0 (0 = TTL-only)")
         if self.cache_aware_beta < 0:
             raise ConfigError("BROKER_CACHE_AWARE_BETA must be >= 0 (0 = ignore load)")
         if self.cache_aware_block_chars < 1:
