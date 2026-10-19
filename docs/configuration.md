@@ -12,9 +12,11 @@ Start from `.env.example`.
 
 At startup the broker rejects:
 
-- `auth_enabled=true` with no `api_keys` → set keys or disable auth (dev only).
+- `auth_enabled=true` with no `api_keys` **and** no `keys_path` file → set keys,
+  provide a virtual-keys file, or disable auth (dev only).
 - `port` outside `1..65535`.
 - `max_loaded_models < 1`, `max_concurrent_requests < 1`.
+- `rate_limit_window_seconds <= 0`.
 - a `registry_path` that does not exist.
 
 `log_format` must be `json` or `text`; `load_concurrency_policy` must be `queue`
@@ -35,7 +37,40 @@ or `reject`; `route_strategy` must be `sticky`, `least_busy`, or `round_robin`;
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
 | `BROKER_AUTH_ENABLED` | bool | `true` | Require an API key on protected routes. |
-| `BROKER_API_KEYS` | list[str] | `[]` | Accepted keys (JSON list). Provide via secret in production. |
+| `BROKER_API_KEYS` | list[str] | `[]` | Accepted keys (JSON list). Provide via secret in production. Treated as **unlimited user keys** under per-key governance. |
+
+## Per-key governance (virtual keys, rpm/tpm, budgets) — ADR 0008
+
+**Opt-in.** With no keys file and no per-key limits the broker behaves exactly as
+v0.4.0. Virtual keys add per-caller identity, rate limits, budgets, and model
+scoping; counters live on the ADR 0009 `StateStore` (in-process or Redis).
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_KEYS_PATH` | str? | `None` | Path to a git-ignored `keys.yaml` of HASHED virtual keys. Manage with `python -m broker.keys`. See `keys.example.yaml`. |
+| `BROKER_RATE_LIMIT_WINDOW_SECONDS` | float | `60.0` | Window for per-key `rpm` (sliding log) and `tpm` (windowed counter). |
+
+Each key in `keys.yaml` carries an `id`, `label`, `tenant`, `scope`
+(`user`|`admin`), the SHA-256 **hash** of its secret (never the secret), an
+`enabled` flag, an optional `expiry` (ISO date, UTC), and a `limits` block — any
+subset of: `rpm`, `tpm` (input+output tokens), `max_concurrency`,
+`daily_token_budget`, `monthly_token_budget`, `daily_cost_usd`,
+`monthly_cost_usd`, and `allowed_models` (fail-closed; applies to the model the
+`auto` router selects too). Cost budgets require a registry `pricing` block (see
+`docs/model-registry.md` / `registry.example.yaml`). Keys/limits are enforced
+before dispatch; see `docs/api-reference.md` for the error/header contract.
+
+Manage keys:
+
+```bash
+python -m broker.keys create --label team-alpha --tenant alpha \
+    --rpm 60 --tpm 100000 --max-concurrency 4 \
+    --daily-tokens 1000000 --daily-cost 5 --allowed-models chat,auto
+python -m broker.keys list              # never prints secrets or hashes
+python -m broker.keys revoke brk_1a2b3c4d
+```
+
+The CLI prints the new secret **exactly once**; only its hash is written.
 
 ## Registry / models
 

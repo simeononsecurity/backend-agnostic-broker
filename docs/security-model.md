@@ -54,6 +54,30 @@ time (`hmac.compare_digest`) against `BROKER_API_KEYS`. `/healthz`, `/readyz`,
 and `/metrics` are unauthenticated. Keys come from config/secrets and are never
 logged or committed.
 
+## Virtual keys & per-key governance (ADR 0008)
+
+`broker/keys.py` + `broker/governance.py` add opt-in per-key governance:
+
+- **Hash-at-rest.** Virtual keys are stored as a **SHA-256 hash** of the secret
+  (never the secret). The secret is shown exactly once by `python -m broker.keys
+  create`; `keys.yaml` is git-ignored (only `keys.example.yaml`, with fake values,
+  is tracked). SHA-256 is the correct primitive for high-entropy secrets (bcrypt/
+  Argon2 are for passwords).
+- **Constant-time, no enumeration.** A non-secret id is embedded in the key for
+  O(1) lookup; the full secret is verified with `hmac.compare_digest` against the
+  stored hash (with a dummy compare when the id is unknown, to avoid a timing
+  oracle). Unknown, revoked, expired, and wrong-secret keys all fail with the
+  **same** generic `401`.
+- **Resource limits (OWASP API4:2023).** Before dispatch, the governor enforces
+  per-key `rpm`/`tpm`, `max_concurrency`, daily/monthly token and cost budgets,
+  and a fail-closed `allowed_models` list (applied to the `auto`-selected model
+  too). Counters live on the `StateStore` (in-process or Redis).
+- **No key material in logs/metrics/errors.** Only the non-secret key id reaches
+  the usage log; errors carry limits/remediation, never secrets. Prometheus labels
+  never include a key.
+- **Backward compatible.** `BROKER_API_KEYS` keep working as unlimited user keys;
+  with no keys file and no limits, behavior is identical to v0.4.0.
+
 ## No silent fallback
 
 An unknown model alias raises `ModelNotFoundError` (404). The broker never

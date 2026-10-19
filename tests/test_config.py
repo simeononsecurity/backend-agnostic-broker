@@ -15,6 +15,25 @@ def test_auth_requires_keys(fake_registry_file):
         s.validate_runtime()
 
 
+def test_auth_satisfied_by_keys_file(fake_registry_file, tmp_path):
+    kp = tmp_path / "keys.yaml"
+    kp.write_text("keys: []\n")
+    # No api_keys, but a keys file is present → auth config is valid (ADR 0008).
+    s = Settings(
+        auth_enabled=True,
+        api_keys=[],
+        keys_path=str(kp),
+        registry_path=str(fake_registry_file),
+    )
+    s.validate_runtime()  # must not raise
+
+
+def test_bad_rate_limit_window_rejected(settings):
+    settings.rate_limit_window_seconds = 0
+    with pytest.raises(ConfigError):
+        settings.validate_runtime()
+
+
 def test_valid_config_passes(settings):
     settings.validate_runtime()  # should not raise
 

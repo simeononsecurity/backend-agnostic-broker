@@ -49,3 +49,25 @@ def test_healthz_bypasses_auth(client):
 
 def test_auth_disabled_allows_all(open_client):
     assert open_client.get("/v1/models").status_code == 200
+
+
+def test_non_ascii_key_returns_401_not_500(client):
+    # A non-ASCII byte in the key must not raise an unhandled TypeError from
+    # hmac.compare_digest (which would be a 500 on an unauthenticated path).
+    # Pass raw bytes so the client sends a latin-1 byte on the wire.
+    assert client.get("/v1/models", headers={"Authorization": b"Bearer k\xe9y"}).status_code == 401
+    assert client.get("/v1/models", headers={"X-API-Key": b"k\xe9y"}).status_code == 401
+
+
+def test_overlong_key_returns_401(client):
+    assert client.get("/v1/models", headers={"X-API-Key": "a" * 20000}).status_code == 401
+
+
+def test_check_auth_non_ascii_raises_autherror_not_typeerror(settings):
+    # Direct regression for the shipped broker/auth.py bug: a non-ASCII presented
+    # key must raise AuthError (→ 401), not a bare TypeError (→ 500).
+    from broker.auth import check_auth
+    from broker.errors import AuthError
+
+    with pytest.raises(AuthError):
+        check_auth(settings, "Bearer k\xe9y", None)

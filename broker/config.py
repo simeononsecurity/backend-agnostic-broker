@@ -36,6 +36,15 @@ class Settings(BaseSettings):
     auth_enabled: bool = True
     api_keys: list[str] = Field(default_factory=list)
 
+    # --- Per-key governance (virtual keys, rpm/tpm, budgets; ADR 0008) ---
+    # Opt-in: with no keys file and no per-key limits, behavior is identical to
+    # v0.4.0. BROKER_KEYS_PATH points at a git-ignored keys.yaml holding HASHED
+    # virtual keys (manage with `python -m broker.keys`); legacy BROKER_API_KEYS
+    # keep working as unlimited user keys. The rate-limit window (seconds) applies
+    # to both rpm (sliding log) and tpm (windowed counter).
+    keys_path: str | None = None
+    rate_limit_window_seconds: float = 60.0
+
     # --- Registry / models ---
     registry_path: str = "registry.yaml"
     default_model: str | None = None
@@ -216,11 +225,16 @@ class Settings(BaseSettings):
 
     def validate_runtime(self) -> None:
         """Cross-field, fail-fast checks run once at startup."""
-        if self.auth_enabled and not self.api_keys:
+        if self.auth_enabled and not self.api_keys and not self._has_keys_file():
             raise ConfigError(
                 "auth is enabled but no API keys are configured",
-                remediation="set BROKER_API_KEYS or BROKER_AUTH_ENABLED=false for local dev only",
+                remediation=(
+                    "set BROKER_API_KEYS, provide a BROKER_KEYS_PATH keys file, "
+                    "or set BROKER_AUTH_ENABLED=false for local dev only"
+                ),
             )
+        if self.rate_limit_window_seconds <= 0:
+            raise ConfigError("BROKER_RATE_LIMIT_WINDOW_SECONDS must be > 0")
         if self.port < 1 or self.port > 65535:
             raise ConfigError("BROKER_PORT out of range")
         if self.max_loaded_models < 1:
@@ -244,6 +258,9 @@ class Settings(BaseSettings):
                 f"registry not found: {self.registry_path!r}",
                 remediation="mount a registry file and set BROKER_REGISTRY_PATH",
             )
+
+    def _has_keys_file(self) -> bool:
+        return bool(self.keys_path) and Path(self.keys_path).exists()
 
     def allowed_backend_bases(self, registry) -> list[str]:
         bases: list[str] = list(self.extra_allowed_backend_urls)

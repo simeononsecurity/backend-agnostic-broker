@@ -12,8 +12,31 @@ When `BROKER_AUTH_ENABLED=true` (default), every route **except** `/healthz`,
 - `Authorization: Bearer <key>`, or
 - `X-API-Key: <key>`
 
-Keys are compared in constant time against `BROKER_API_KEYS`. Missing/invalid
-keys return `401` with error type `authentication_error`.
+Keys are compared in constant time. Missing/invalid keys return `401` with error
+type `authentication_error`.
+
+### Virtual keys & per-key governance (ADR 0008)
+
+`BROKER_API_KEYS` remain valid and are treated as **unlimited user keys**. When a
+`BROKER_KEYS_PATH` file is configured, callers may also present a **virtual key**
+(`brk_<id>_<secret>`) resolved against a hashed key store (see
+[configuration.md](configuration.md)). A virtual key carries an identity (scope
+`user`|`admin`, tenant) and limits enforced **before dispatch** on
+`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, and `/v1/embeddings`:
+
+- **Rate limits** — `429` `rate_limit_exceeded` with a `Retry-After` header when a
+  key's `rpm`, `tpm`, or `max_concurrency` is exceeded.
+- **Budgets** — `429` `insufficient_quota` when a daily/monthly token or cost
+  budget is exhausted (retrying won't help until the window resets).
+- **Model scoping** — `403` `permission_error` (`code: model_not_allowed`) when a
+  key requests a model outside its `allowed_models`; this also applies to the
+  model the `auto` router selects (fail-closed).
+
+**Rate-limit headers.** Responses to limited keys carry OpenAI-style headers so
+clients can self-pace: `x-ratelimit-limit-requests` / `-remaining-requests` /
+`-reset-requests` and the `-tokens` equivalents. `Retry-After` (seconds) is set on
+`429` responses. Unlimited keys (legacy `BROKER_API_KEYS`, or virtual keys with no
+limits) get no governance headers and are never rate-limited.
 
 ## Common behaviors
 
@@ -64,9 +87,12 @@ Errors use an OpenAI-style envelope with broker context (`broker/errors.py`):
 ```
 
 Error types and HTTP status: `config_error` (500), `invalid_request_error`
-(400), `security_error` (400), `authentication_error` (401), `placement_denied`
-(403), `model_not_found` (404), `model_load_error` (503), `backend_unavailable`
-(502), `timeout_error` (504), `rate_limit_error` (429), `request_too_large` (413).
+(400), `security_error` (400), `authentication_error` (401), `permission_error`
+(403, e.g. `model_not_allowed`), `placement_denied` (403), `model_not_found`
+(404), `model_load_error` (503), `backend_unavailable` (502), `timeout_error`
+(504), `rate_limit_error` (429), `rate_limit_exceeded` (429, per-key
+rpm/tpm/concurrency), `insufficient_quota` (429, per-key budget exhausted),
+`request_too_large` (413).
 
 ## Endpoints
 
@@ -247,8 +273,13 @@ curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
 Aggregated usage from the usage log ([ADR 0007](adr/0007-usage-accounting-store.md)):
 total requests + tokens, per-model and per-endpoint counts, and the most recent
 rows (`?limit=N`, default 20). Metadata only — no request/response content, and
-the API key is stored as a non-reversible fingerprint. Returns `{"enabled": false}`
+the API key is stored as a non-reversible id. Returns `{"enabled": false}`
 when the log is disabled.
+
+**Scoping (ADR 0008).** The response is scoped to the caller: a `user`-scope key
+sees only its own usage (`scope: "key"`, plus its `api_key_id`); an `admin`-scope
+key sees all usage (`scope: "all"`) and a `by_key` per-key spend breakdown. With
+auth disabled, the caller is treated as admin.
 
 ## OpenAPI
 

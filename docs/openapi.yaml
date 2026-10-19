@@ -249,7 +249,12 @@ paths:
   /usage:
     get:
       summary: Usage Summary
-      description: Aggregated request/token usage from the usage log (see ADR 0007).
+      description: 'Aggregated request/token usage from the usage log (see ADR 0007).
+
+
+        Scoped per ADR 0008: a ``user``-scope key sees only its own usage; an
+
+        ``admin``-scope key sees all keys plus a per-key spend breakdown.'
       operationId: usage_summary_usage_get
       parameters:
       - name: limit

@@ -58,6 +58,7 @@ from typing import Any
 from .adapters import make_adapter
 from .config import Settings
 from .errors import (
+    AuthorizationError,
     BackendUnavailableError,
     ConcurrencyLimitError,
     ModelLoadError,
@@ -558,6 +559,24 @@ class ModelManager:
             remediation="check GET /healthz/backends",
         )
 
+    def _check_allowed(self, name: str, allowed_models: set[str] | None) -> None:
+        """Fail-closed per-key model scoping (ADR 0008).
+
+        ``allowed_models`` is the authenticated key's allow-list. ``None`` means no
+        restriction (unlimited key). When set, the resolved public model name must
+        be a member — this is applied to the model the ``auto`` router selects as
+        well as a directly-requested model, so scoping cannot be bypassed via auto.
+        """
+        if allowed_models is None:
+            return
+        if name not in allowed_models:
+            raise AuthorizationError(
+                f"model {name!r} is not permitted for this API key",
+                model=name,
+                code="model_not_allowed",
+                remediation="request a model in the key's allowed_models list",
+            )
+
     async def chat(
         self,
         name: str,
@@ -566,11 +585,17 @@ class ModelManager:
         route_key: str | None = None,
         required_placement: frozenset[str] | None = None,
         latency_budget_ms: float | None = None,
+        allowed_models: set[str] | None = None,
     ) -> dict:
         req = frozenset(required_placement or ())
         resolved = await self._resolve_route(name, payload, req, latency_budget_ms)
+        # ADR 0008 fail-closed per-key scoping applies to the (possibly auto-
+        # chosen) resolved model, so scoping cannot be bypassed via `auto`.
+        self._check_allowed(resolved.hops[0], allowed_models)
         if resolved.mode == "cascade" and len(resolved.hops) > 1:
-            return await self._serve_cascade(resolved, payload, request_id, route_key)
+            return await self._serve_cascade(
+                resolved, payload, request_id, route_key, allowed_models
+            )
         result = await self._serve_one(resolved.hops[0], payload, request_id, route_key, req)
         if isinstance(result, dict):
             result["_broker_route"] = result.get("model", resolved.hops[0])
@@ -600,12 +625,20 @@ class ModelManager:
         )
 
     async def _serve_cascade(
-        self, resolved: ResolvedRoute, payload: dict, request_id: str, route_key: str | None
+        self,
+        resolved: ResolvedRoute,
+        payload: dict,
+        request_id: str,
+        route_key: str | None,
+        allowed_models: set[str] | None = None,
     ) -> dict:
         """Serve the cheapest-capable hop; escalate once on a quality signal.
 
         Both hops are recorded (decision log + usage); the result carries the
-        ``_broker_route`` path (``primary`` or ``primary->escalation``).
+        ``_broker_route`` path (``primary`` or ``primary->escalation``). The
+        escalation hop is scope-checked (ADR 0008) before it is served, so a key
+        that may not use the stronger model is denied fail-closed rather than
+        silently escalated to it.
         """
         primary, escalation = resolved.hops[0], resolved.hops[1]
         req = resolved.required_placement
@@ -618,7 +651,9 @@ class ModelManager:
             if isinstance(result, dict):
                 result["_broker_route"] = primary_served
             return result
-        # Escalate: record the primary hop, then serve the stronger model.
+        # Escalate: fail-closed scoping on the stronger hop, record the primary
+        # hop, then serve the stronger model.
+        self._check_allowed(escalation, allowed_models)
         self._record_hop("chat_cascade", resolved.public_name, result, request_id, "escalated")
         result2 = await self._serve_one(escalation, payload, request_id, route_key, req)
         served = result2.get("model", escalation) if isinstance(result2, dict) else escalation
@@ -667,10 +702,13 @@ class ModelManager:
         request_id: str,
         route_key: str | None = None,
         required_placement: frozenset[str] | None = None,
+        allowed_models: set[str] | None = None,
     ) -> AsyncIterator[bytes]:
         req = frozenset(required_placement or ())
         # ``name`` is already a concrete model (the API resolves streaming routes via
-        # resolve_stream); placement is re-validated here when selecting members.
+        # resolve_stream); placement is re-validated here when selecting members and
+        # per-key scoping (ADR 0008) is re-checked fail-closed on the served model.
+        self._check_allowed(name, allowed_models)
         members = self._members_for(name, req)
         exclude: set[str] = set()
         last: Exception | None = None
@@ -745,15 +783,17 @@ class ModelManager:
         request_id: str,
         route_key: str | None = None,
         required_placement: frozenset[str] | None = None,
+        allowed_models: set[str] | None = None,
     ) -> dict:
         """Route an embeddings request through pool selection + failover.
 
         Unlike chat, ``auto`` does not apply (there is nothing to classify); the
         request is routed to the named model/pool. Shares the same member
         selection, concurrency gating, lazy-load, and failover as chat. Placement
-        pinning is enforced fail-closed on the named model/pool.
+        pinning and per-key scoping are enforced fail-closed on the named model/pool.
         """
         req = frozenset(required_placement or ())
+        self._check_allowed(name, allowed_models)
         members = self._members_for(name, req)
         return await self._route_and_serve(
             name,

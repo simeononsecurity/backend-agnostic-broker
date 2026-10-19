@@ -37,6 +37,10 @@ code in `broker/`.
 | **Silent model substitution** | Unknown alias served by a different model | `ModelNotFoundError` (404); no fallback path exists. |
 | **Denial of service (size)** | Oversized request bodies | `BROKER_MAX_REQUEST_BYTES` → 413 (content-length fast path + post-read check). |
 | **Denial of service (load)** | Flooding concurrent/loaded models | Global + per-model semaphores; `max_loaded_models` with LRU eviction; `reject` policy → 429. |
+| **Unrestricted resource/cost consumption (per key)** | One key flooding requests/tokens or running up cost (OWASP API4:2023) | Per-key `rpm`/`tpm`/`max_concurrency` + daily/monthly token & cost budgets enforced pre-dispatch on the `StateStore`; `429 rate_limit_exceeded` / `insufficient_quota` with `Retry-After` (ADR 0008). |
+| **Key material theft at rest** | Leaked repo/DB/backup exposing keys | Keys stored as SHA-256 **hash** only (never plaintext); `keys.yaml` git-ignored; secret shown once at creation (`broker/keys.py`). |
+| **Key enumeration / timing oracle** | Probing which keys are valid | Constant-time `hmac.compare_digest` (+ dummy compare for unknown ids); identical generic `401` for unknown/revoked/expired/wrong-secret keys. |
+| **Model-scope bypass via `auto`** | Using the `auto` alias to reach a disallowed model | `allowed_models` is fail-closed and checked on the model the router selects, not just the requested alias → `403 model_not_allowed`. |
 | **Resource exhaustion (stuck model)** | A runtime that never becomes ready or hangs | Startup + request timeouts; failure path transitions to `failed` and tears down the process; idle sweep unloads idle models. |
 | **Secret leakage** | Keys in repo/logs | `.env` git-ignored; constant-time key compare; keys never logged; CI secret scan. |
 | **Privilege escalation in container** | Exploit → host | Non-root user, read-only rootfs, dropped capabilities, `no-new-privileges`, minimal image. |

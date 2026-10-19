@@ -38,6 +38,29 @@ def test_unknown_backend_rejected(tmp_path):
         load_registry(str(p))
 
 
+def test_pricing_block_parsed_and_survives_backend_filter(tmp_path):
+    p = tmp_path / "priced.yaml"
+    p.write_text(
+        "models:\n"
+        "  - alias: a\n    backend: fake\n    runtime_model_id: x\n"
+        "pricing:\n"
+        "  a:\n    input_per_million: 0.5\n    output_per_million: 1.5\n"
+    )
+    reg = load_registry(str(p), enabled_backends={"fake"})
+    assert reg.pricing["a"].input_per_million == 0.5
+    assert reg.pricing["a"].output_per_million == 1.5
+
+
+def test_pricing_rejects_negative(tmp_path):
+    p = tmp_path / "negprice.yaml"
+    p.write_text(
+        "models:\n  - alias: a\n    backend: fake\n    runtime_model_id: x\n"
+        "pricing:\n  a:\n    input_per_million: -1\n"
+    )
+    with pytest.raises(ConfigError):
+        load_registry(str(p))
+
+
 def test_extra_field_rejected(tmp_path):
     p = tmp_path / "x.yaml"
     p.write_text(
