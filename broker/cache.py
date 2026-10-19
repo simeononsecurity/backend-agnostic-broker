@@ -23,13 +23,15 @@ Design (prior art: LiteLLM exact caching, RFC 9111):
 * **Bypass is honored at the HTTP layer** (``Cache-Control: no-cache``/``no-store``
   or ``x-broker-cache: bypass``) — this module just reads/writes.
 
-Semantic (embedding-similarity) caching is deferred — see ADR 0012.
+Semantic (embedding-similarity) caching is implemented separately by
+:class:`SemanticCache` below (ADR 0014).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import OrderedDict
 from typing import Any
 
@@ -119,16 +121,19 @@ class ResponseCache:
         except (ValueError, TypeError):
             return None
 
-    async def store(self, key: str, value: dict) -> bool:
+    async def store(self, key: str, value: dict, *, ttl_override: float | None = None) -> bool:
         """Store a successful result. Returns False if skipped (too large).
 
         Enforces ``max_bytes`` (per-entry cap) and ``max_entries`` (LRU bound on
-        the in-process index). TTL comes from ``response_cache_ttl_seconds``.
+        the in-process index). TTL comes from ``response_cache_ttl_seconds``
+        unless ``ttl_override`` is given (per-request ``x-broker-cache-ttl``,
+        ADR 0014): a non-negative override wins (0 = no TTL).
         """
         data = json.dumps(value, default=str).encode("utf-8")
         if self.max_bytes > 0 and len(data) > self.max_bytes:
             return False
-        ttl = self.ttl if self.ttl > 0 else None
+        effective = self.ttl if ttl_override is None else ttl_override
+        ttl = effective if effective > 0 else None
         await self.state.kv_set(self._k(key), data, ttl=ttl)
         self._index[key] = None
         self._index.move_to_end(key)
@@ -155,4 +160,151 @@ class ResponseCache:
             "stores": self.stores,
             "hit_rate": round(self.hits / total, 4) if total else 0.0,
             "live_entries": len(self._index),
+        }
+
+
+#: KV namespace prefix for the semantic index (under the StateStore ``kv`` ns).
+_SEM_PREFIX = "semcache"
+
+#: Request fields compared fuzzily (by embedding) rather than exactly. Everything
+#: else in the body is part of the exact-match bucket key, so a semantic hit can
+#: only differ in the prompt text.
+_FUZZY_FIELDS = ("messages",)
+
+
+class SemanticCache:
+    """Embedding-similarity response cache (ADR 0014).
+
+    A second cache layer consulted only after an exact-cache miss, for
+    chat/completions/responses. It partitions stored responses into **buckets**
+    keyed by every non-prompt request field (scope, resolved model, endpoint,
+    sampling/tools/response_format/seed/..., plus the ADR 0012 scope) so that only
+    the *prompt text* is fuzzy — a semantic hit can never cross a scope, model, or
+    parameter boundary. Within a bucket the query embedding is compared to each
+    stored embedding by cosine similarity (pure Python — no numpy); a hit fires
+    when the best similarity clears ``threshold``.
+
+    Embedding + residency live outside this class (the app supplies them via the
+    manager's own ``/v1/embeddings`` path): this class is given a ready embedding
+    vector and is otherwise a pure StateStore policy, keeping it unit-testable.
+    """
+
+    def __init__(self, state: StateStore, settings: Any) -> None:
+        self.state = state
+        self.enabled: bool = settings.semantic_cache_enabled
+        self.model: str | None = settings.semantic_cache_model
+        self.threshold: float = settings.semantic_cache_threshold
+        self.ttl: float = settings.semantic_cache_ttl_seconds
+        self.max_entries: int = settings.semantic_cache_max_entries
+        self.require_resident: bool = settings.semantic_cache_require_resident
+        self.hits = 0
+        self.misses = 0
+        self.stores = 0
+        self.skipped_not_resident = 0
+
+    # --- pure helpers (unit-testable) ------------------------------------
+    @staticmethod
+    def cosine(a: list[float], b: list[float]) -> float:
+        """Cosine similarity of two equal-length vectors (0.0 on degenerate input)."""
+        if not a or not b or len(a) != len(b):
+            return 0.0
+        dot = 0.0
+        na = 0.0
+        nb = 0.0
+        for x, y in zip(a, b, strict=False):
+            dot += x * y
+            na += x * x
+            nb += y * y
+        if na <= 0.0 or nb <= 0.0:
+            return 0.0
+        return dot / (math.sqrt(na) * math.sqrt(nb))
+
+    @staticmethod
+    def bucket_key(*, scope: str, model: str, endpoint: str, payload: dict) -> str:
+        """Exact-match bucket key: everything except the fuzzy prompt fields.
+
+        Excludes the fuzzy fields (``messages``) and the routing-only fields
+        (``model``, ``stream``, ``user``) that the exact cache also drops; the
+        resolved model is pinned via the explicit ``model`` argument.
+        """
+        skip = set(_FUZZY_FIELDS) | {"model", "stream", "user"}
+        body = {k: v for k, v in payload.items() if k not in skip}
+        blob = json.dumps(
+            {"scope": scope, "model": model, "endpoint": endpoint, "body": body},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def query_text(payload: dict) -> str:
+        """Flatten the fuzzy prompt fields to a single string to embed."""
+        parts: list[str] = []
+        for msg in payload.get("messages") or []:
+            if isinstance(msg, dict):
+                role = msg.get("role", "")
+                content = msg.get("content")
+                if isinstance(content, list):
+                    content = "".join(
+                        str(p.get("text") or p.get("content") or "")
+                        if isinstance(p, dict)
+                        else str(p)
+                        for p in content
+                    )
+                parts.append(f"{role}: {content if content is not None else ''}")
+        return "\n".join(parts)
+
+    # --- read / write ----------------------------------------------------
+    def _k(self, bucket: str) -> str:
+        return f"{_SEM_PREFIX}:{bucket}"
+
+    async def lookup(self, bucket: str, embedding: list[float]) -> tuple[dict, float] | None:
+        """Return ``(result, similarity)`` for the best stored match ≥ threshold.
+
+        Updates hit/miss stats. ``None`` on a miss (empty bucket or no match).
+        """
+        raw = await self.state.kv_get_json(self._k(bucket))
+        best_val: dict | None = None
+        best_sim = -1.0
+        for entry in raw or []:
+            emb = entry.get("e")
+            sim = self.cosine(embedding, emb if isinstance(emb, list) else [])
+            if sim > best_sim:
+                best_sim = sim
+                best_val = entry.get("v")
+        if best_val is not None and best_sim >= self.threshold:
+            self.hits += 1
+            return best_val, best_sim
+        self.misses += 1
+        return None
+
+    async def store(
+        self, bucket: str, embedding: list[float], value: dict, *, ttl_override: float | None = None
+    ) -> None:
+        """Append ``(embedding, value)`` to a bucket, LRU-bounded by max_entries."""
+        raw = await self.state.kv_get_json(self._k(bucket))
+        entries = list(raw) if isinstance(raw, list) else []
+        entries.append({"e": embedding, "v": value})
+        if self.max_entries > 0 and len(entries) > self.max_entries:
+            entries = entries[-self.max_entries :]
+        effective = self.ttl if ttl_override is None else ttl_override
+        ttl = effective if effective > 0 else None
+        await self.state.kv_set_json(self._k(bucket), entries, ttl=ttl)
+        self.stores += 1
+
+    def stats(self) -> dict[str, Any]:
+        total = self.hits + self.misses
+        return {
+            "enabled": self.enabled,
+            "model": self.model,
+            "threshold": self.threshold,
+            "ttl_seconds": self.ttl,
+            "max_entries": self.max_entries,
+            "require_resident": self.require_resident,
+            "hits": self.hits,
+            "misses": self.misses,
+            "stores": self.stores,
+            "skipped_not_resident": self.skipped_not_resident,
+            "hit_rate": round(self.hits / total, 4) if total else 0.0,
         }

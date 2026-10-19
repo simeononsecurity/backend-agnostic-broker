@@ -35,7 +35,7 @@ from pydantic import BaseModel
 
 from . import __version__
 from .auth import admin_key_match, extract_key
-from .cache import ResponseCache
+from .cache import ResponseCache, SemanticCache
 from .config import Settings, get_settings
 from .errors import (
     AuthError,
@@ -49,6 +49,7 @@ from .keys import KeyStore, Principal
 from .manager import ModelManager
 from .metrics import INFLIGHT, LOADED_MODELS, REQUEST_LATENCY, REQUESTS
 from .openai_compat import (
+    chat_result_to_sse_chunks,
     chat_sse_to_responses_sse,
     chat_sse_to_text_sse,
     chat_to_response,
@@ -222,6 +223,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # pass-through unless BROKER_RESPONSE_CACHE_ENABLED.
     response_cache = ResponseCache(manager.state, settings)
     app.state.response_cache = response_cache
+    # Semantic (embedding-similarity) cache (ADR 0014): a second layer consulted
+    # after an exact miss, for chat/completions/responses. No-op unless
+    # BROKER_SEMANTIC_CACHE_ENABLED.
+    semantic_cache = SemanticCache(manager.state, settings)
+    app.state.semantic_cache = semantic_cache
     admin_log = logging.getLogger("broker.admin")
 
     def _cache_bypass(request: Request) -> bool:
@@ -229,12 +235,155 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         Honors the HTTP-standard ``Cache-Control: no-cache``/``no-store`` request
         directives (treated as a full bypass — the broker has no revalidation
-        protocol, so not-serving-stored is the safe superset) and the
-        broker-specific ``x-broker-cache: bypass`` header.
+        protocol, so not-serving-stored is the safe superset), ``max-age=0`` (ADR
+        0014, strictest reading), and the broker-specific ``x-broker-cache:
+        bypass`` header.
         """
-        cc = (request.headers.get("cache-control") or "").lower()
+        cc = (request.headers.get("cache-control") or "").lower().replace(" ", "")
         xb = (request.headers.get("x-broker-cache") or "").lower()
-        return "no-cache" in cc or "no-store" in cc or xb == "bypass"
+        return "no-cache" in cc or "no-store" in cc or "max-age=0" in cc or xb == "bypass"
+
+    def _cache_controls(request: Request) -> tuple[float | None, str | None]:
+        """Parse per-request cache controls (ADR 0014): write-TTL + namespace.
+
+        ``x-broker-cache-ttl`` overrides this request's stored-entry TTL (>=0; 0 =
+        no TTL). ``x-broker-cache-namespace`` partitions the cache scope (so a
+        caller can isolate or cheaply invalidate by rotating it). Rejected HTTP
+        directives (``s-maxage``, request ``max-age>0`` freshness) are ignored —
+        the broker keeps no stored-age and has no revalidation protocol.
+        """
+        ttl_override: float | None = None
+        raw = request.headers.get("x-broker-cache-ttl")
+        if raw is not None:
+            try:
+                ttl_override = float(raw)
+            except ValueError as exc:
+                raise ValidationError(
+                    f"invalid x-broker-cache-ttl {raw!r}",
+                    remediation="send a non-negative number of seconds",
+                ) from exc
+            if ttl_override < 0:
+                raise ValidationError("x-broker-cache-ttl must be >= 0")
+        namespace = request.headers.get("x-broker-cache-namespace")
+        if namespace is not None:
+            namespace = namespace.strip()
+            if namespace and not _PLACEMENT_LABEL_RE.match(namespace):
+                raise ValidationError(
+                    f"invalid x-broker-cache-namespace {namespace!r}",
+                    remediation="use letters/digits/'.'/'-'/'_'/':'",
+                )
+            namespace = namespace or None
+        return ttl_override, namespace
+
+    def _semantic_eligible(payload: dict) -> bool:
+        """Whether the request is eligible for the semantic layer (policy only)."""
+        if not semantic_cache.enabled:
+            return False
+        if not settings.response_cache_deterministic_only:
+            return True
+        return ResponseCache.is_deterministic(payload)
+
+    async def _semantic_embed(text: str) -> list[float] | None:
+        """Embed ``text`` via the broker's own embeddings path for the semantic cache.
+
+        Honors the lazy-load invariant: with ``require_resident`` (default) the
+        embedding model is consulted ONLY when already resident, so a chat request
+        never silently loads it. Returns the vector, or ``None`` when skipped.
+        """
+        model = semantic_cache.model
+        if not model or not text:
+            return None
+        if semantic_cache.require_resident and not manager.is_resident(model):
+            semantic_cache.skipped_not_resident += 1
+            return None
+        try:
+            result = await manager.embeddings(model, {"input": text}, "semcache")
+        except BrokerError:
+            return None
+        data = result.get("data") if isinstance(result, dict) else None
+        if not data:
+            return None
+        emb = data[0].get("embedding")
+        return emb if isinstance(emb, list) else None
+
+    async def _cache_read(
+        request: Request,
+        *,
+        key_scope: str | None,
+        endpoint: str,
+        alias: str,
+        keyed_payload: dict,
+        always_deterministic: bool,
+    ) -> dict:
+        """Read-only cache consult (exact then semantic). Returns a context dict.
+
+        Keys: ``state`` (hit|semantic-hit|miss|bypass), ``result`` (on a hit),
+        ``headers`` (extra response headers), ``ckey`` / ``bucket`` / ``emb`` /
+        ``ttl_override`` (populated so a caller can STORE after serving a miss).
+        """
+        ctx: dict = {
+            "state": "miss",
+            "result": None,
+            "headers": {},
+            "ckey": None,
+            "bucket": None,
+            "emb": None,
+            "ttl_override": None,
+        }
+        if not response_cache.enabled and not semantic_cache.enabled:
+            return ctx
+        if _cache_bypass(request):
+            ctx["state"] = "bypass"
+            return ctx
+        ctx["ttl_override"], namespace = _cache_controls(request)
+        resolved = await manager.resolve_public(alias, keyed_payload)
+        scope = key_scope or "anon"
+        if namespace:
+            scope = f"{scope}|ns={namespace}"
+        # --- exact layer ---
+        if response_cache.enabled and response_cache.cacheable(
+            keyed_payload, always_deterministic=always_deterministic
+        ):
+            ckey = ResponseCache.make_key(
+                scope=scope, model=resolved, endpoint=endpoint, payload=keyed_payload
+            )
+            ctx["ckey"] = ckey
+            with manager.tracer.span("cache_lookup", {"broker.cache.endpoint": endpoint}) as sp:
+                hit = await response_cache.get(ckey)
+                sp.set_attribute("broker.cache.hit", hit is not None)
+            if hit is not None:
+                ctx["state"] = "hit"
+                ctx["result"] = hit
+                return ctx
+        # --- semantic layer (chat/completions/responses only) ---
+        if endpoint != "embeddings" and _semantic_eligible(keyed_payload):
+            bucket = SemanticCache.bucket_key(
+                scope=scope, model=resolved, endpoint=endpoint, payload=keyed_payload
+            )
+            emb = await _semantic_embed(SemanticCache.query_text(keyed_payload))
+            if emb is not None:
+                ctx["bucket"] = bucket
+                ctx["emb"] = emb
+                with manager.tracer.span(
+                    "semantic_cache_lookup", {"broker.cache.endpoint": endpoint}
+                ) as sp:
+                    match = await semantic_cache.lookup(bucket, emb)
+                    sp.set_attribute("broker.cache.semantic_hit", match is not None)
+                if match is not None:
+                    result, sim = match
+                    ctx["state"] = "semantic-hit"
+                    ctx["result"] = result
+                    ctx["headers"] = {"x-broker-cache-similarity": f"{sim:.4f}"}
+        return ctx
+
+    async def _cache_store(ctx: dict, result: dict) -> None:
+        """Populate exact + semantic caches after serving a miss (non-streaming)."""
+        if ctx["ckey"] is not None:
+            await response_cache.store(ctx["ckey"], result, ttl_override=ctx["ttl_override"])
+        if semantic_cache.enabled and ctx["bucket"] is not None and ctx["emb"] is not None:
+            await semantic_cache.store(
+                ctx["bucket"], ctx["emb"], result, ttl_override=ctx["ttl_override"]
+            )
 
     async def _cached_serve(
         *,
@@ -245,35 +394,95 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         keyed_payload: dict,
         serve,
         always_deterministic: bool = False,
-    ) -> tuple[dict, str]:
-        """Serve a request through the response cache. Returns (result, state).
+    ) -> tuple[dict, str, dict]:
+        """Serve a request through the response cache. Returns (result, state, headers).
 
-        ``state`` is ``hit|miss|bypass`` (also set as the ``x-broker-cache``
-        response header). ``serve(name)`` runs the real pipeline for the resolved
-        public model and returns the final response dict. Errors propagate
-        uncached; only a successful result is stored.
+        ``state`` is ``hit|semantic-hit|miss|bypass`` (also the ``x-broker-cache``
+        response header); ``headers`` carries extras (e.g. the similarity score on
+        a semantic hit). Errors propagate uncached; only a successful NON-streaming
+        result is stored.
         """
-        if not response_cache.enabled:
-            return await serve(alias), "miss"
-        if _cache_bypass(request):
-            return await serve(alias), "bypass"
-        resolved = await manager.resolve_public(alias, keyed_payload)
-        if not response_cache.cacheable(keyed_payload, always_deterministic=always_deterministic):
-            return await serve(alias), "miss"
-        ckey = ResponseCache.make_key(
-            scope=key_scope or "anon", model=resolved, endpoint=endpoint, payload=keyed_payload
+        ctx = await _cache_read(
+            request,
+            key_scope=key_scope,
+            endpoint=endpoint,
+            alias=alias,
+            keyed_payload=keyed_payload,
+            always_deterministic=always_deterministic,
         )
-        with manager.tracer.span("cache_lookup", {"broker.cache.endpoint": endpoint}) as sp:
-            hit = await response_cache.get(ckey)
-            sp.set_attribute("broker.cache.hit", hit is not None)
-        if hit is not None:
-            return hit, "hit"
+        if ctx["result"] is not None:
+            return ctx["result"], ctx["state"], ctx["headers"]
+        if ctx["state"] == "bypass":
+            return await serve(alias), "bypass", {}
         # Serve through the ORIGINAL alias (not the pre-resolved model) so auto,
-        # cascade, placement and per-key scoping all run in the manager. ``resolved``
-        # is only the cache-key model; a cascade's final served model is in the body.
+        # cascade, placement and per-key scoping all run in the manager.
         result = await serve(alias)
-        await response_cache.store(ckey, result)
-        return result, "miss"
+        await _cache_store(ctx, result)
+        return result, "miss", {}
+
+    def _replay_stream_response(
+        result: dict,
+        *,
+        endpoint: str,
+        model: str,
+        request_id: str,
+        state: str,
+        extra_headers: dict,
+        admission,
+        principal,
+        key_id,
+        start: float,
+    ) -> StreamingResponse:
+        """Serve a cache hit for a streaming request as a well-formed SSE replay (ADR 0014)."""
+        served = result.get("model", model) if isinstance(result, dict) else model
+        chunks = chat_result_to_sse_chunks(result, model)
+
+        async def _raw():
+            for c in chunks:
+                yield c
+
+        if endpoint == "completions":
+            src = chat_sse_to_text_sse(_raw(), model)
+        elif endpoint == "responses":
+            src = chat_sse_to_responses_sse(_raw(), model)
+        else:
+            src = _raw()
+
+        async def gen():
+            INFLIGHT.inc()
+            try:
+                async for out in src:
+                    yield out
+                REQUESTS.labels(f"{endpoint}_stream", model, "ok").inc()
+            finally:
+                INFLIGHT.dec()
+                REQUEST_LATENCY.labels(f"{endpoint}_stream", model).observe(
+                    time.monotonic() - start
+                )
+                await governor.reconcile(principal, admission.reservation, model=model)
+                usage.record(
+                    endpoint=f"{endpoint}_stream",
+                    requested=model,
+                    model=served,
+                    request_id=request_id,
+                    api_key_id=key_id,
+                    latency_ms=(time.monotonic() - start) * 1000,
+                    status="ok",
+                    stream=True,
+                )
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={
+                "x-request-id": request_id,
+                "cache-control": "no-cache",
+                "x-broker-route": served,
+                "x-broker-cache": state,
+                **extra_headers,
+                **admission.headers,
+            },
+        )
 
     def require_admin(
         authorization: str | None, x_api_key: str | None, x_admin_key: str | None
@@ -429,6 +638,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         LOADED_MODELS.set(manager.loaded_count())
         snapshot = await manager.status()
         snapshot["response_cache"] = response_cache.stats()
+        snapshot["semantic_cache"] = semantic_cache.stats()
         return snapshot
 
     @app.get("/metrics")
@@ -531,6 +741,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         start = time.monotonic()
         if req.stream:
+            # Streaming cache replay (ADR 0014): consult the cache before routing;
+            # on a hit, replay the stored result as SSE instead of running inference.
+            scache = await _cache_read(
+                request,
+                key_scope=_cache_scope(key_id, placement),
+                endpoint="chat",
+                alias=alias,
+                keyed_payload=payload,
+                always_deterministic=False,
+            )
+            if scache["result"] is not None:
+                return _replay_stream_response(
+                    scache["result"],
+                    endpoint="chat",
+                    model=alias,
+                    request_id=request_id,
+                    state=scache["state"],
+                    extra_headers=scache["headers"],
+                    admission=admission,
+                    principal=principal,
+                    key_id=key_id,
+                    start=start,
+                )
             # Resolve the (possibly auto) route to one concrete model before streaming
             # so the route is known for the header and placement is enforced up front.
             concrete, route_path = await manager.resolve_stream(
@@ -580,6 +813,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "x-request-id": request_id,
                     "cache-control": "no-cache",
                     "x-broker-route": route_path,
+                    "x-broker-cache": scache["state"],
                     **admission.headers,
                 },
             )
@@ -600,7 +834,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     allowed_models=allowed,
                 )
 
-            result, cache_state = await _cached_serve(
+            result, cache_state, cache_headers = await _cached_serve(
                 request=request,
                 key_scope=_cache_scope(key_id, placement),
                 endpoint="chat",
@@ -632,6 +866,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "x-request-id": request_id,
                     "x-broker-route": route_path,
                     "x-broker-cache": cache_state,
+                    **cache_headers,
                     **admission.headers,
                 },
             )
@@ -698,6 +933,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         start = time.monotonic()
 
         if stream:
+            scache = await _cache_read(
+                request,
+                key_scope=_cache_scope(key_id, placement),
+                endpoint="completions",
+                alias=model,
+                keyed_payload=chat_payload,
+                always_deterministic=False,
+            )
+            if scache["result"] is not None:
+                return _replay_stream_response(
+                    scache["result"],
+                    endpoint="completions",
+                    model=model,
+                    request_id=request_id,
+                    state=scache["state"],
+                    extra_headers=scache["headers"],
+                    admission=admission,
+                    principal=principal,
+                    key_id=key_id,
+                    start=start,
+                )
             concrete, route_path = await manager.resolve_stream(
                 model, chat_payload, required_placement=placement, latency_budget_ms=budget
             )
@@ -748,6 +1004,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "x-request-id": request_id,
                     "cache-control": "no-cache",
                     "x-broker-route": route_path,
+                    "x-broker-cache": scache["state"],
                     **admission.headers,
                 },
             )
@@ -768,7 +1025,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     allowed_models=allowed,
                 )
 
-            result, cache_state = await _cached_serve(
+            result, cache_state, cache_headers = await _cached_serve(
                 request=request,
                 key_scope=_cache_scope(key_id, placement),
                 endpoint="completions",
@@ -801,6 +1058,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "x-request-id": request_id,
                     "x-broker-route": route_path,
                     "x-broker-cache": cache_state,
+                    **cache_headers,
                     **admission.headers,
                 },
             )
@@ -859,6 +1117,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         start = time.monotonic()
 
         if stream:
+            scache = await _cache_read(
+                request,
+                key_scope=_cache_scope(key_id, placement),
+                endpoint="responses",
+                alias=model,
+                keyed_payload=chat_payload,
+                always_deterministic=False,
+            )
+            if scache["result"] is not None:
+                return _replay_stream_response(
+                    scache["result"],
+                    endpoint="responses",
+                    model=model,
+                    request_id=request_id,
+                    state=scache["state"],
+                    extra_headers=scache["headers"],
+                    admission=admission,
+                    principal=principal,
+                    key_id=key_id,
+                    start=start,
+                )
             concrete, route_path = await manager.resolve_stream(
                 model, chat_payload, required_placement=placement, latency_budget_ms=budget
             )
@@ -909,6 +1188,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "x-request-id": request_id,
                     "cache-control": "no-cache",
                     "x-broker-route": route_path,
+                    "x-broker-cache": scache["state"],
                     **admission.headers,
                 },
             )
@@ -929,7 +1209,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     allowed_models=allowed,
                 )
 
-            result, cache_state = await _cached_serve(
+            result, cache_state, cache_headers = await _cached_serve(
                 request=request,
                 key_scope=_cache_scope(key_id, placement),
                 endpoint="responses",
@@ -962,6 +1242,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "x-request-id": request_id,
                     "x-broker-route": route_path,
                     "x-broker-cache": cache_state,
+                    **cache_headers,
                     **admission.headers,
                 },
             )
@@ -1025,7 +1306,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     allowed_models=allowed,
                 )
 
-            result, cache_state = await _cached_serve(
+            result, cache_state, cache_headers = await _cached_serve(
                 request=request,
                 key_scope=_cache_scope(key_id, placement),
                 endpoint="embeddings",
@@ -1055,6 +1336,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 headers={
                     "x-request-id": request_id,
                     "x-broker-cache": cache_state,
+                    **cache_headers,
                     **admission.headers,
                 },
             )

@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import logging
 import random
 import time
@@ -284,6 +285,19 @@ class ModelManager:
 
     def loaded_count(self) -> int:
         return sum(1 for m in self.models.values() if m.machine.is_active())
+
+    def is_resident(self, name: str) -> bool:
+        """True if any member of ``name`` (alias or pool) is already loaded.
+
+        Used by the semantic cache (ADR 0014) to honor the lazy-load invariant:
+        the embedding model is embedded/consulted only when it is already
+        resident, so a chat request never silently loads an extra model.
+        """
+        members = self.pools.get(name)
+        if not members:
+            m = self.models.get(name)
+            members = [m] if m is not None else []
+        return any(m.machine.is_active() for m in members)
 
     async def _resolve_route(
         self,
@@ -798,6 +812,29 @@ class ModelManager:
                                 sp.set_attribute(
                                     "gen_ai.usage.output_tokens", usage["completion_tokens"]
                                 )
+                        # Opt-in span content capture (ADR 0014): OFF by default.
+                        # OTel GenAI `spanOnly` mode — truncated JSON strings; may
+                        # contain PII, so never captured unless explicitly enabled.
+                        if self.tracer.capture_content:
+                            try:
+                                sp.set_attribute(
+                                    "gen_ai.input.messages",
+                                    self.tracer.truncate(json.dumps(payload.get("messages", []))),
+                                )
+                                if isinstance(result, dict):
+                                    sp.set_attribute(
+                                        "gen_ai.output.messages",
+                                        self.tracer.truncate(
+                                            json.dumps(
+                                                [
+                                                    c.get("message", {})
+                                                    for c in result.get("choices", [])
+                                                ]
+                                            )
+                                        ),
+                                    )
+                            except Exception:  # noqa: BLE001 - tracing never breaks a request
+                                pass
                     m.healthy = True
                     # Present the public (requested) model name back to the caller.
                     if isinstance(result, dict):
