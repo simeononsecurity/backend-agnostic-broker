@@ -234,11 +234,16 @@ class Settings(BaseSettings):
     #   threshold: cosine similarity in [0,1]; default 0.95 is precision-favoring
     #     (see ADR 0014 / docs/research): a false positive serves a wrong answer.
     #   max_entries: per-bucket bound on stored (embedding,response) pairs (LRU).
+    #   max_buckets: global bound on the NUMBER of buckets (LRU). Together with
+    #     max_entries and the TTL this keeps the semantic index bounded even when
+    #     a caller varies non-prompt params to create many buckets. Per-process
+    #     (best-effort under Redis, where the TTL is the authoritative bound).
     semantic_cache_enabled: bool = False
     semantic_cache_model: str | None = None
     semantic_cache_threshold: float = 0.95
     semantic_cache_ttl_seconds: float = 300.0
     semantic_cache_max_entries: int = 128
+    semantic_cache_max_buckets: int = 1024
     semantic_cache_require_resident: bool = True
 
     # --- Admin runtime control (ADR 0012) ---
@@ -391,6 +396,8 @@ class Settings(BaseSettings):
                 raise ConfigError("BROKER_SEMANTIC_CACHE_TTL_SECONDS must be >= 0 (0 = no TTL)")
             if self.semantic_cache_max_entries < 1:
                 raise ConfigError("BROKER_SEMANTIC_CACHE_MAX_ENTRIES must be >= 1")
+            if self.semantic_cache_max_buckets < 1:
+                raise ConfigError("BROKER_SEMANTIC_CACHE_MAX_BUCKETS must be >= 1")
         if self.tracing_content_max_chars < 0:
             raise ConfigError("BROKER_TRACING_CONTENT_MAX_CHARS must be >= 0")
         if (

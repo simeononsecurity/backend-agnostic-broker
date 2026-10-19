@@ -268,7 +268,7 @@ bypass. Per-request bypass via `Cache-Control: no-cache`/`no-store` or
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
 | `BROKER_RESPONSE_CACHE_ENABLED` | bool | `false` | Master switch for the exact response cache. |
-| `BROKER_RESPONSE_CACHE_TTL_SECONDS` | float | `300` | Entry TTL; `0` = no TTL (rely on `max_entries`). |
+| `BROKER_RESPONSE_CACHE_TTL_SECONDS` | float | `300` | Operator TTL ceiling for stored entries; `0` = no TTL (rely on `max_entries`). A per-request `x-broker-cache-ttl` may only shorten it. |
 | `BROKER_RESPONSE_CACHE_MAX_ENTRIES` | int | `1000` | In-process LRU bound on live entries; `0` = unbounded (Redis uses TTL). |
 | `BROKER_RESPONSE_CACHE_MAX_BYTES` | int | `1000000` | Per-entry cap; a larger serialized result is not stored. `0` = no cap. |
 | `BROKER_RESPONSE_CACHE_DETERMINISTIC_ONLY` | bool | `true` | Cache only deterministic requests (`temperature == 0` or an explicit `seed`); embeddings always. Set `false` to cache all. |
@@ -281,7 +281,7 @@ responses *populate* the cache. Per request:
 
 | Header | Effect |
 |--------|--------|
-| `x-broker-cache-ttl: <seconds>` | Override this request's stored-entry TTL (`>= 0`; `0` = no TTL). |
+| `x-broker-cache-ttl: <seconds>` | Clamp this request's stored-entry TTL. Finite, `>= 0`; may only **shorten** the operator TTL. `0` = do not store this response. Non-finite (`nan`/`inf`/`-inf`, overflow like `1e400`) or negative → `400`. |
 | `x-broker-cache-namespace: <token>` | Partition the caller's cache scope (rotate to invalidate). |
 | `Cache-Control: max-age=0` | Bypass (same as `no-cache`/`no-store`). |
 
@@ -296,10 +296,23 @@ own `/v1/embeddings` path (`BROKER_SEMANTIC_CACHE_MODEL`, a registry alias) and
 serves the closest stored response whose cosine similarity clears the threshold.
 **Strict scoping** — key/tenant + placement + namespace + resolved model +
 endpoint + every non-prompt param (sampling, `tools`, `response_format`, `seed`,
-...) must match exactly; only the prompt text is fuzzy — so a semantic hit never
-crosses a scope. Pure-Python cosine over a bounded per-bucket index (no numpy);
-in-process or Redis via the StateStore. A semantic hit returns
-`x-broker-cache: semantic-hit` + `x-broker-cache-similarity`.
+...) **plus the system prompt and the whole conversation history** must match
+exactly; only the **last user turn's text** is fuzzy (and only its text — any
+non-text content parts stay exact) — so a semantic hit never crosses a scope,
+system prompt, or history boundary. Completions (`prompt`) and responses
+(`input` + `instructions`) are normalized to messages upstream, so the same rule
+covers all three endpoints. Pure-Python cosine over a bounded per-bucket index
+(no numpy); the **number of buckets** is also globally bounded
+(`BROKER_SEMANTIC_CACHE_MAX_BUCKETS`, LRU) so a caller varying non-prompt params
+cannot grow the index without limit; in-process or Redis via the StateStore. A
+semantic hit returns `x-broker-cache: semantic-hit` + `x-broker-cache-similarity`.
+
+The semantic layer stores only when the **served** model equals the model the
+request keyed on (the pre-resolution pick); if a cascade escalated to a different
+model the response is not stored (it would otherwise be served to a later request
+that resolved to the primary). Per-request `x-broker-cache-ttl` follows the same
+clamp rules as the exact cache (finite, may only shorten the operator TTL, `0` =
+do not store).
 
 **Lazy-load invariant.** With `BROKER_SEMANTIC_CACHE_REQUIRE_RESIDENT=true`
 (default) the cache is consulted/populated **only when the embedding model is
@@ -318,8 +331,9 @@ false-positive-vs-threshold survey (GPTCache, Redis, LiteLLM, respan).
 | `BROKER_SEMANTIC_CACHE_ENABLED` | bool | `false` | Master switch for the semantic layer. |
 | `BROKER_SEMANTIC_CACHE_MODEL` | str | — | **Required when enabled**: registry alias served via `/v1/embeddings`. |
 | `BROKER_SEMANTIC_CACHE_THRESHOLD` | float | `0.95` | Cosine similarity in `[0,1]`; higher = fewer false positives, lower hit rate. |
-| `BROKER_SEMANTIC_CACHE_TTL_SECONDS` | float | `300` | Per-bucket TTL; `0` = no TTL. |
-| `BROKER_SEMANTIC_CACHE_MAX_ENTRIES` | int | `128` | Per-bucket bound on stored `(embedding, response)` pairs (LRU). |
+| `BROKER_SEMANTIC_CACHE_TTL_SECONDS` | float | `300` | Operator TTL ceiling per bucket; `0` = no TTL. A per-request `x-broker-cache-ttl` may only shorten it. |
+| `BROKER_SEMANTIC_CACHE_MAX_ENTRIES` | int | `128` | Per-bucket bound on stored `(embedding, response)` pairs (LRU); `>= 1`. |
+| `BROKER_SEMANTIC_CACHE_MAX_BUCKETS` | int | `1024` | Global LRU bound on the **number** of buckets; `>= 1`. Keeps the index bounded even when a caller varies non-prompt params. |
 | `BROKER_SEMANTIC_CACHE_REQUIRE_RESIDENT` | bool | `true` | Consult/populate only when the embedding model is already resident; `false` allows on-demand loading. |
 
 ## Admin runtime control (ADR 0012)

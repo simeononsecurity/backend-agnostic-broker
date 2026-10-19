@@ -40,22 +40,41 @@ the chat request did not ask for. This ADR resolves that tension explicitly
 
 Four capabilities, all **opt-in with defaults that reproduce v0.5.0**.
 
+> **Follow-up amendment (2026-10-19, pre-merge; branch not yet pushed).**
+> Orchestrator verification found three defects in the first implementation, fixed
+> in place on this branch and reflected in the Decision text above and the
+> Confirmation below: (1) the per-request `x-broker-cache-ttl` had no finite
+> ceiling (`0`/`nan`/`inf`/`1e400` were stored without expiry, overriding the
+> operator TTL) → it is now finite, `>= 0`, may only *shorten* the operator TTL,
+> and `0` means "do not store"; (2) the *whole* message list was embedded, so
+> differing system prompts or histories could produce a cross-context hit → only
+> the **last user turn's text** is fuzzy now, everything else is exact; (3) a
+> cascade that escalated to a different model was stored under the pre-resolution
+> model → the cache now stores only under the **served** model. The semantic
+> bucket **count** is also bounded (`BROKER_SEMANTIC_CACHE_MAX_BUCKETS`).
+
 ### 1. Semantic response cache (`BROKER_SEMANTIC_CACHE_ENABLED`, default off)
 
 A second cache layer consulted **only after an exact-cache miss**, for chat,
 completions, and responses (not embeddings — an embedding *is* the vector, so
 there is no fuzzy-text benefit and the exact cache already covers it).
 
-- **Strict scoping; only the prompt text is fuzzy.** The semantic index is
-  partitioned by a **non-prompt bucket key** = SHA-256 of
+- **Strict scoping; only the last user turn's text is fuzzy.** The semantic index
+  is partitioned by a **non-prompt bucket key** = SHA-256 of
   `(caller scope, resolved public model, endpoint, every non-prompt request
-  field)` — sampling params, `tools`, `tool_choice`, `response_format`, `seed`,
+  field, the system/developer messages, and the whole conversation history)` —
+  sampling params, `tools`, `tool_choice`, `response_format`, `seed`,
   `max_tokens`, etc., plus the ADR 0012 scope (key/tenant + placement + optional
-  namespace). Two requests can share a semantic hit **only if every one of those
-  matches exactly**; just the message/prompt *text* is compared by cosine
-  similarity. This removes the cross-key / cross-model / cross-param false-hit
-  class entirely by construction — the remaining risk is purely text
-  paraphrase.
+  namespace), **plus every message except the text of the final user turn**
+  (system prompts, earlier user/assistant/tool turns, and any non-text content
+  parts of the last user turn are all exact). Two requests can share a semantic
+  hit **only if every one of those matches exactly**; just the *last user turn's
+  text* is compared by cosine similarity. Completions (`prompt`) and responses
+  (`input` + `instructions`) are normalized to `messages` before caching, so this
+  single rule covers all three endpoints — `instructions` becomes an exact system
+  turn. This removes the cross-key / cross-model / cross-param / cross-system-prompt
+  / cross-history false-hit class entirely by construction — the remaining risk is
+  purely a paraphrase of the final user turn.
 - **Cosine threshold, default `0.95`.** Chosen from the research survey (Redis
   ≈0.90, LiteLLM 0.80, GPTCache 0.92, respan measured ~1–3% false-positive at
   0.95 vs 3–7% at 0.93). The broker is a **multi-tenant gateway with no built-in
@@ -78,8 +97,16 @@ there is no fuzzy-text benefit and the exact cache already covers it).
 - **Deterministic-only by default** (shares `BROKER_RESPONSE_CACHE_DETERMINISTIC_ONLY`).
 - **Backed by the ADR 0009 StateStore** (`kv_*`): per-bucket JSON list of
   `(embedding, response)` entries, bounded by `BROKER_SEMANTIC_CACHE_MAX_ENTRIES`
-  (default 128, per bucket) with its own TTL (`BROKER_SEMANTIC_CACHE_TTL_SECONDS`).
-  In-process by default, Redis when configured (shared across replicas).
+  (default 128, per bucket) **and the number of buckets bounded by
+  `BROKER_SEMANTIC_CACHE_MAX_BUCKETS`** (default 1024, LRU) so a caller varying
+  non-prompt params cannot grow the keyspace without limit, each with its own TTL
+  (`BROKER_SEMANTIC_CACHE_TTL_SECONDS`). In-process by default, Redis when
+  configured (shared across replicas).
+- **Store only under the served model.** The bucket is keyed on the model resolved
+  *before* serving; a cascade may escalate to a different model. The response is
+  stored **only when the served model equals the keyed model** — otherwise the
+  store is skipped and counted (`skipped_model_mismatch`), so a later request that
+  resolves to the primary is never served an answer a different model produced.
 - **Header.** A semantic hit returns `x-broker-cache: semantic-hit` (distinct
   from the exact `hit`), plus `x-broker-cache-similarity: <score>`.
 - **Never across scopes.** Enforced by the bucket key; tested with different
@@ -100,8 +127,17 @@ assembled stream is never stored. Streaming responses now also carry the
 
 ### 3. Per-request cache controls
 
-- **Adopt `x-broker-cache-ttl: <seconds>`** — overrides the write TTL for this
-  request's stored entry (validated ≥0; 0 = no TTL).
+- **Adopt `x-broker-cache-ttl: <seconds>`** — clamps the write TTL for this
+  request's stored entry. It must be **finite** and `>= 0` and may only **shorten**
+  the operator TTL (`BROKER_RESPONSE_CACHE_TTL_SECONDS` /
+  `BROKER_SEMANTIC_CACHE_TTL_SECONDS`): the effective TTL is `min(request, operator)`
+  when the operator TTL is finite, else the request value (a finite request TTL
+  still bounds an otherwise-unbounded operator entry). `0` means **do not store this
+  response** (never "store forever"); non-finite values (`nan`/`inf`/`-inf`, and
+  overflowing literals such as `1e400`) and negatives are rejected with `400`. A
+  client therefore can never store a non-expiring entry or extend one beyond the
+  operator's ceiling, and every Redis write carries a finite TTL whenever the
+  operator TTL is finite.
 - **Adopt `x-broker-cache-namespace: <token>`** — folded into the cache scope
   (after key/tenant + placement) so a caller can partition or cheaply invalidate
   their own cache by rotating the namespace. Charset-validated.
@@ -177,15 +213,31 @@ private `[dev,otel]` venv):
   different keys, placements, and sampling/tools params (never a cross-scope
   semantic hit); `semantic-hit` + `x-broker-cache-similarity` headers;
   deterministic-only default; disabled = pass-through; bounded index eviction and
-  TTL.
+  TTL. **Follow-up:** `bucket_key` separates differing **system prompts** and
+  **histories** (same last turn → different bucket) while a reworded last user turn
+  shares a bucket; non-text content parts stay exact; `query_text` embeds only the
+  last user turn; a stub embedder returning identical vectors proves differing
+  system prompts / histories always MISS while a reworded last turn HITs; the
+  **number of buckets** is LRU-bounded (`MAX_BUCKETS`).
 - `tests/test_cache_streaming.py` — a non-streaming request populates the cache;
   a subsequent `stream: true` request for chat / completions / responses returns
   a **well-formed SSE replay** (`chat.completion.chunk` / `text_completion` /
   `response.*` events + `[DONE]`) with `x-broker-cache: hit`; a streaming miss
   never stores; semantic streaming replay.
-- `tests/test_cache_controls.py` — `x-broker-cache-ttl` overrides the write TTL;
-  `x-broker-cache-namespace` isolates and invalidates; `Cache-Control: max-age=0`
-  bypasses; a rejected `s-maxage` directive does not change behavior.
+- `tests/test_cache_controls.py` — `x-broker-cache-ttl` clamps the write TTL;
+  **follow-up:** non-finite / overflowing TTLs (`nan`/`inf`/`-inf`/`1e400`/400
+  digits) → `400`; `0` does not store (never forever); a huge finite override is
+  clamped to the operator ceiling; `_clamp_ttl` only shortens. `x-broker-cache-namespace`
+  isolates and invalidates; `Cache-Control: max-age=0` bypasses; a rejected
+  `s-maxage` directive does not change behavior.
+- `tests/test_cache_model_scope.py` — **follow-up (GAP 3):** a cascade escalation
+  to a different model is **not stored** (`skipped_model_mismatch`, a second
+  identical request still misses), while a clean cascade that stays on the primary
+  stores and hits.
+- `tests/test_cache_redis_ttl.py` — **follow-up:** against a fake Redis backend
+  every write carries a **finite** TTL within the operator ceiling (huge override
+  clamped), the default TTL is finite, and `x-broker-cache-ttl: 0` stores nothing
+  (skipped unless the `[redis]` extra + `fakeredis` are present).
 - `tests/test_tracing_content.py` — content capture **off by default** (no span
   carries messages); **on** when `BROKER_TRACING_CAPTURE_CONTENT=true` the
   `inference` span carries truncated `gen_ai.input.messages` /

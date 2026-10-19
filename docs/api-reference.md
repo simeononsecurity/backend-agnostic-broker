@@ -302,9 +302,12 @@ are never cached. See [configuration.md](configuration.md#response-cache-adr-001
 When the semantic cache is enabled (`BROKER_SEMANTIC_CACHE_ENABLED`), a response
 served from the embedding-similarity layer (after an exact miss) carries
 `x-broker-cache: semantic-hit` plus **`x-broker-cache-similarity`** (the cosine
-score, e.g. `0.9873`). Only the prompt text is matched fuzzily — key/tenant,
-placement, namespace, resolved model, endpoint, and all non-prompt params must
-match exactly, so a semantic hit never crosses a scope.
+score, e.g. `0.9873`). Only the **last user turn's text** is matched fuzzily —
+key/tenant, placement, namespace, resolved model, endpoint, all non-prompt params,
+**the system prompt, and the whole conversation history** must match exactly, so a
+semantic hit never crosses a scope, system prompt, or history boundary. The layer
+stores only when the served model equals the keyed model (a cascade escalation to
+another model is not stored).
 
 **Streaming requests** (`stream: true`) now also consult the cache: on a hit the
 broker returns a well-formed SSE replay (`chat.completion.chunk` /
@@ -315,7 +318,7 @@ instead of bypassing. Only non-streaming responses *populate* the cache.
 
 | Header | Effect |
 |--------|--------|
-| `x-broker-cache-ttl: <seconds>` | Override this request's stored-entry TTL (`>= 0`; `0` = no TTL). |
+| `x-broker-cache-ttl: <seconds>` | Clamp this request's stored-entry TTL. Finite, `>= 0`; may only **shorten** the operator TTL (`BROKER_RESPONSE_CACHE_TTL_SECONDS` / `BROKER_SEMANTIC_CACHE_TTL_SECONDS`). `0` = do not store this response. Non-finite (`nan`/`inf`/`-inf`, overflowing literals like `1e400`) or negative → `400`. |
 | `x-broker-cache-namespace: <token>` | Partition the caller's cache scope (rotate to invalidate). Charset: letters/digits/`.`/`-`/`_`/`:`. |
 | `Cache-Control: max-age=0` | Bypass (same as `no-cache`). |
 

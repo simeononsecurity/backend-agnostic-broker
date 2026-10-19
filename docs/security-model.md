@@ -134,18 +134,35 @@ sharing one Redis.
 
 The semantic cache (off by default) inherits the same scope-first isolation: its
 bucket key hashes the caller's key/tenant + placement + namespace scope **and**
-the resolved model, endpoint, and every non-prompt parameter, so only the prompt
-*text* is matched fuzzily and a semantic hit can **never** cross a key, tenant,
-placement, model, or parameter boundary. The residual risk is a *false positive*
-— two different prompts within one scope whose embeddings are close enough to
-share an answer. This is mitigated by a high default cosine threshold (**0.95**,
-precision-favoring per the research survey) and the deterministic-only default;
-raise the threshold toward `0.99` to further reduce false hits (lower hit rate),
-or lower it only after measuring your own false-positive rate. Stored embeddings
-and response bodies live in the StateStore — treat them as confidential as the
-responses. The embedding model is the broker's own registry alias; with
-`BROKER_SEMANTIC_CACHE_REQUIRE_RESIDENT=true` (default) a chat request never loads
-it, preserving the lazy-load invariant.
+the resolved model, endpoint, every non-prompt parameter, **the system prompt, and
+the full conversation history**, so only the *last user turn's text* is matched
+fuzzily and a semantic hit can **never** cross a key, tenant, placement, model,
+parameter, system-prompt, or history boundary. (An earlier revision embedded the
+whole message list, so a shared long history could push similarity over the
+threshold and leak an answer across differing system prompts/histories — now
+fixed: see ADR 0014 Confirmation.) The residual risk is a *false positive* — two
+different last-turn prompts within one identical scope+context whose embeddings are
+close enough to share an answer. This is mitigated by a high default cosine
+threshold (**0.95**, precision-favoring per the research survey) and the
+deterministic-only default; raise the threshold toward `0.99` to further reduce
+false hits (lower hit rate), or lower it only after measuring your own
+false-positive rate.
+
+**Bounded growth / client-controlled TTL.** A per-request `x-broker-cache-ttl` may
+only *shorten* the operator TTL and must be finite and `>= 0` (`0` = do not store,
+non-finite → `400`), so an API-key holder cannot store entries that never expire or
+override the operator's ceiling. Every write carries a finite TTL whenever the
+operator TTL is finite. The semantic index is bounded on both axes — entries per
+bucket (`MAX_ENTRIES`) **and** the number of buckets (`MAX_BUCKETS`, LRU) — so a
+caller varying non-prompt params cannot grow Redis without limit. The cache also
+stores only under the **served** model: a cascade escalation to a different model
+is not stored (it would otherwise serve a later primary-routed request a foreign
+model's answer).
+
+Stored embeddings and response bodies live in the StateStore — treat them as
+confidential as the responses. The embedding model is the broker's own registry
+alias; with `BROKER_SEMANTIC_CACHE_REQUIRE_RESIDENT=true` (default) a chat request
+never loads it, preserving the lazy-load invariant.
 
 ## Span content capture (ADR 0014) — PII risk
 

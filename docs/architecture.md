@@ -79,12 +79,13 @@ auto/cascade — `/v1/embeddings`):
    normalized payload + sampling + tools)* is looked up; an exact hit returns
    immediately with `x-broker-cache: hit` and no inference. On an exact miss, if
    the **semantic cache** (ADR 0014) is enabled and its embedding model is already
-   **resident**, the prompt text is embedded and matched (cosine ≥ threshold)
-   within the same strict non-prompt bucket → `x-broker-cache: semantic-hit` +
-   `x-broker-cache-similarity`. **Streaming** hits are replayed as well-formed SSE.
-   Bypass via `Cache-Control: no-cache`/`no-store`/`max-age=0` or
-   `x-broker-cache: bypass`; per-request `x-broker-cache-ttl` /
-   `x-broker-cache-namespace` tune storage/scope.
+   **resident**, the last user turn's text is embedded and matched (cosine ≥
+   threshold) within the same strict non-prompt bucket → `x-broker-cache:
+   semantic-hit` + `x-broker-cache-similarity`. **Streaming** hits are replayed as
+   well-formed SSE. Bypass via `Cache-Control: no-cache`/`no-store`/`max-age=0` or
+   `x-broker-cache: bypass`; per-request `x-broker-cache-ttl` (finite; only shortens
+   the operator TTL; `0` = do not store) / `x-broker-cache-namespace` tune
+   storage/scope.
 6. **Resolve + auto/cascade (ADR 0011)** — for `auto`, the `AutoRouter` picks a
    concrete public model or a two-hop **cascade** plan (serve cheap, escalate once
    on a quality signal). The resolved model — and each cascade hop — is re-checked
@@ -189,18 +190,23 @@ routing state, so it is in-process by default or shared via Redis.
 `broker/cache.py` (`SemanticCache`) is a second, opt-in layer the API consults
 **after an exact miss** for chat/completions/responses. It partitions stored
 responses into **buckets** keyed by every *non-prompt* field (scope, resolved
-model, endpoint, sampling/tools/`response_format`/..., plus namespace), so only
-the prompt text is fuzzy — a semantic hit can never cross a scope, model, or
-param. Within a bucket it embeds the prompt via the broker's own `/v1/embeddings`
-path and compares to each stored embedding by **pure-Python cosine** (no numpy),
-returning the best match ≥ threshold (default 0.95). To honor lazy loading, the
-API embeds/consults **only when the embedding model is already resident**
-(`manager.is_resident`), so a chat request never silently loads an extra model
-(`BROKER_SEMANTIC_CACHE_REQUIRE_RESIDENT=false` opts out). Only non-streaming
-responses populate either cache; a **streaming** hit is replayed as a well-formed
-SSE stream (`openai_compat.chat_result_to_sse_chunks` fed through the existing
-text/Responses translators). Per-request `x-broker-cache-ttl` and
-`x-broker-cache-namespace` tune storage and scope; `max-age=0` is a bypass;
+model, endpoint, sampling/tools/`response_format`/..., namespace, **the system
+prompt, and the whole conversation history**), so only the **last user turn's
+text** is fuzzy — a semantic hit can never cross a scope, model, param, system
+prompt, or history boundary. The bucket count is bounded globally
+(`BROKER_SEMANTIC_CACHE_MAX_BUCKETS`, LRU) alongside the per-bucket entry bound.
+Within a bucket it embeds that last-turn text via the broker's own
+`/v1/embeddings` path and compares to each stored embedding by **pure-Python
+cosine** (no numpy), returning the best match ≥ threshold (default 0.95). To honor
+lazy loading, the API embeds/consults **only when the embedding model is already
+resident** (`manager.is_resident`), so a chat request never silently loads an
+extra model (`BROKER_SEMANTIC_CACHE_REQUIRE_RESIDENT=false` opts out). Only
+non-streaming responses populate either cache, and only under the **served** model
+(a cascade escalation to a different model is not stored); a **streaming** hit is
+replayed as a well-formed SSE stream (`openai_compat.chat_result_to_sse_chunks`
+fed through the existing text/Responses translators). Per-request
+`x-broker-cache-ttl` (finite, only shortens the operator TTL; `0` = do not store)
+and `x-broker-cache-namespace` tune storage and scope; `max-age=0` is a bypass;
 `s-maxage`/request `max-age>0` freshness are rejected (no stored-age/revalidation).
 When `BROKER_TRACING_CAPTURE_CONTENT` is set, the `inference` span additionally
 carries truncated `gen_ai.input.messages`/`gen_ai.output.messages` (OTel GenAI
