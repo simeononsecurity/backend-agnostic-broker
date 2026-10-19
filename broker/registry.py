@@ -282,6 +282,14 @@ class RouterWeights(BaseModel):
     cost: float = 1.0
     prefer_loaded: float = 1.0
     priority: float = 1.0
+    # When true (ADR 0019 opt-in), the cost term in the heuristic score is
+    # normalized to [0, 1]·cost so one capability match always outweighs price.
+    # Default is FALSE = the v0.5.0 un-normalized term ``(5 - cost_tier)·cost``,
+    # because on the orchestrator's independent prompt set the normalized term
+    # produced IDENTICAL accuracy (it only lifted the author's in-sample sets), so
+    # the unjustified default change is reverted and the behavior is opt-in. See
+    # docs/auto-router.md / ADR 0019.
+    cost_normalized: bool = False
 
 
 class ScorerConfig(BaseModel):
