@@ -20,6 +20,8 @@ htmlcov/
 
 # Local registry with real paths/hosts (ship only the example)
 registry.yaml
+# ...but DO ship example registries that use only the offline fake backend.
+!examples/**/registry.yaml
 
 # Virtual API keys — hashed secrets, local-only (ship only keys.example.yaml)
 keys.yaml

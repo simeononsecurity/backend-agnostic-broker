@@ -46,6 +46,11 @@ broker = "broker.__main__:main"
 [tool.setuptools.packages.find]
 include = ["broker*"]
 
+# Ship the optional web UI (ADR 0015) as package data: plain, pre-built static
+# files (no build toolchain at install or runtime). Served only when enabled.
+[tool.setuptools.package-data]
+broker = ["ui/static/*", "ui/static/**/*"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

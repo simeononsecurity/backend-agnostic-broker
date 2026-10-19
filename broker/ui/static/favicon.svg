@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="broker">
+  <rect width="32" height="32" rx="6" fill="#11151c"/>
+  <rect x="6" y="6" width="9" height="20" rx="2" fill="#4ea1ff"/>
+  <rect x="17" y="6" width="9" height="20" rx="2" fill="#2a3341"/>
+</svg>

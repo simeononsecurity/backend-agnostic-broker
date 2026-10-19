@@ -58,6 +58,7 @@ from .openai_compat import (
 )
 from .registry import load_registry
 from .security import reject_request_flags
+from .ui import register_ui
 from .usage import UsageLog
 
 log = logging.getLogger("broker.app")
@@ -1141,5 +1142,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def broker_error_handler(request: Request, exc: BrokerError):
         rid = getattr(request.state, "request_id", "unknown")
         return err_response(exc, rid)
+
+    # --- Optional static web UI / playground (ADR 0015) ------------------
+    # Registered LAST and only when BROKER_UI_ENABLED. Serves hardened static
+    # assets at /ui with a strict CSP; adds no new unauthenticated data routes.
+    # Disabled (the default) -> /ui 404s.
+    register_ui(app, settings)
 
     return app

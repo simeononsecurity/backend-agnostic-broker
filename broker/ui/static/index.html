@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
+  <title>backend-agnostic-broker · playground</title>
+  <link rel="icon" href="/ui/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/ui/styles.css" />
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">◧</span>
+      <h1>broker playground</h1>
+    </div>
+    <div class="conn-status" id="conn-status" role="status" aria-live="polite">
+      <span class="dot" id="conn-dot" aria-hidden="true"></span>
+      <span id="conn-text">not connected</span>
+    </div>
+  </header>
+
+  <section class="connect-panel" aria-label="Connection">
+    <form id="connect-form" autocomplete="off">
+      <div class="field">
+        <label for="base-url">Broker base URL</label>
+        <input id="base-url" name="base-url" type="text" inputmode="url"
+               spellcheck="false" placeholder="(same origin)" />
+      </div>
+      <div class="field">
+        <label for="api-key">API key</label>
+        <input id="api-key" name="api-key" type="password" autocomplete="off"
+               spellcheck="false" placeholder="Bearer key (kept in memory only)" />
+      </div>
+      <div class="field">
+        <label for="admin-key">Admin key <span class="muted">(optional)</span></label>
+        <input id="admin-key" name="admin-key" type="password" autocomplete="off"
+               spellcheck="false" placeholder="unlocks the admin panel" />
+      </div>
+      <div class="field field-actions">
+        <button type="submit" id="connect-btn">Connect</button>
+        <button type="button" id="forget-btn" class="secondary">Forget keys</button>
+      </div>
+    </form>
+    <p class="note" id="key-note">
+      Keys are held in this tab's memory only — never written to localStorage,
+      sessionStorage, or cookies. Reloading the page clears them.
+    </p>
+  </section>
+
+  <nav class="tabs" id="tabs" aria-label="Views">
+    <button class="tab" data-tab="models" aria-selected="true">Models</button>
+    <button class="tab" data-tab="chat">Chat</button>
+    <button class="tab" data-tab="completions">Completions</button>
+    <button class="tab" data-tab="responses">Responses</button>
+    <button class="tab" data-tab="embeddings">Embeddings</button>
+    <button class="tab" data-tab="rerank" hidden>Rerank</button>
+    <button class="tab" data-tab="status">Status</button>
+    <button class="tab" data-tab="usage">Usage</button>
+    <button class="tab" data-tab="admin" hidden>Admin</button>
+  </nav>
+
+  <main id="main">
+    <div class="banner" id="banner" role="alert" hidden></div>
+
+    <!-- Models -->
+    <section class="panel" id="panel-models" aria-label="Models">
+      <div class="panel-head">
+        <h2>Models</h2>
+        <button type="button" class="secondary" data-action="refresh-models">Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table id="models-table">
+          <thead>
+            <tr><th scope="col">ID</th><th scope="col">Backend</th>
+                <th scope="col">Capabilities</th><th scope="col">Pool / candidates</th>
+                <th scope="col">Context</th></tr>
+          </thead>
+          <tbody id="models-body"></tbody>
+        </table>
+      </div>
+      <p class="muted" id="models-empty" hidden>No models — connect first.</p>
+    </section>
+
+    <!-- Chat -->
+    <section class="panel" id="panel-chat" hidden aria-label="Chat playground">
+      <h2>Chat playground</h2>
+      <div class="row">
+        <div class="field">
+          <label for="chat-model">Model</label>
+          <input id="chat-model" list="model-list" value="auto" spellcheck="false" />
+        </div>
+        <div class="field">
+          <label for="chat-temp">Temperature</label>
+          <input id="chat-temp" type="number" min="0" max="2" step="0.1" value="0" />
+        </div>
+        <div class="field checkbox">
+          <input id="chat-stream" type="checkbox" checked />
+          <label for="chat-stream">Stream (SSE)</label>
+        </div>
+      </div>
+      <div class="field">
+        <label for="chat-system">System prompt <span class="muted">(optional)</span></label>
+        <textarea id="chat-system" rows="2"></textarea>
+      </div>
+      <div class="field">
+        <label for="chat-input">Message</label>
+        <textarea id="chat-input" rows="4" placeholder="Ask something…"></textarea>
+      </div>
+      <div class="field-actions">
+        <button type="button" data-action="chat-send">Send</button>
+        <button type="button" class="secondary" data-action="chat-clear">Clear</button>
+      </div>
+      <div class="meta-line" id="chat-meta" aria-live="polite"></div>
+      <pre class="output" id="chat-output" tabindex="0" aria-label="Chat output"></pre>
+    </section>
+
+    <!-- Completions -->
+    <section class="panel" id="panel-completions" hidden aria-label="Completions">
+      <h2>Completions</h2>
+      <div class="row">
+        <div class="field">
+          <label for="comp-model">Model</label>
+          <input id="comp-model" list="model-list" value="auto" spellcheck="false" />
+        </div>
+        <div class="field checkbox">
+          <input id="comp-stream" type="checkbox" checked />
+          <label for="comp-stream">Stream</label>
+        </div>
+      </div>
+      <div class="field">
+        <label for="comp-input">Prompt</label>
+        <textarea id="comp-input" rows="4"></textarea>
+      </div>
+      <div class="field-actions"><button type="button" data-action="comp-send">Send</button></div>
+      <div class="meta-line" id="comp-meta" aria-live="polite"></div>
+      <pre class="output" id="comp-output" tabindex="0" aria-label="Completions output"></pre>
+    </section>
+
+    <!-- Responses -->
+    <section class="panel" id="panel-responses" hidden aria-label="Responses">
+      <h2>Responses</h2>
+      <div class="row">
+        <div class="field">
+          <label for="resp-model">Model</label>
+          <input id="resp-model" list="model-list" value="auto" spellcheck="false" />
+        </div>
+        <div class="field checkbox">
+          <input id="resp-stream" type="checkbox" checked />
+          <label for="resp-stream">Stream</label>
+        </div>
+      </div>
+      <div class="field">
+        <label for="resp-input">Input</label>
+        <textarea id="resp-input" rows="4"></textarea>
+      </div>
+      <div class="field-actions"><button type="button" data-action="resp-send">Send</button></div>
+      <div class="meta-line" id="resp-meta" aria-live="polite"></div>
+      <pre class="output" id="resp-output" tabindex="0" aria-label="Responses output"></pre>
+    </section>
+
+    <!-- Embeddings -->
+    <section class="panel" id="panel-embeddings" hidden aria-label="Embeddings">
+      <h2>Embeddings</h2>
+      <div class="row">
+        <div class="field">
+          <label for="emb-model">Model</label>
+          <input id="emb-model" list="model-list" spellcheck="false" />
+        </div>
+      </div>
+      <div class="field">
+        <label for="emb-input">Input (one item per line)</label>
+        <textarea id="emb-input" rows="4"></textarea>
+      </div>
+      <div class="field-actions"><button type="button" data-action="emb-send">Embed</button></div>
+      <div class="meta-line" id="emb-meta" aria-live="polite"></div>
+      <pre class="output" id="emb-output" tabindex="0" aria-label="Embeddings output"></pre>
+    </section>
+
+    <!-- Rerank (hidden unless /v1/rerank exists) -->
+    <section class="panel" id="panel-rerank" hidden aria-label="Rerank">
+      <h2>Rerank</h2>
+      <div class="row">
+        <div class="field">
+          <label for="rr-model">Model</label>
+          <input id="rr-model" list="model-list" spellcheck="false" />
+        </div>
+      </div>
+      <div class="field">
+        <label for="rr-query">Query</label>
+        <input id="rr-query" type="text" />
+      </div>
+      <div class="field">
+        <label for="rr-docs">Documents (one per line)</label>
+        <textarea id="rr-docs" rows="4"></textarea>
+      </div>
+      <div class="field-actions"><button type="button" data-action="rr-send">Rerank</button></div>
+      <div class="meta-line" id="rr-meta" aria-live="polite"></div>
+      <pre class="output" id="rr-output" tabindex="0" aria-label="Rerank output"></pre>
+    </section>
+
+    <!-- Status -->
+    <section class="panel" id="panel-status" hidden aria-label="Status">
+      <div class="panel-head">
+        <h2>Status</h2>
+        <button type="button" class="secondary" data-action="refresh-status">Refresh</button>
+      </div>
+      <pre class="output" id="status-output" tabindex="0" aria-label="Status output"></pre>
+    </section>
+
+    <!-- Usage -->
+    <section class="panel" id="panel-usage" hidden aria-label="Usage">
+      <div class="panel-head">
+        <h2>Usage</h2>
+        <button type="button" class="secondary" data-action="refresh-usage">Refresh</button>
+      </div>
+      <pre class="output" id="usage-output" tabindex="0" aria-label="Usage output"></pre>
+    </section>
+
+    <!-- Admin (gated by admin key) -->
+    <section class="panel" id="panel-admin" hidden aria-label="Admin">
+      <div class="panel-head">
+        <h2>Admin control plane</h2>
+        <button type="button" class="secondary" data-action="refresh-admin">Refresh</button>
+      </div>
+      <p class="note">Destructive actions prompt for confirmation. Requires an admin key.</p>
+      <div class="field-actions">
+        <button type="button" class="secondary" data-action="admin-reload">Reload registry</button>
+      </div>
+      <div class="table-wrap">
+        <table id="admin-table">
+          <thead>
+            <tr><th scope="col">Alias</th><th scope="col">State</th>
+                <th scope="col">In-flight</th><th scope="col">Actions</th></tr>
+          </thead>
+          <tbody id="admin-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <datalist id="model-list"></datalist>
+
+  <footer class="footer">
+    <span class="muted">Offline operator playground · all requests stay same-origin · no telemetry</span>
+  </footer>
+
+  <script src="/ui/app.js" type="module"></script>
+</body>
+</html>
