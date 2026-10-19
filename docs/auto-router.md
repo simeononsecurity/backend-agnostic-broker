@@ -113,7 +113,10 @@ build must too.
 # registry.yaml
 router:
   default: small-chat            # deterministic fallback
-  weights: { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0 }
+  # capability/cost/prefer_loaded/priority weights, plus cost_normalized (ADR 0019,
+  # default false = v0.5.0: cost can outweigh capability; set true to make a single
+  # capability match always beat price — see "Honest accuracy" §4).
+  weights: { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0, cost_normalized: false }
   overrides:
     - when: { has_images: true }      # always send images to the vision model
       use: llava
@@ -300,52 +303,91 @@ python scripts/router_eval.py --backend llm   # use the GGUF classifier
 ```
 
 A CI run of the harness on the heuristic backend over the bundled **82-prompt
-train** set (`tests/data/router_eval.jsonl`) with the improved ADR 0019 heuristic:
+train** set (`tests/data/router_eval.jsonl`, in-sample) with the ADR 0019
+structural heuristic:
 
 | Direct metric | Value |
 |---------------|-------|
 | Prompts | 82 |
-| Accuracy (chosen is acceptable) | 1.000 |
-| Cheapest-capable accuracy | 0.842 |
-| Mean cost_tier (router) | 2.878 |
+| Accuracy (chosen is acceptable) | 0.976 |
+| Cheapest-capable accuracy | 0.817 |
+| Mean cost_tier (router) | 2.829 |
 | Mean cost_tier (oracle / cheapest-capable) | 2.573 |
 | Router strong-call fraction (top tier) | 0.146 |
 
 | RouteLLM metric | Router curve | Oracle upper bound |
 |-----------------|--------------|--------------------|
 | r(M_w) / r(M_s) | 0.220 / 1.000 | — |
-| PGR (operating point) | 1.000 | — |
-| APGR | 0.789 | 0.834 |
-| CPT(50%) | 0.335 | — |
-| CPT(80%) | 0.335 | — |
+| PGR (operating point) | 0.969 | — |
+| APGR | 0.766 | 0.834 |
+| CPT(50%) | 0.457 | 0.159 |
+| CPT(80%) | 0.457 | 0.283 |
 
-#### ADR 0019 code/math improvement — before vs after (train and frozen held-out)
+The operating-point PGR is **0.969 — strictly below 1.0**: the heuristic does *not*
+saturate even its own tuning set. (An earlier iteration of ADR 0019 reached a
+saturated PGR = 1.000 here by over-fitting keyword lists to the data; that was a
+red flag, not a win — see below.)
 
-The heuristic's cost term is now **normalized** so it is a tie-breaker that cannot
-outweigh a single capability match, and the greedy `"write a"` creative keyword was
-removed (it mis-tagged code prompts). The labeled set grew to **82 train** prompts
-plus a **frozen 24-prompt held-out** split (`tests/data/router_eval_heldout.jsonl`)
-that is **not used for tuning**. Per-task accuracy, old heuristic → new heuristic:
+#### Honest accuracy — three prompt sets, by independence (ADR 0019 follow-up)
 
-| Task | Train before | Train after | Held-out before | Held-out after |
-|------|--------------|-------------|-----------------|----------------|
-| code | 0.636 | **1.000** | 0.500 | **1.000** |
-| math | 0.091 | **1.000** | 0.000 | **1.000** |
-| chat | 1.000 | 1.000 | 1.000 | 1.000 |
-| reasoning | 0.833 | 1.000 | 1.000 | 1.000 |
-| creative | 1.000 | 1.000 | 1.000 | 1.000 |
-| tools / json | 1.000 | 1.000 | 1.000 | 1.000 |
-| vision / long-context | 1.000 | 1.000 | 1.000 | 1.000 |
-| **overall accuracy** | **0.768** | **1.000** | 0.792 | **1.000** |
+> **Keyword heuristics generalize poorly.** A small keyword + structural scorer
+> like this one is a cheap, offline, CI-safe *default*, **not** a strong
+> classifier. For reliable code / math / reasoning routing use the **LLM router
+> backend** (`router_backend: llm`, a tiny GGUF — see §2) or the **calibrated
+> cascade** (serve cheap, verify the real answer, escalate), which inspect far
+> more signal than any word list. The numbers below are measured, not aspired to.
 
-No held-out task regresses (every task is flat or improves); code and math rise
-sharply on both splits. The accuracy thresholds are pinned by
-`tests/test_router_v2.py` (code ≥ 0.90 / 0.80, math ≥ 0.90 / 0.80 on train /
-held-out), and the held-out split is enforced disjoint-from-train by a test. The
-cost of capability-first routing is a higher mean cost_tier (2.57 → 2.88 on train);
+Three sets, labeled by how independent they are from the tuning:
+
+- **Train** (`tests/data/router_eval.jsonl`, 82) — the set the heuristic was tuned
+  against. **In-sample**; an optimistic upper bound.
+- **Author held-out** (`tests/data/router_eval_heldout.jsonl`, 24) — written by the
+  same author in the **same commit** with the **same vocabulary**. It is *adjacent*
+  to the training data, **not independent**; it saturates and should be read as
+  such, not as validation.
+- **Independent** (`tests/data/router_eval_independent.jsonl`, 44) — written
+  separately by the orchestrator, disjoint phrasing and vocabulary. **This is the
+  only set that measures generalization.**
+
+Per-task accuracy, v0.5.0 heuristic → ADR 0019 structural heuristic:
+
+| Task | Train v0.5.0 → now | Author held-out v0.5.0 → now | **Independent** v0.5.0 → now |
+|------|--------------------|------------------------------|------------------------------|
+| code | 0.636 → **0.955** | 0.500 → 1.000 | 0.250 → **0.917** |
+| math | 0.091 → **1.000** | 0.000 → 1.000 | 0.100 → **0.900** |
+| reasoning | 0.833 → 0.833 | 1.000 → 1.000 | 0.000 → **1.000** |
+| chat | 1.000 → 1.000 | 1.000 → 1.000 | 1.000 → 1.000 |
+| creative | 1.000 → 1.000 | 1.000 → 1.000 | 1.000 → 1.000 |
+| tools / json | 1.000 → 1.000 | 1.000 → 1.000 | — (not in set) |
+| vision / long-context | 1.000 → 1.000 | 1.000 → 1.000 | — (not in set) |
+| **overall** | 0.768 → **0.976** | 0.667 → 1.000 | 0.386 → **0.955** |
+
+Read the **Independent** column: code/math/reasoning rise from near-zero to
+0.9+ on prompts the heuristic never saw, and no protected task type (chat,
+creative, tools, json, vision, long-context) drops below v0.5.0. Train and
+Independent are now **close** (0.976 vs 0.955) — the signature of genuine
+generalization. (A previous ADR 0019 iteration scored Train 1.000 / Independent
+0.43 — a large gap that is the classic sign of over-fitting; it reported a
+"perfect" held-out 1.000 that did **not** hold on independent prompts.)
+
+**How it generalizes: structure, not vocabulary.** Instead of growing keyword
+lists, the scorer reads the *shape* of a request (`broker/router.py`): code-like
+punctuation / file extensions / CLI-tool & language names / error shapes; digits
+glued to operators, fractions, and `prime`/`roots`/`sum of`/probability phrasings
+for math; and `why`/`prove`/`plan`/`trade-off`, syllogisms, and long
+multi-constraint questions for reasoning. Each feature has a unit test over
+prompts that appear in no eval set (`tests/test_router_v2.py`). The one vocabulary
+change is a **deletion**: the greedy `"write a"` creative keyword (a generic
+instruction prefix) was removed because it mis-stole `"write a python function …"`
+code prompts for the cheap generalist.
+
+The accuracy floors are pinned by `tests/test_router_v2.py`: in-sample PGR **< 1.0**
+(not saturated), and on the independent set **code ≥ 0.6, math ≥ 0.5,
+reasoning ≥ 0.3**, with chat/creative no lower than v0.5.0. The independent set is
+frozen and enforced disjoint from both train and the author held-out split. The
+cost of capability-first routing is a higher mean cost_tier (2.57 → 2.83 on train);
 the swept cost–quality curve still spans the full range, so APGR/CPT stay
-meaningful (lowering `router.weights.cost` no longer *raises* accuracy — the default
-operating point already reaches the ceiling on this set).
+meaningful.
 
 #### What the metrics mean (and the limits of label-based evaluation)
 
@@ -367,7 +409,10 @@ operating point already reaches the ceiling on this set).
 - **No silent clamping.** PGR is reported raw; if the quality gap
   `r(M_s) − r(M_w) ≤ 0`, or a value is out of `[0, 1]`, the metric is marked
   `invalid` with a reason in both the markdown and JSON output.
-- **Limitations.** Numbers are only as good as the labels: small set (45),
-  hand-labeled capability (not human-graded quality), and a synthetic 6-model
-  catalogue. Treat them as a regression signal for routing *changes*, not an
-  absolute quality score. The LLM backend and real registries will shift them.
+- **Limitations.** Numbers are only as good as the labels: a small hand-labeled
+  set (82 train + 24 author held-out + 44 independent), capability labels (not
+  human-graded quality), and a synthetic 6-model catalogue. A keyword + structural
+  heuristic generalizes only partially — the **Independent** column is the number
+  to trust, and it is well below the in-sample set. Treat these as a regression
+  signal for routing *changes*, not an absolute quality score, and prefer the LLM
+  router backend or the cascade for hard code/math/reasoning routing.

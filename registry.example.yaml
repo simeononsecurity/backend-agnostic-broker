@@ -28,8 +28,13 @@ router:
   # Heuristic-backend scoring weights (also used on LLM fallback). Capability
   # match dominates by default; raise `cost` to push cheaper models harder,
   # `prefer_loaded` to favor already-loaded models, `priority` to weight each
-  # model's `priority` field.
-  weights: { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0 }
+  # model's `priority` field. `cost_normalized` (default false = v0.5.0) keeps
+  # the cost term un-normalized: a large price gap can outweigh a single
+  # capability match. Set it true (ADR 0019 opt-in) to normalize the cost term to
+  # [0,1]·cost so one capability match always wins over price — note this changed
+  # NOTHING on the orchestrator's independent eval set, so it is left opt-in.
+  weights:
+    { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0, cost_normalized: false }
 
   # --- Cascade mode (opt-in; ADR 0011 + 0019) --------------------------------
   # "single" (default) = one-shot classification. "cascade" = serve the cheapest

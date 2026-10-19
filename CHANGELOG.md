@@ -27,13 +27,27 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     stream or **streams the stronger hop live** — never mixing two models' output in
     one stream. Default `fallback_single` (= v0.5.0); completions/responses keep
     `fallback_single`.
-  - **Heuristic code/math accuracy.** The cost term is normalized to a true
-    tie-breaker (a cheap generalist no longer outscores the one capable model on a
-    code/math prompt) and the greedy `"write a"` creative keyword was removed. The
-    labeled set grew to **82 train** + a **frozen 24-prompt held-out** split. Per
-    task, before → after: **code 0.64 → 1.00** (held-out 0.50 → 1.00), **math
-    0.09 → 1.00** (held-out 0.00 → 1.00); no held-out task regresses. Thresholds and
-    the frozen split are pinned by tests.
+  - **Heuristic code/math/reasoning accuracy via structural features.** Instead of
+    growing keyword lists (which over-fit — an earlier cut reported a *false*
+    "perfect" 1.0 on the author's own held-out split while scoring code 0.42 /
+    math 0.10 / reasoning 0.00 on independent prompts), the scorer now reads the
+    **structure** of a request: code-like punctuation / file extensions / CLI-tool &
+    language names / error shapes; digit-operator/fraction/`prime`/`sum of` math
+    phrasing; and `why`/`prove`/`plan`/`trade-off`, syllogisms, and long
+    multi-constraint questions. Keyword lists are reverted to v0.5.0 (minus the
+    over-broad `"write a"` creative token). Results are reported **three ways by
+    independence** — 82 train (in-sample), 24 author held-out (same commit/vocabulary,
+    **not** independent), and a **frozen 44-prompt independent** set written by the
+    orchestrator (`tests/data/router_eval_independent.jsonl`). On the independent
+    set, v0.5.0 → now: **code 0.25 → 0.92, math 0.10 → 0.90, reasoning 0.00 → 1.00**;
+    chat/creative unchanged at 1.0. In-sample PGR stays **< 1.0** (not saturated).
+    Keyword heuristics generalize only partially — the docs point to the LLM router
+    backend / cascade for hard routing. Per-feature unit tests, the frozen
+    disjoint independent set, and the honest pins are enforced in tests.
+  - **`router.weights.cost_normalized`** (opt-in, default **false** = v0.5.0). The
+    ADR 0019 normalized-cost term is gated behind this knob because it made **no
+    difference on the independent set** (it only lifted in-sample numbers); the
+    unjustified default change is reverted.
   - Example: `examples/auto-router/` (registry with tags/cost tiers + cascade +
     scorer + buffer + latency budget + placement, a README, and a tested pytest).
 

@@ -23,9 +23,11 @@ two concrete weaknesses it could not yet fix:
 - A **streaming** cascade request fell back to the single strong pick, because a
   live stream cannot be re-scored. Whether a true streaming cascade is worth it was
   left open.
-- The heuristic measured **code 0.60** and **math 0.33** on the 45-prompt set — the
-  cheap-model cost bonus could outweigh a single capability match, and a greedy
-  `"write a"` creative keyword mis-tagged code prompts.
+- The heuristic under-served **code/math/reasoning**: the cheap-model cost bonus
+  could outweigh a single capability match, a greedy `"write a"` creative keyword
+  mis-tagged code prompts, and keyword matching did not fire on natural prompts that
+  shared no word with the lists. (A first cut of this ADR tried to fix this by
+  growing the keyword lists, which **over-fit** — see Decision item 4.)
 
 The tension is unchanged from ADR 0011: add routing intelligence **without** a new
 mandatory dependency, **without** changing default `auto` behavior, and **without**
@@ -71,16 +73,35 @@ left pending, and the two we only partly adopt are explicitly bounded here.
    the first-N-token-commit alternative: a cheap model can open confidently and
    derail later, after the broker has committed to streaming it.
 
-4. **Heuristic code/math accuracy (implemented).** The heuristic's cost term is
-   **normalized** to `[0, 1]·w.cost` so at the default weights it is a true
-   tie-breaker that can never outweigh a single capability match (a cheap generalist
-   no longer beats the one capable model on a code/math prompt); the greedy
-   `"write a"` creative keyword is removed and the `code`/`math` vocabularies are
-   broadened with generically-true terms. The labeled set grows to **82 train**
-   prompts (≥15 code, ≥10 math) plus a **frozen 24-prompt held-out** split
-   (`tests/data/router_eval_heldout.jsonl`) that is **not used for tuning**. The
-   cost sweep still traces the full cost–quality curve, so APGR/CPT remain
-   meaningful.
+4. **Heuristic code/math/reasoning accuracy via structural features (implemented).**
+   Keyword lists memorize vocabulary and generalize poorly: an earlier cut of this
+   ADR grew the `code`/`math` word lists and normalized the cost term until the
+   bundled train and author-written held-out splits scored a **perfect 1.000** — but
+   an independent 44-prompt set the author never saw scored only **code 0.42 /
+   math 0.10 / reasoning 0.00**. That gap is over-fitting, and the "perfect"
+   numbers were not real. The correction: the `code`/`math` vocabularies are
+   **reverted to the v0.5.0 lists** (the one deletion is the over-broad `"write a"`
+   creative token, a generic instruction prefix that mis-stole code prompts), and
+   generalization is carried by **structural features** that read the *shape* of a
+   request, not its exact words (`broker/router.py`): code-like punctuation / file
+   extensions / CLI-tool & language names / error shapes; digits-with-operators,
+   fractions, and `prime`/`roots`/`sum of`/probability phrasing for math; and
+   `why`/`prove`/`plan`/`trade-off`, syllogisms, and long multi-constraint questions
+   for reasoning. Each feature has a unit test over prompts in no eval set. The
+   labeled sets are reported **three ways by independence** — 82 train (in-sample),
+   24 author held-out (same author/commit/vocabulary — **not** independent), and a
+   **frozen 44-prompt independent** set written by the orchestrator
+   (`tests/data/router_eval_independent.jsonl`, attributed). On the independent set,
+   v0.5.0 → now: **code 0.25 → 0.92, math 0.10 → 0.90, reasoning 0.00 → 1.00**, with
+   chat/creative unchanged at 1.0; train/independent are now close (0.98 / 0.96),
+   the signature of real generalization rather than memorization. The in-sample PGR
+   is **0.97 — strictly below the oracle ceiling** (the guard the overfit cut had to
+   loosen). The `cost_normalized` term is retained **as an opt-in** (`router.weights
+   .cost_normalized`, default **false** = v0.5.0) because it made **no difference on
+   the independent set** — it only lifted the author's in-sample numbers. Honest
+   caveat recorded in the docs: a keyword+structural heuristic generalizes only
+   partially; for reliable code/math/reasoning routing prefer the LLM router backend
+   or the calibrated cascade. The cost sweep still traces the full curve.
 
 No new mandatory dependency is introduced; all new behavior is opt-in and
 default-off, and a request with none of the new knobs reproduces v0.5.0 exactly.
@@ -99,9 +120,13 @@ default-off, and a request with none of the new knobs reproduces v0.5.0 exactly.
   chat SSE into other formats; buffering across those layers adds complexity for
   little gain, and `fallback_single` already upholds the never-mix invariant there.
   Rejected (chat-only buffering).
-- **Changing default `router.weights`** to fix code/math — simplest, but ripples the
-  whole curve and the v0.5.0 behavior. Rejected in favor of a structural fix
-  (normalized cost) that keeps the defaults and the sweep semantics.
+- **Changing default `router.weights` / normalizing the cost term by default** to
+  fix code/math — the first cut of this ADR did exactly this (normalized cost on by
+  default). On the independent set it changed **nothing** (identical accuracy); it
+  only lifted the author's in-sample numbers and silently altered v0.5.0 default
+  behavior. Rejected as the default; kept as an **opt-in** `cost_normalized` knob
+  (default false = v0.5.0). Generalization is carried instead by structural
+  features, which move the independent-set numbers.
 - **Status quo (end-to-end latency, booleans, no streaming cascade)** — leaves the
   streaming latency signal wrong, the escalation un-tunable, and streaming cascades
   unserved. Rejected.
@@ -111,42 +136,56 @@ default-off, and a request with none of the new knobs reproduces v0.5.0 exactly.
 - **Positive** — streaming requests are judged on the latency they actually
   perceive (TTFT); cascade escalation gains a single calibrated threshold (+ an
   optional logprob signal); a streaming cascade can now run end-to-end without ever
-  mixing two models; code/math routing improves sharply with frozen held-out
-  evidence and pinned-in-tests thresholds.
+  mixing two models; code/math/reasoning routing improves on an **independent**
+  prompt set (code 0.25→0.92, math 0.10→0.90, reasoning 0.00→1.00), measured — not
+  on the author's own held-out split, which is not independent.
 - **Negative** — the buffered streaming cascade pays the cheap model's full
   generation time as perceived TTFT on the kept path (inherent to buffering); the
   reliability scorer is a heuristic aggregator, not a trained/calibrated regressor,
   so its benefit is operational (a tunable knob), not a measured accuracy gain; the
-  capability-first heuristic spends slightly more (mean cost_tier 2.57→2.88 on
-  train) to stop under-serving code/math.
+  capability-first heuristic spends slightly more (mean cost_tier 2.57→2.83 on
+  train) to stop under-serving code/math; and a keyword+structural heuristic still
+  generalizes only partially — honest, not perfect, so the docs point operators to
+  the LLM router backend / cascade for hard routing.
 - **Risks** — a mis-set scorer threshold could over- or under-escalate (mitigation:
   opt-in, default off, threshold validated to `[0,1]`, hard gates keep refusal/
   truncation safety); a buffered cascade could stall a client on a very long cheap
-  answer (mitigation: opt-in, documented, chat-only); over-fitting the heuristic to
-  the eval prompts (mitigation: the frozen held-out split is disjoint from train and
-  enforced by a test, and the changes are structural/general, not per-prompt).
+  answer (mitigation: opt-in, documented, chat-only); **over-fitting the heuristic
+  to the eval prompts — which the first cut of this ADR did** (train/held-out 1.0,
+  independent 0.43). Mitigation adopted here: a frozen **independent** set written
+  by a different author is committed and enforced disjoint from train and the author
+  held-out split; acceptance is pinned on *that* set (code ≥ 0.6, math ≥ 0.5,
+  reasoning ≥ 0.3) and the in-sample PGR is asserted **< 1.0** (not saturated); the
+  features are structural/general, not per-prompt.
 
 ## Confirmation
 
 Implemented in `broker/usage.py` (`ttft_ms` column + migration +
 `latency_percentiles(metric=...)`), `broker/router.py` (`reliability_score`,
-scorer-aware `should_escalate`, `stream`-aware latency estimate, normalized-cost
-heuristic + keyword fixes), `broker/registry.py` (`CascadeConfig.stream_mode`,
-`ScorerConfig`), `broker/manager.py` (`StreamPlan`, `plan_stream`,
+scorer-aware `should_escalate`, `stream`-aware latency estimate, **structural
+code/math/reasoning features** + reverted keyword lists + opt-in `cost_normalized`),
+`broker/registry.py` (`CascadeConfig.stream_mode`, `ScorerConfig`,
+`RouterWeights.cost_normalized`), `broker/manager.py` (`StreamPlan`, `plan_stream`,
 `stream_cascade_buffer`, SSE replay), and `broker/app.py` (TTFT capture on all
 streaming endpoints; chat wires the buffered cascade). Verified by:
 
-- `tests/test_router_v2.py` — 21 tests: TTFT recorded + **old-schema DB migration**,
-  TTFT metric excludes non-stream rows, **latency budget uses TTFT for streaming**
-  vs end-to-end otherwise, **scorer threshold behavior** (monotone knob, hard gates,
+- `tests/test_router_v2.py` — TTFT recorded + **old-schema DB migration**, TTFT
+  metric excludes non-stream rows, **latency budget uses TTFT for streaming** vs
+  end-to-end otherwise, **scorer threshold behavior** (monotone knob, hard gates,
   logprob feature, disabled-preserves-booleans), **buffered streaming cascade never
-  mixes two models** (kept-replay and escalate-stream), completions stays
-  fallback_single, **held-out split frozen/disjoint**, and **pinned accuracy** on
-  train and held-out (code/math ≥ 0.90 / 0.80).
+  mixes two models** (kept-replay, escalate-stream, and a dedicated end-to-end
+  no-mixing test asserting only the final model's tokens + the `x-broker-route`
+  header), completions stays fallback_single, **per-structural-feature unit tests**
+  over prompts in no eval set, the **independent set frozen/disjoint** from train
+  and author held-out, **honest three-way pins** (in-sample not saturated; on the
+  independent set code ≥ 0.6, math ≥ 0.5, reasoning ≥ 0.3; chat/creative ≥ v0.5.0),
+  and the opt-in `cost_normalized` default (false) + behavior.
 - Existing `tests/test_router_cascade.py`, `tests/test_router_latency.py`,
   `tests/test_router_eval.py`, `tests/test_usage.py`, `tests/test_streaming.py` stay
-  green (default behavior preserved; the eval PGR assertion relaxed to allow a
-  genuine 1.0 now that the improved heuristic reaches the oracle ceiling).
+  green (default behavior preserved). The eval PGR assertion is kept at the v0.5.0
+  bound **`0.0 ≤ PGR < 1.0`** (the overfit cut had loosened it to `≤ 1.0`); the
+  honest heuristic does not saturate, so the original bound holds and the v0.5.0
+  back-compat suite passes unmodified.
 
-Before/after eval tables (train vs frozen held-out) are reproduced in
-`docs/auto-router.md`.
+The honest three-way eval tables (train / author held-out / independent, before and
+after) are reproduced in `docs/auto-router.md`.

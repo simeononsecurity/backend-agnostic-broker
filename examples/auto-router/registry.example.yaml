@@ -15,7 +15,12 @@ router:
   # Deterministic fallback if the classifier returns an invalid/empty choice.
   default: tiny
   # Heuristic scoring weights (capability dominates; cost is a tie-breaker).
-  weights: { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0 }
+  # cost_normalized: true (ADR 0019 opt-in) normalizes the cost term to [0,1]·cost
+  # so a single capability match always beats price — here it keeps a code prompt
+  # on the dedicated `coder` instead of letting the cheap generalist win the tie
+  # and escalate to the pricier `reasoner`. The broker default is false (v0.5.0).
+  weights:
+    { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0, cost_normalized: true }
 
   # Hard overrides (data), checked in order; the first capable match wins.
   overrides:

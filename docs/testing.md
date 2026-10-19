@@ -3,7 +3,7 @@
 Run the suite:
 
 ```bash
-make test                 # pytest -q  (392 collected: 366 passed, 26 skipped)
+make test                 # pytest -q  (402 collected: 376 passed, 26 skipped)
 make cov                  # with coverage
 python -m pytest -q tests/test_security.py   # one file
 ```
@@ -13,18 +13,18 @@ so they exercise the real request path, lifecycle, locking, and security
 boundaries without any external runtime. The suite is CPU-only; optional GPU
 tests (if added) should be marked and excluded from CI.
 
-In the default CPU venv, 366 pass and 26 skip — the skips are the Redis-backed
+In the default CPU venv, 376 pass and 26 skip — the skips are the Redis-backed
 `StateStore` paths (counters, prefix index, response cache) and the OpenTelemetry
 span path, which need the optional `redis`/`otel` extras. In a venv with
-`pip install -e '.[dev,redis,otel]'` those run too: **390 passed, 2 skipped**
+`pip install -e '.[dev,redis,otel]'` those run too: **400 passed, 2 skipped**
 (the remaining 2 are import-guard paths that only fire when a package is *absent*).
 
-## Coverage map (392 collected)
+## Coverage map (402 collected)
 
 | File | Tests | Covers |
 |------|-------|--------|
 | `tests/test_config.py` | 21 | Typed config + fail-fast `validate_runtime` (auth without keys, auth satisfied by a keys file, bad port, missing registry, bad rate-limit window, policy/log-format/route-strategy validation, retry/cooldown/cache-aware bounds, admin credentials required vs satisfied by a keys file, legacy defaults). |
-| `tests/test_registry.py` | 12 | Registry parsing/validation, unknown-field rejection, duplicate-alias detection, backend filtering, pool + router config, `pricing` block (ADR 0008) parse + negative rejection. |
+| `tests/test_registry.py` | 13 | Registry parsing/validation, unknown-field rejection, duplicate-alias detection, backend filtering, pool + router config, `router.weights.cost_normalized` default-off + parse (ADR 0019), `pricing` block (ADR 0008) parse + negative rejection. |
 | `tests/test_lifecycle.py` | 5 | State machine legal/illegal transitions, idle timing, snapshots. |
 | `tests/test_adapters.py` | 5 | Adapter contract conformance + fake backend behavior. |
 | `tests/test_api.py` | 10 | `/v1/models`, `/v1/chat/completions`, `/healthz`, `/readyz`, `/status`, `/metrics`, structured errors, request IDs, size limit. |
@@ -41,7 +41,7 @@ span path, which need the optional `redis`/`otel` extras. In a venv with
 | `tests/test_placement.py` | 10 | Placement pinning (ADR 0011), fail-closed: auto-filter, explicit + pool + embeddings `403 placement_denied`, pool member filtering, header parse/validation, config default. |
 | `tests/test_router_latency.py` | 7 | Latency-budget routing (ADR 0011): faster-capable pick, no-op when fast enough, capability safety, config default, header parse/validation. |
 | `tests/test_router_eval.py` | 11 | Eval harness: RouteLLM metric primitives (PGR/frontier/APGR/CPT/oracle) vs hand-computed values incl. no-clamping + `invalid`-on-degenerate; quality ceiling is a true upper bound; router swept curve distinct from and bounded by the oracle; direct metrics in range; markdown renders; dataset labels valid. |
-| `tests/test_router_v2.py` | 21 | Router v2 (ADR 0019): TTFT recorded + old-schema DB migration + ttft metric excludes non-stream; latency budget uses TTFT for streaming vs end-to-end otherwise; reliability scorer (threshold knob, hard gates, logprob feature, disabled-preserves-booleans, validation); buffered streaming cascade never mixes two models (kept-replay + escalate-stream) and completions stays fallback_single; frozen held-out split disjoint from train; pinned code/math accuracy on train + held-out. |
+| `tests/test_router_v2.py` | 30 | Router v2 (ADR 0019 + follow-up): TTFT recorded + old-schema DB migration + ttft metric excludes non-stream; latency budget uses TTFT for streaming vs end-to-end otherwise; reliability scorer (threshold knob, hard gates, logprob feature, disabled-preserves-booleans, validation); buffered streaming cascade never mixes two models (kept-replay + escalate-stream + dedicated end-to-end no-mixing test) and completions stays fallback_single; **honest three-way eval** (train in-sample not saturated, author held-out labeled not-independent, frozen independent set pinned code ≥ 0.6 / math ≥ 0.5 / reasoning ≥ 0.3 with chat/creative ≥ v0.5.0); **structural intent features** unit-tested on prompts in no eval set; opt-in `cost_normalized` default-off + scoring. |
 | `tests/test_auth.py` | 9 | Bearer + `X-API-Key`, missing/invalid key, unauthenticated probes, non-ASCII + over-long keys → 401 not 500. |
 | `tests/test_streaming.py` | 1 | SSE streaming (`chat.completion.chunk` + `[DONE]`). |
 | `tests/test_openai_endpoints.py` | 18 | `/v1/completions`, `/v1/responses`, `/v1/embeddings` shims/adapters: translation, streaming, pool routing, no silent fallback. |
