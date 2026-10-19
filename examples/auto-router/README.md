@@ -13,7 +13,7 @@ your Ollama / vLLM / llama.cpp model — the whole `router` block stays the same
 ## Run it
 
 ```bash
-export BROKER_REGISTRY_PATH=examples/auto-router/registry.yaml
+export BROKER_REGISTRY_PATH=examples/auto-router/registry.example.yaml
 export BROKER_ENABLED_BACKENDS=fake            # use your real backends in production
 export BROKER_AUTH_ENABLED=false               # demo only
 uvicorn broker.app:create_app --factory --port 8080
