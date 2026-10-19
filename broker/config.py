@@ -82,8 +82,14 @@ class Settings(BaseSettings):
     # no effect unless route_strategy="cache_aware".
     #   beta: the single tunable exchange-rate between cache benefit and load.
     #     1.0 = "a member at 2x fleet-average load is docked one full cache hit's
-    #     worth of preference". 0.0 = pure prefix affinity (ignore load).
-    cache_aware_beta: float = 1.0
+    #     worth of preference"; 0.0 = pure prefix affinity (ignore load). Default
+    #     0.25 was chosen from the scripts/bench_routing.py scenario x beta matrix
+    #     (see ADR 0010 / docs/routing-and-health.md): it is the smallest beta that
+    #     keeps the low-pressure pool balanced yet still concentrates prefixes
+    #     enough to roughly double hit rate under cache pressure. beta=1.0
+    #     over-penalized affinity (the approximate index makes the load term swamp
+    #     a real cache hit) and never beat sticky.
+    cache_aware_beta: float = 0.25
     # Characters per prefix block (approximate; ~4 chars/token). Larger = smaller
     # index but coarser prefix matching. Only full blocks are hashed.
     cache_aware_block_chars: int = 128
