@@ -261,6 +261,18 @@ TTFT p95 ms / load spread min–max). The **default `β=0.25`** row is marked:
 
 Reproduce with `python scripts/bench_routing.py --matrix`.
 
+**Limitation — simulated TTFT is an upper bound (no queueing).** The bench's TTFT is
+a pure routing-savings model: `TTFT = TTFT_BASE_MS − hit_fraction × TTFT_SAVED_MS`.
+It models **no queueing delay from load imbalance**. At the default `β=0.25` the load
+spread is real and non-trivial — about **2.4×** on `cross_session` (90–219) and
+**1.75×** on `cache_pressure` (109–191) — so on a real backend the hot member would
+also pay queueing latency that this model omits. Therefore the **TTFT / p95 figures
+here are an upper bound** on the achievable latency win (treat them as *simulated*);
+the **hit-rate** results are routing-only and hold regardless. Before relying on the
+latency win in production, validate on a **real vLLM** pool with
+`BROKER_CACHE_AWARE_USE_METRICS=true` (so selection also sees real queue depth), and
+see the deferred "bench: add a queueing model" follow-up in [roadmap.md](roadmap.md).
+
 **How the default `β=0.25` was chosen.** Selection rule: *pick the smallest swept β
 whose load spread stays within 25 % (max/min ≤ 1.25) on the low-pressure
 `long_lived` scenario — where concentrating prefixes buys nothing — and which
@@ -278,7 +290,8 @@ Larger β (≥0.5) gives up the cache-pressure reuse; `β=1.0` collapses toward
   pressure**: shared system prompts / few-shot preambles / RAG contexts across many
   (even short) sessions, or long multi-turn chats whose KV working set exceeds a
   member's cache. That is exactly `cache_pressure` and `cross_session`, where it
-  roughly doubles hit rate and cuts p95.
+  roughly doubles hit rate and cuts (simulated, upper-bound) p95 — see the TTFT
+  limitation above.
 - **Keep `sticky`** (the default strategy) when the cache is **not** the bottleneck
   (`long_lived` is a near-tie), or under **bursty, skewed high-concurrency** load.
   In `skewed_bursty`, `sticky` *beats* `cache_aware` (42.8 % vs ~31 %): a burst of

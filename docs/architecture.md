@@ -45,22 +45,55 @@ transitions.
 
 ## Request flow (chat completion)
 
-1. **Auth + limits** — `app.py` middleware assigns a request ID and enforces the
-   content-length limit; the route calls `check_auth`.
-2. **Validate selector** — the request body is parsed; `reject_request_flags`
-   rejects flag-like/shell-metacharacter tokens in `model`.
-3. **Resolve + route** — if `model` is `auto`, the `AutoRouter` first classifies
-   it to a concrete public model (see [auto-router.md](auto-router.md)). The name
-   then names a public model (a standalone alias or a **pool** of members). `_members_for` raises `ModelNotFoundError` if unknown
-   (**no silent fallback**). `_select_member` picks a member per
-   `route_strategy`: **`sticky`** (default) pins a session — `X-Session-Id`
-   header, else OpenAI `user`, else client IP — to one member and reuses it,
-   assigning new sessions the least-busy member; `least_busy` and `round_robin`
-   pick per request; **`cache_aware`** (ADR 0010, opt-in) scores members by
-   prompt-prefix affinity minus relative load (`broker/cache_routing.py`),
-   falling back to `least_busy` on no match. It reserves the member's in-flight
-   slot under a route lock.
-4. **Acquire the member**:
+The data-plane pipeline composes every P1/P2 feature in one fixed order (the same
+order for `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, and — minus
+auto/cascade — `/v1/embeddings`):
+
+> **auth → key limits/budget (ADR 0008) → placement pinning (ADR 0011) → response
+> cache lookup (ADR 0012) → auto/cascade (ADR 0011) → pool selection (ADR 0010
+> `cache_aware`/sticky) with retries + cooldowns (ADR 0009) → inference → usage
+> record + cache store.**
+
+1. **Auth** — `app.py` middleware assigns a request ID and enforces the
+   content-length limit; the route resolves the caller's **Principal** from the key
+   store (`authed`: ADR 0008 virtual keys + legacy flat `BROKER_API_KEYS`). An
+   unknown/invalid/revoked/expired/malformed key yields one generic 401 (a
+   non-ASCII/over-long key is compared byte-wise, never a 500). With auth disabled
+   the caller is an identity-less unlimited admin principal.
+2. **Validate selector** — the body is parsed; `reject_request_flags` rejects
+   flag-like/shell-metacharacter tokens in `model`; a fast `allowed_models`
+   precheck 403s a directly-named, disallowed model before admission.
+3. **Key limits / budget (ADR 0008)** — the `Governor` admits the request against
+   the key's `rpm` (sliding window), `tpm` (pre-estimate + post-reconcile),
+   `max_concurrency`, and daily/monthly token & cost budgets on the shared
+   `StateStore`. Over-limit → `429 rate_limit_exceeded` (+ `Retry-After` +
+   `x-ratelimit-*`); over-budget → `429 insufficient_quota`. A reservation is
+   reconciled with real token usage after serving.
+4. **Placement pinning (ADR 0011, fail-closed)** — the requirement
+   (`x-broker-placement` ∪ `BROKER_DEFAULT_PLACEMENT`) is resolved up front; only
+   models/pool members carrying **every** required label are eligible, else
+   `403 placement_denied` (never spills to a non-compliant model).
+5. **Response cache lookup (ADR 0012)** — if the cache is enabled and the request
+   is cacheable (deterministic-by-default; embeddings always), a key over
+   *(API-key/tenant + placement scope, resolved public model, normalized
+   payload + sampling + tools)* is looked up; a hit returns immediately with
+   `x-broker-cache: hit` and no inference. Bypass via `Cache-Control: no-cache`/
+   `no-store` or `x-broker-cache: bypass`.
+6. **Resolve + auto/cascade (ADR 0011)** — for `auto`, the `AutoRouter` picks a
+   concrete public model or a two-hop **cascade** plan (serve cheap, escalate once
+   on a quality signal). The resolved model — and each cascade hop — is re-checked
+   against the key's `allowed_models` (fail-closed, so `auto` can **never** serve a
+   disallowed model). `_members_for` raises `ModelNotFoundError` if unknown (**no
+   silent fallback**).
+7. **Pool selection + reliability** — `_select_member` picks a member per
+   `route_strategy`: **`sticky`** (default) pins a session (`X-Session-Id`, else
+   OpenAI `user`, else client IP) to one member; `least_busy`/`round_robin` pick
+   per request; **`cache_aware`** (ADR 0010) scores members by prompt-prefix
+   affinity minus relative load (`broker/cache_routing.py`), falling back to
+   `least_busy`. Transparent **retries** with full-jitter backoff and per-member
+   **cooldowns** (ADR 0009) stay **within the requested model's pool** (never a
+   different model). The member's in-flight slot is reserved under a route lock.
+8. **Acquire the member**:
    - `_maybe_evict(alias)` unloads the LRU idle model if `max_loaded_models` is
      reached (raises `ConcurrencyLimitError` if nothing can be evicted).
    - `ensure_ready()` starts + readies the model **exactly once** under an
@@ -69,19 +102,22 @@ transitions.
    - On a backend error (`backend_unavailable`/`model_load_error`/`timeout`), the
      member is marked unhealthy and the request **fails over** to another pool
      member (before the first byte, for streams).
-5. **Concurrency** — a global semaphore caps total in-flight requests; a
+9. **Concurrency** — a global semaphore caps total in-flight requests; a
    per-model semaphore caps per-model concurrency. With
    `load_concurrency_policy=reject`, a saturated per-model semaphore returns
    HTTP 429 instead of queueing.
-6. **Serve** — the model transitions `ready → busy`; the adapter runs `chat` (or
-   `stream_chat` for SSE) under a per-request timeout; `inflight` is tracked and
-   the model returns to `ready` when drained. The response `model` is relabeled
-   to the public name requested.
-7. **Idle unload** — a background sweep (`_sweep_once`, every
-   `idle_sweep_interval_seconds`) unloads any `ready` model idle beyond its
-   timeout. A separate **health probe** (`_health_probe_once`, every
-   `health_probe_interval_seconds`) liveness-checks active models **without
-   loading any** and marks a `ready` model `failed` if its backend has gone away.
+10. **Serve + record** — the model transitions `ready → busy`; the adapter runs
+    `chat` (or `stream_chat` for SSE) under a per-request timeout; `inflight` is
+    tracked and the model returns to `ready` when drained. The response `model` is
+    relabeled to the public name requested. On success the usage log records the
+    request and the response cache **stores** the result (keyed as in step 5); a
+    cascade is stored under its final served model, with `x-broker-route` showing
+    the path. Streaming responses are never cached.
+11. **Idle unload** — a background sweep (`_sweep_once`, every
+    `idle_sweep_interval_seconds`) unloads any `ready` model idle beyond its
+    timeout. A separate **health probe** (`_health_probe_once`, every
+    `health_probe_interval_seconds`) liveness-checks active models **without
+    loading any** and marks a `ready` model `failed` if its backend has gone away.
 
 ## Lazy loading: broker-managed vs native
 

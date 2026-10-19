@@ -11,8 +11,8 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 |---|------|--------|-----|
 | 1 | `/v1/completions` + `/v1/responses` (chat-translation shims) | ✅ done | [0006](adr/0006-openai-endpoint-surface.md) |
 | 2 | Usage/token + routing-decision log (`/usage`, SQLite) | ✅ done | [0007](adr/0007-usage-accounting-store.md) |
-| 3 | `/v1/embeddings` (Ollama native + OpenAI-compat passthrough) | ✅ done — verified live against Ollama (nomic-embed-text, 768-dim) | [0006](adr/0006-openai-endpoint-surface.md) |
-| 3b | `/v1/rerank` | 📋 planned | [0006](adr/0006-openai-endpoint-surface.md) |
+| 2b | `/v1/embeddings` (Ollama native + OpenAI-compat passthrough) | ✅ done — verified live against Ollama (nomic-embed-text, 768-dim) | [0006](adr/0006-openai-endpoint-surface.md) |
+| 2c | `/v1/rerank` | 📋 planned | [0006](adr/0006-openai-endpoint-surface.md) |
 
 ## P1 — governance, reliability, routing intelligence
 
@@ -40,3 +40,7 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
   `Accepted` when implementation starts, and add a `## Confirmation` section.
 - Invariants that constrain every item: lazy load, **no silent cross-model
   fallback**, non-loading health, security guards (see `AGENTS.md`).
+- Deferred follow-ups: semantic (embedding-similarity) response cache (item 10);
+  web UI/playground (item 12, `BROKER_UI_ENABLED` reserved); and a **queueing model
+  for `scripts/bench_routing.py`** so the cache-aware TTFT/p95 figures reflect
+  load-imbalance queueing rather than routing-only savings (ADR 0010).

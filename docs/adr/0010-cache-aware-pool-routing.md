@@ -88,6 +88,15 @@ high-concurrency (`skewed_bursty`) `sticky`'s durable pin beats record-after-ser
 routing — documented as a "when to use" guide in `docs/routing-and-health.md`, and
 `sticky` remains the default strategy.
 
+**Benchmark caveat — TTFT/p95 are a simulated upper bound.** The harness models
+latency as pure routing savings (`TTFT = base − hit_fraction × saved`) with **no
+queueing delay from load imbalance**. At `beta=0.25` the load spread is real
+(≈2.4× on `cross_session`, ≈1.75× on `cache_pressure`), so a real backend's hot
+member would add queueing the model omits: the **hit-rate** results are routing-only
+and robust, but the **TTFT/p95 wins are an upper bound**. Validate the latency claim
+on a real vLLM pool with `BROKER_CACHE_AWARE_USE_METRICS=true` before relying on it;
+adding a queueing model to the bench is a deferred follow-up (see `docs/roadmap.md`).
+
 **Load signal.** `load` defaults to the in-flight request count. Optionally
 (`BROKER_CACHE_AWARE_USE_METRICS=true`) the existing **non-loading** health probe
 scrapes an exposed vLLM `/metrics` endpoint for `vllm:num_requests_waiting` as a
