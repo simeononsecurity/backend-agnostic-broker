@@ -267,10 +267,35 @@ class RouterConfig(BaseModel):
     weights: RouterWeights = Field(default_factory=RouterWeights)
 
 
+class ModelPricing(BaseModel):
+    """Per-model price, used to charge per-key cost budgets (ADR 0008).
+
+    Prices are in **USD per million tokens**, split by input (prompt) and output
+    (completion). Keyed by the *public* model name (pool or alias) in the registry
+    ``pricing`` block. Models without an entry are treated as free (cost budgets
+    are only enforced for priced models).
+    """
+
+    model_config = {"extra": "forbid"}
+
+    input_per_million: float = 0.0
+    output_per_million: float = 0.0
+
+    @field_validator("input_per_million", "output_per_million")
+    @classmethod
+    def _nonneg(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("pricing must be >= 0")
+        return v
+
+
 class Registry(BaseModel):
     models: list[ModelEntry]
     # Optional policy for the "auto" router alias.
     router: RouterConfig = Field(default_factory=RouterConfig)
+    # Optional per-model prices (USD / million tokens) for per-key cost budgets
+    # (ADR 0008), keyed by public model name. Empty => cost budgets are inactive.
+    pricing: dict[str, ModelPricing] = Field(default_factory=dict)
 
     def by_alias(self) -> dict[str, ModelEntry]:
         out: dict[str, ModelEntry] = {}
@@ -350,6 +375,7 @@ def load_registry(path: str, enabled_backends: set[str] | None = None) -> Regist
         reg = Registry(
             models=[m for m in reg.models if m.backend.value in enabled_backends],
             router=reg.router,
+            pricing=reg.pricing,
         )
     # Trigger duplicate-alias + pool-grouping checks eagerly.
     reg.by_alias()

@@ -48,6 +48,23 @@ router:
     # - when: { has_images: true }
     #   use: my-vision-model
 
+# ---- Per-model pricing (optional): powers per-key COST budgets (ADR 0008) ----
+# Prices are USD per MILLION tokens, split into input (prompt) and output
+# (completion), keyed by the PUBLIC model name (a pool name, or a standalone
+# alias; use "auto" is NOT needed — the served model is what gets priced).
+# A key's cost budget (python -m broker.keys create --daily-cost / --monthly-cost)
+# is charged `prompt*input + completion*output`. Models without an entry here are
+# treated as free, so cost budgets simply don't apply to them. Token budgets
+# (--daily-tokens / --monthly-tokens) need no pricing. Leave this out entirely if
+# you only use rpm/tpm/token budgets.
+pricing:
+  chat:                      # the "chat" pool below
+    input_per_million: 0.20
+    output_per_million: 0.60
+  echo-fake:                 # example standalone alias
+    input_per_million: 0.0
+    output_per_million: 0.0
+
 models:
   # ---- Fake backend (no external runtime; used for tests & smoke) ----------
   - alias: echo-fake

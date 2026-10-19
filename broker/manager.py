@@ -57,6 +57,7 @@ from typing import Any
 from .adapters import make_adapter
 from .config import Settings
 from .errors import (
+    AuthorizationError,
     BackendUnavailableError,
     ConcurrencyLimitError,
     ModelLoadError,
@@ -455,10 +456,34 @@ class ModelManager:
             remediation="check GET /healthz/backends",
         )
 
+    def _check_allowed(self, name: str, allowed_models: set[str] | None) -> None:
+        """Fail-closed per-key model scoping (ADR 0008).
+
+        ``allowed_models`` is the authenticated key's allow-list. ``None`` means no
+        restriction (unlimited key). When set, the resolved public model name must
+        be a member — this is applied to the model the ``auto`` router selects as
+        well as a directly-requested model, so scoping cannot be bypassed via auto.
+        """
+        if allowed_models is None:
+            return
+        if name not in allowed_models:
+            raise AuthorizationError(
+                f"model {name!r} is not permitted for this API key",
+                model=name,
+                code="model_not_allowed",
+                remediation="request a model in the key's allowed_models list",
+            )
+
     async def chat(
-        self, name: str, payload: dict, request_id: str, route_key: str | None = None
+        self,
+        name: str,
+        payload: dict,
+        request_id: str,
+        route_key: str | None = None,
+        allowed_models: set[str] | None = None,
     ) -> dict:
         name = await self._resolve_auto(name, payload)
+        self._check_allowed(name, allowed_models)
         members = self._members_for(name)
         return await self._route_and_serve(
             name,
@@ -500,9 +525,15 @@ class ModelManager:
                 m.machine.to(State.READY)
 
     async def stream_chat(
-        self, name: str, payload: dict, request_id: str, route_key: str | None = None
+        self,
+        name: str,
+        payload: dict,
+        request_id: str,
+        route_key: str | None = None,
+        allowed_models: set[str] | None = None,
     ) -> AsyncIterator[bytes]:
         name = await self._resolve_auto(name, payload)
+        self._check_allowed(name, allowed_models)
         members = self._members_for(name)
         exclude: set[str] = set()
         last: Exception | None = None
@@ -571,7 +602,12 @@ class ModelManager:
             self.global_sem.release()
 
     async def embeddings(
-        self, name: str, payload: dict, request_id: str, route_key: str | None = None
+        self,
+        name: str,
+        payload: dict,
+        request_id: str,
+        route_key: str | None = None,
+        allowed_models: set[str] | None = None,
     ) -> dict:
         """Route an embeddings request through pool selection + failover.
 
@@ -579,6 +615,7 @@ class ModelManager:
         request is routed to the named model/pool. Shares the same member
         selection, concurrency gating, lazy-load, and failover as chat.
         """
+        self._check_allowed(name, allowed_models)
         members = self._members_for(name)
         return await self._route_and_serve(
             name,

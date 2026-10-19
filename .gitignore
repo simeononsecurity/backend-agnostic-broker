@@ -21,6 +21,9 @@ htmlcov/
 # Local registry with real paths/hosts (ship only the example)
 registry.yaml
 
+# Virtual API keys — hashed secrets, local-only (ship only keys.example.yaml)
+keys.yaml
+
 # OS / editor
 .DS_Store
 *.swp

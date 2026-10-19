@@ -112,29 +112,56 @@ class UsageLog:
         except Exception as exc:  # noqa: BLE001 - logging must never break a request
             log.warning("usage log write failed: %s", exc)
 
-    def summary(self, limit: int = 20) -> dict[str, Any]:
-        """Aggregate totals + per-model/per-endpoint counts + recent rows."""
+    def summary(
+        self,
+        limit: int = 20,
+        *,
+        api_key_id: str | None = None,
+        include_keys: bool = False,
+    ) -> dict[str, Any]:
+        """Aggregate totals + per-model/per-endpoint counts + recent rows.
+
+        ``api_key_id`` scopes every aggregate to one key (user-scope callers see
+        only their own usage). ``include_keys`` adds a per-key spend breakdown
+        (admin-scope callers see all keys). Both privacy rules from ADR 0007 are
+        preserved: only metadata + token counts are returned, never content, and
+        the key identifier is the stored non-secret id, never a secret.
+        """
         if not self.enabled or self._conn is None:
             return {"enabled": False}
+        where = ""
+        params: tuple = ()
+        if api_key_id is not None:
+            where = " WHERE api_key_id = ?"
+            params = (api_key_id,)
         with self._lock:
             cur = self._conn.cursor()
             total = cur.execute(
-                "SELECT COUNT(*), COALESCE(SUM(total_tokens), 0) FROM usage"
+                f"SELECT COUNT(*), COALESCE(SUM(total_tokens), 0) FROM usage{where}", params
             ).fetchone()
             by_model = cur.execute(
                 "SELECT COALESCE(model, '?'), COUNT(*), COALESCE(SUM(total_tokens), 0) "
-                "FROM usage GROUP BY model ORDER BY 2 DESC"
+                f"FROM usage{where} GROUP BY model ORDER BY 2 DESC",
+                params,
             ).fetchall()
             by_endpoint = cur.execute(
-                "SELECT endpoint, COUNT(*) FROM usage GROUP BY endpoint ORDER BY 2 DESC"
+                f"SELECT endpoint, COUNT(*) FROM usage{where} GROUP BY endpoint ORDER BY 2 DESC",
+                params,
             ).fetchall()
             recent = cur.execute(
                 "SELECT ts, endpoint, requested, model, total_tokens, latency_ms, status, stream "
-                "FROM usage ORDER BY id DESC LIMIT ?",
-                (max(0, int(limit)),),
+                f"FROM usage{where} ORDER BY id DESC LIMIT ?",
+                (*params, max(0, int(limit))),
             ).fetchall()
-        return {
+            per_key = None
+            if include_keys:
+                per_key = cur.execute(
+                    "SELECT COALESCE(api_key_id, '?'), COUNT(*), COALESCE(SUM(total_tokens), 0) "
+                    "FROM usage GROUP BY api_key_id ORDER BY 3 DESC"
+                ).fetchall()
+        out: dict[str, Any] = {
             "enabled": True,
+            "scope": "key" if api_key_id is not None else "all",
             "requests": total[0],
             "total_tokens": total[1],
             "by_model": [{"model": m, "requests": c, "total_tokens": t} for (m, c, t) in by_model],
@@ -153,6 +180,13 @@ class UsageLog:
                 for (ts, e, rq, m, tt, lm, st, sr) in recent
             ],
         }
+        if api_key_id is not None:
+            out["api_key_id"] = api_key_id
+        if per_key is not None:
+            out["by_key"] = [
+                {"api_key_id": k, "requests": c, "total_tokens": t} for (k, c, t) in per_key
+            ]
+        return out
 
     def close(self) -> None:
         if self._conn is not None:

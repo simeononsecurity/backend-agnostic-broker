@@ -33,9 +33,17 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
 from . import __version__
-from .auth import check_auth
+from .auth import extract_key
 from .config import Settings, get_settings
-from .errors import BrokerError, RequestTooLargeError, ValidationError
+from .errors import (
+    AuthError,
+    AuthorizationError,
+    BrokerError,
+    RequestTooLargeError,
+    ValidationError,
+)
+from .governance import Governor
+from .keys import KeyStore, Principal
 from .manager import ModelManager
 from .metrics import INFLIGHT, LOADED_MODELS, REQUEST_LATENCY, REQUESTS
 from .openai_compat import (
@@ -125,6 +133,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     usage_path = settings.usage_log_path or f"{settings.cache_dir.rstrip('/')}/usage.sqlite3"
     usage = UsageLog(usage_path, enabled=settings.usage_log_enabled)
 
+    # Per-key governance (ADR 0008): virtual keys (hashed) + legacy flat keys,
+    # and the governor that enforces rpm/tpm/concurrency/budgets on the shared
+    # StateStore. Opt-in: with no keys file and no per-key limits this is inert.
+    key_store = KeyStore(settings.keys_path, settings.api_keys)
+    governor = Governor(
+        manager.state,
+        window_seconds=settings.rate_limit_window_seconds,
+        pricing=registry.pricing,
+    )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await manager.start_sweeper()
@@ -145,11 +163,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.ready = True
     app.state.usage = usage
+    app.state.key_store = key_store
+    app.state.governor = governor
 
     def err_response(exc: BrokerError, request_id: str) -> JSONResponse:
         payload = exc.to_payload()
         payload["error"]["request_id"] = request_id
-        return JSONResponse(status_code=exc.http_status, content=payload)
+        headers = {"x-request-id": request_id, **getattr(exc, "headers", {})}
+        return JSONResponse(status_code=exc.http_status, content=payload, headers=headers)
 
     @app.middleware("http")
     async def context_mw(request: Request, call_next):
@@ -172,8 +193,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         resp.headers["x-request-id"] = request_id
         return resp
 
-    def authed(authorization: str | None, x_api_key: str | None) -> None:
-        check_auth(settings, authorization, x_api_key)
+    def authed(authorization: str | None, x_api_key: str | None) -> Principal:
+        """Authenticate a request and return the caller's Principal.
+
+        With auth disabled every caller is an unlimited admin (identity-less);
+        otherwise the presented secret is resolved against the key store (virtual
+        keys + legacy flat keys). An unknown/invalid/revoked/expired key yields one
+        generic 401 — no detail leaks that would let a client enumerate keys.
+        """
+        if not settings.auth_enabled:
+            return Principal(usage_id=None, scope="admin", unlimited=True)
+        principal = key_store.resolve(extract_key(authorization, x_api_key))
+        if principal is None:
+            raise AuthError(
+                "invalid or missing API key",
+                remediation="send Authorization: Bearer <key> or X-API-Key",
+            )
+        return principal
+
+    def _allowed_models(principal: Principal) -> set[str] | None:
+        models = principal.limits.allowed_models
+        return set(models) if models else None
+
+    def _precheck_model(principal: Principal, model: str) -> None:
+        """Fast 403 for a directly-requested, disallowed model (before admission).
+
+        ``auto`` is allowed through to routing; the model it selects is checked by
+        the manager, so scoping still applies to auto's choice.
+        """
+        allowed = _allowed_models(principal)
+        if allowed is not None and model != settings.router_alias and model not in allowed:
+            raise AuthorizationError(
+                f"model {model!r} is not permitted for this API key",
+                model=model,
+                code="model_not_allowed",
+                remediation="request a model in the key's allowed_models list",
+            )
+
+    def _estimate_tokens(texts: list | str | None, max_tokens: int | None) -> int:
+        """Cheap pre-dispatch token estimate (~4 chars/token) + requested output."""
+        if texts is None:
+            chars = 0
+        elif isinstance(texts, str):
+            chars = len(texts)
+        else:
+            chars = sum(len(str(t)) for t in texts)
+        return chars // 4 + int(max_tokens or 0)
 
     # --- ops endpoints ---------------------------------------------------
     @app.get("/healthz")
@@ -265,8 +330,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         authorization: str | None = Header(None),
         x_api_key: str | None = Header(None),
     ):
-        authed(authorization, x_api_key)
-        key_id = UsageLog.key_fingerprint(x_api_key or authorization)
+        principal = authed(authorization, x_api_key)
+        key_id = principal.usage_id
         request_id = request.state.request_id
         raw = await request.body()
         if len(raw) > settings.max_request_bytes:
@@ -284,8 +349,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         reject_request_flags(req.model, "model")
 
         alias = req.model
+        _precheck_model(principal, alias)
+        allowed = _allowed_models(principal)
         payload = req.model_dump(exclude_none=True)
         payload["messages"] = [m.model_dump(exclude_none=True) for m in req.messages]
+        est_tokens = _estimate_tokens(
+            [m.get("content") for m in payload["messages"]], req.max_tokens
+        )
+        admission = await governor.admit(principal, est_tokens)
 
         # Sticky-routing session key: explicit header wins, else the OpenAI
         # `user` field, else the client IP. Keeps a conversation pinned to one
@@ -306,7 +377,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 stream_status = "ok"
                 try:
                     async for chunk in manager.stream_chat(
-                        alias, payload, request_id, route_key=session_key
+                        alias, payload, request_id, route_key=session_key, allowed_models=allowed
                     ):
                         yield chunk
                     REQUESTS.labels("chat_stream", alias, "ok").inc()
@@ -320,6 +391,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 finally:
                     INFLIGHT.dec()
                     REQUEST_LATENCY.labels("chat_stream", alias).observe(time.monotonic() - start)
+                    await governor.reconcile(principal, admission.reservation, model=alias)
                     usage.record(
                         endpoint="chat_stream",
                         requested=alias,
@@ -334,30 +406,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return StreamingResponse(
                 gen(),
                 media_type="text/event-stream",
-                headers={"x-request-id": request_id, "cache-control": "no-cache"},
+                headers={
+                    "x-request-id": request_id,
+                    "cache-control": "no-cache",
+                    **admission.headers,
+                },
             )
 
         INFLIGHT.inc()
+        prompt_tokens = completion_tokens = 0
+        served_model = alias
         try:
-            result = await manager.chat(alias, payload, request_id, route_key=session_key)
+            result = await manager.chat(
+                alias, payload, request_id, route_key=session_key, allowed_models=allowed
+            )
             REQUESTS.labels("chat", alias, "ok").inc()
             u = result.get("usage") or {}
+            prompt_tokens = u.get("prompt_tokens", 0)
+            completion_tokens = u.get("completion_tokens", 0)
+            served_model = result.get("model", alias)
             usage.record(
                 endpoint="chat",
                 requested=alias,
-                model=result.get("model", alias),
+                model=served_model,
                 request_id=request_id,
                 api_key_id=key_id,
-                prompt_tokens=u.get("prompt_tokens", 0),
-                completion_tokens=u.get("completion_tokens", 0),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
                 total_tokens=u.get("total_tokens", 0),
                 latency_ms=(time.monotonic() - start) * 1000,
                 status="ok",
             )
-            return JSONResponse(content=result, headers={"x-request-id": request_id})
+            return JSONResponse(
+                content=result, headers={"x-request-id": request_id, **admission.headers}
+            )
         finally:
             INFLIGHT.dec()
             REQUEST_LATENCY.labels("chat", alias).observe(time.monotonic() - start)
+            await governor.reconcile(
+                principal,
+                admission.reservation,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                model=served_model,
+            )
 
     @app.get("/usage")
     async def usage_summary(
@@ -366,9 +458,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         authorization: str | None = Header(None),
         x_api_key: str | None = Header(None),
     ):
-        """Aggregated request/token usage from the usage log (see ADR 0007)."""
-        authed(authorization, x_api_key)
-        return usage.summary(limit=limit)
+        """Aggregated request/token usage from the usage log (see ADR 0007).
+
+        Scoped per ADR 0008: a ``user``-scope key sees only its own usage; an
+        ``admin``-scope key sees all keys plus a per-key spend breakdown.
+        """
+        principal = authed(authorization, x_api_key)
+        if principal.is_admin:
+            return usage.summary(limit=limit, include_keys=True)
+        return usage.summary(limit=limit, api_key_id=principal.usage_id)
 
     @app.post("/v1/completions")
     async def completions(
@@ -377,8 +475,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         x_api_key: str | None = Header(None),
     ):
         """Legacy text completions, translated to the chat pipeline (ADR 0006)."""
-        authed(authorization, x_api_key)
-        key_id = UsageLog.key_fingerprint(x_api_key or authorization)
+        principal = authed(authorization, x_api_key)
+        key_id = principal.usage_id
         request_id = request.state.request_id
         raw = await request.body()
         if len(raw) > settings.max_request_bytes:
@@ -391,11 +489,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not model or not isinstance(model, str):
             raise ValidationError("`model` is required")
         reject_request_flags(model, "model")
+        _precheck_model(principal, model)
+        allowed = _allowed_models(principal)
         stream = bool(body.get("stream"))
         chat_payload = {k: v for k, v in body.items() if k != "prompt"}
         chat_payload["model"] = model
         chat_payload["messages"] = prompt_to_messages(body.get("prompt"))
         session_key = _session_key(request, body)
+        est_tokens = _estimate_tokens(body.get("prompt"), body.get("max_tokens"))
+        admission = await governor.admit(principal, est_tokens)
         start = time.monotonic()
 
         if stream:
@@ -405,7 +507,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 st = "ok"
                 try:
                     aiter = manager.stream_chat(
-                        model, chat_payload, request_id, route_key=session_key
+                        model,
+                        chat_payload,
+                        request_id,
+                        route_key=session_key,
+                        allowed_models=allowed,
                     )
                     async for out in chat_sse_to_text_sse(aiter, model):
                         yield out
@@ -422,6 +528,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     REQUEST_LATENCY.labels("completions_stream", model).observe(
                         time.monotonic() - start
                     )
+                    await governor.reconcile(principal, admission.reservation, model=model)
                     usage.record(
                         endpoint="completions_stream",
                         requested=model,
@@ -436,31 +543,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return StreamingResponse(
                 gen(),
                 media_type="text/event-stream",
-                headers={"x-request-id": request_id, "cache-control": "no-cache"},
+                headers={
+                    "x-request-id": request_id,
+                    "cache-control": "no-cache",
+                    **admission.headers,
+                },
             )
 
         INFLIGHT.inc()
+        prompt_tokens = completion_tokens = 0
+        served_model = model
         try:
-            result = await manager.chat(model, chat_payload, request_id, route_key=session_key)
+            result = await manager.chat(
+                model, chat_payload, request_id, route_key=session_key, allowed_models=allowed
+            )
             out = chat_to_text_completion(result, model)
             REQUESTS.labels("completions", model, "ok").inc()
             u = result.get("usage") or {}
+            prompt_tokens = u.get("prompt_tokens", 0)
+            completion_tokens = u.get("completion_tokens", 0)
+            served_model = result.get("model", model)
             usage.record(
                 endpoint="completions",
                 requested=model,
-                model=result.get("model", model),
+                model=served_model,
                 request_id=request_id,
                 api_key_id=key_id,
-                prompt_tokens=u.get("prompt_tokens", 0),
-                completion_tokens=u.get("completion_tokens", 0),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
                 total_tokens=u.get("total_tokens", 0),
                 latency_ms=(time.monotonic() - start) * 1000,
                 status="ok",
             )
-            return JSONResponse(content=out, headers={"x-request-id": request_id})
+            return JSONResponse(
+                content=out, headers={"x-request-id": request_id, **admission.headers}
+            )
         finally:
             INFLIGHT.dec()
             REQUEST_LATENCY.labels("completions", model).observe(time.monotonic() - start)
+            await governor.reconcile(
+                principal,
+                admission.reservation,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                model=served_model,
+            )
 
     @app.post("/v1/responses")
     async def responses(
@@ -469,8 +596,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         x_api_key: str | None = Header(None),
     ):
         """OpenAI Responses API, translated to the chat pipeline (ADR 0006)."""
-        authed(authorization, x_api_key)
-        key_id = UsageLog.key_fingerprint(x_api_key or authorization)
+        principal = authed(authorization, x_api_key)
+        key_id = principal.usage_id
         request_id = request.state.request_id
         raw = await request.body()
         if len(raw) > settings.max_request_bytes:
@@ -483,6 +610,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not model or not isinstance(model, str):
             raise ValidationError("`model` is required")
         reject_request_flags(model, "model")
+        _precheck_model(principal, model)
+        allowed = _allowed_models(principal)
         stream = bool(body.get("stream"))
         passthrough = {
             k: v for k, v in body.items() if k not in ("input", "instructions", "stream")
@@ -495,6 +624,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             body.get("input"), body.get("instructions")
         )
         session_key = _session_key(request, body)
+        est_tokens = _estimate_tokens(
+            [body.get("input"), body.get("instructions")], passthrough.get("max_tokens")
+        )
+        admission = await governor.admit(principal, est_tokens)
         start = time.monotonic()
 
         if stream:
@@ -504,7 +637,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 st = "ok"
                 try:
                     aiter = manager.stream_chat(
-                        model, chat_payload, request_id, route_key=session_key
+                        model,
+                        chat_payload,
+                        request_id,
+                        route_key=session_key,
+                        allowed_models=allowed,
                     )
                     async for out in chat_sse_to_responses_sse(aiter, model):
                         yield out
@@ -521,6 +658,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     REQUEST_LATENCY.labels("responses_stream", model).observe(
                         time.monotonic() - start
                     )
+                    await governor.reconcile(principal, admission.reservation, model=model)
                     usage.record(
                         endpoint="responses_stream",
                         requested=model,
@@ -535,31 +673,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return StreamingResponse(
                 gen(),
                 media_type="text/event-stream",
-                headers={"x-request-id": request_id, "cache-control": "no-cache"},
+                headers={
+                    "x-request-id": request_id,
+                    "cache-control": "no-cache",
+                    **admission.headers,
+                },
             )
 
         INFLIGHT.inc()
+        prompt_tokens = completion_tokens = 0
+        served_model = model
         try:
-            result = await manager.chat(model, chat_payload, request_id, route_key=session_key)
+            result = await manager.chat(
+                model, chat_payload, request_id, route_key=session_key, allowed_models=allowed
+            )
             out = chat_to_response(result, model)
             REQUESTS.labels("responses", model, "ok").inc()
             u = result.get("usage") or {}
+            prompt_tokens = u.get("prompt_tokens", 0)
+            completion_tokens = u.get("completion_tokens", 0)
+            served_model = result.get("model", model)
             usage.record(
                 endpoint="responses",
                 requested=model,
-                model=result.get("model", model),
+                model=served_model,
                 request_id=request_id,
                 api_key_id=key_id,
-                prompt_tokens=u.get("prompt_tokens", 0),
-                completion_tokens=u.get("completion_tokens", 0),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
                 total_tokens=u.get("total_tokens", 0),
                 latency_ms=(time.monotonic() - start) * 1000,
                 status="ok",
             )
-            return JSONResponse(content=out, headers={"x-request-id": request_id})
+            return JSONResponse(
+                content=out, headers={"x-request-id": request_id, **admission.headers}
+            )
         finally:
             INFLIGHT.dec()
             REQUEST_LATENCY.labels("responses", model).observe(time.monotonic() - start)
+            await governor.reconcile(
+                principal,
+                admission.reservation,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                model=served_model,
+            )
 
     @app.post("/v1/embeddings")
     async def embeddings(
@@ -568,8 +726,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         x_api_key: str | None = Header(None),
     ):
         """OpenAI embeddings — routed to an embedding-capable backend (ADR 0006)."""
-        authed(authorization, x_api_key)
-        key_id = UsageLog.key_fingerprint(x_api_key or authorization)
+        principal = authed(authorization, x_api_key)
+        key_id = principal.usage_id
         request_id = request.state.request_id
         raw = await request.body()
         if len(raw) > settings.max_request_bytes:
@@ -582,6 +740,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not model or not isinstance(model, str):
             raise ValidationError("`model` is required")
         reject_request_flags(model, "model")
+        _precheck_model(principal, model)
+        allowed = _allowed_models(principal)
         if body.get("input") is None:
             raise ValidationError("`input` is required (string or list of strings)")
         payload = {"input": body["input"]}
@@ -589,28 +749,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if k in body:
                 payload[k] = body[k]
         session_key = _session_key(request, body)
+        est_tokens = _estimate_tokens(body.get("input"), None)
+        admission = await governor.admit(principal, est_tokens)
         start = time.monotonic()
         INFLIGHT.inc()
+        prompt_tokens = 0
+        served_model = model
         try:
-            result = await manager.embeddings(model, payload, request_id, route_key=session_key)
+            result = await manager.embeddings(
+                model, payload, request_id, route_key=session_key, allowed_models=allowed
+            )
             REQUESTS.labels("embeddings", model, "ok").inc()
             u = result.get("usage") or {}
+            prompt_tokens = u.get("prompt_tokens", 0)
+            served_model = result.get("model", model)
             usage.record(
                 endpoint="embeddings",
                 requested=model,
-                model=result.get("model", model),
+                model=served_model,
                 request_id=request_id,
                 api_key_id=key_id,
-                prompt_tokens=u.get("prompt_tokens", 0),
+                prompt_tokens=prompt_tokens,
                 completion_tokens=0,
                 total_tokens=u.get("total_tokens", u.get("prompt_tokens", 0)),
                 latency_ms=(time.monotonic() - start) * 1000,
                 status="ok",
             )
-            return JSONResponse(content=result, headers={"x-request-id": request_id})
+            return JSONResponse(
+                content=result, headers={"x-request-id": request_id, **admission.headers}
+            )
         finally:
             INFLIGHT.dec()
             REQUEST_LATENCY.labels("embeddings", model).observe(time.monotonic() - start)
+            await governor.reconcile(
+                principal,
+                admission.reservation,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=0,
+                model=served_model,
+            )
 
     @app.exception_handler(BrokerError)
     async def broker_error_handler(request: Request, exc: BrokerError):

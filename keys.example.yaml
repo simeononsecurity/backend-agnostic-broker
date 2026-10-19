@@ -1,0 +1,63 @@
+# Example virtual-keys file for backend-agnostic-broker (ADR 0008).
+#
+# Copy to keys.yaml (git-ignored) and manage with the CLI — do NOT hand-edit
+# secrets. The secret is shown exactly once at creation; only its SHA-256 HASH is
+# ever stored here. The values below are FAKE placeholders for documentation.
+#
+#   python -m broker.keys create --label team-alpha --tenant alpha \
+#       --scope user --rpm 60 --tpm 100000 --max-concurrency 4 \
+#       --daily-tokens 1000000 --monthly-tokens 20000000 \
+#       --daily-cost 5 --monthly-cost 100 --allowed-models chat,auto
+#   python -m broker.keys list
+#   python -m broker.keys revoke brk_1a2b3c4d
+#
+# Point the broker at this file with BROKER_KEYS_PATH=keys.yaml. Legacy
+# BROKER_API_KEYS keep working as UNLIMITED user keys, so adopting virtual keys is
+# purely additive. With no keys file and no per-key limits, behavior is identical
+# to v0.4.0.
+#
+# Each key:
+#   id            non-secret lookup id (the secret is brk_<id>_<random>)
+#   label         human description (optional)
+#   tenant        tenant/org this key belongs to (optional)
+#   scope         user | admin  (admin can see all keys' usage via GET /usage)
+#   secret_sha256 SHA-256 hex of the secret — NEVER the secret itself
+#   enabled       false to revoke without deleting
+#   expiry        ISO date "YYYY-MM-DD" (UTC); omit/null for never
+#   limits:       any subset — omit a field for "unlimited on that axis"
+#     rpm                   requests per minute (sliding window)
+#     tpm                   tokens per minute (input+output; windowed)
+#     max_concurrency       max simultaneous in-flight requests
+#     daily_token_budget    tokens per UTC day (auto-reset)
+#     monthly_token_budget  tokens per UTC month (auto-reset)
+#     daily_cost_usd        USD/day (needs registry `pricing` for the model)
+#     monthly_cost_usd      USD/month
+#     allowed_models        fail-closed allow-list; applies to auto's choice too
+
+keys:
+  # A rate- and budget-limited team key (all FAKE values).
+  - id: 1a2b3c4d
+    label: team-alpha
+    tenant: alpha
+    scope: user
+    secret_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    enabled: true
+    expiry: null
+    limits:
+      rpm: 60
+      tpm: 100000
+      max_concurrency: 4
+      daily_token_budget: 1000000
+      monthly_token_budget: 20000000
+      daily_cost_usd: 5.0
+      monthly_cost_usd: 100.0
+      allowed_models: [chat, auto]
+
+  # An admin key with no limits (sees all keys' usage). FAKE hash.
+  - id: 9f8e7d6c
+    label: ops-admin
+    tenant: null
+    scope: admin
+    secret_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
+    enabled: true
+    expiry: null

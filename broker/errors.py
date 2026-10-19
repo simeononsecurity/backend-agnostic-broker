@@ -28,6 +28,7 @@ class BrokerError(Exception):
         state: str | None = None,
         remediation: str | None = None,
         code: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -36,6 +37,9 @@ class BrokerError(Exception):
         self.state = state
         self.remediation = remediation
         self.code = code or self.error_type
+        # Optional HTTP response headers to attach to the error envelope (e.g.
+        # Retry-After + x-ratelimit-* on a 429). Never carries key material.
+        self.headers = headers or {}
 
     def to_payload(self) -> dict[str, Any]:
         """Render an OpenAI-compatible error envelope with broker context."""
@@ -121,3 +125,38 @@ class RequestTooLargeError(BrokerError):
 
     http_status = 413
     error_type = "request_too_large"
+
+
+class RateLimitExceededError(BrokerError):
+    """A per-key request/token rate limit was exceeded (ADR 0008).
+
+    Maps to OpenAI's ``429`` ``rate_limit_exceeded``. Carries ``Retry-After`` and
+    ``x-ratelimit-*`` headers so OpenAI-compatible clients can self-pace.
+    """
+
+    http_status = 429
+    error_type = "rate_limit_exceeded"
+
+
+class InsufficientQuotaError(BrokerError):
+    """A per-key token or cost budget was exhausted (ADR 0008).
+
+    Maps to OpenAI's billing error class: HTTP ``429`` with ``error.type``
+    ``insufficient_quota``. Unlike a transient rate limit, retrying does not help
+    until the budget window resets or the cap is raised.
+    """
+
+    http_status = 429
+    error_type = "insufficient_quota"
+
+
+class AuthorizationError(BrokerError):
+    """The authenticated key is not permitted to perform this action (ADR 0008).
+
+    Used for a model the key's ``allowed_models`` list does not cover
+    (``model_not_allowed``). Distinct from :class:`AuthError` (401), which is a
+    failed/missing authentication.
+    """
+
+    http_status = 403
+    error_type = "permission_error"

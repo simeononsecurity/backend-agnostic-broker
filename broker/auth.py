@@ -24,6 +24,11 @@ def _extract_key(authorization: str | None, x_api_key: str | None) -> str | None
     return None
 
 
+def extract_key(authorization: str | None, x_api_key: str | None) -> str | None:
+    """Public: pull the presented secret from Authorization/X-API-Key headers."""
+    return _extract_key(authorization, x_api_key)
+
+
 def check_auth(
     settings: Settings,
     authorization: str | None,
