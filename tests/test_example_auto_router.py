@@ -15,7 +15,9 @@ from broker.app import create_app
 from broker.config import Settings
 from broker.registry import load_registry
 
-EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "auto-router" / "registry.example.yaml"
+EXAMPLE = (
+    Path(__file__).resolve().parent.parent / "examples" / "auto-router" / "registry.example.yaml"
+)
 
 
 def test_example_registry_loads_with_all_router_features():
