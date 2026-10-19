@@ -44,3 +44,33 @@ def check_auth(
         "invalid API key",
         remediation="use a configured API key",
     )
+
+
+def check_admin(
+    settings: Settings,
+    authorization: str | None,
+    x_api_key: str | None,
+    x_admin_key: str | None = None,
+) -> None:
+    """Authorize a privileged admin request (ADR 0012).
+
+    Deliberately separate from :func:`check_auth`: admin actions (model unload/
+    load, registry reload) are gated by a dedicated ``admin_api_keys`` list, not
+    the normal API keys, so the control plane is isolated from the data plane. A
+    future virtual-key admin scope (ADR 0008) can replace this one function
+    without touching the routes. The admin key may be presented as
+    ``X-Admin-Key``, ``Authorization: Bearer ...``, or ``X-API-Key``.
+    """
+    presented = x_admin_key.strip() if x_admin_key else _extract_key(authorization, x_api_key)
+    if not presented:
+        raise AuthError(
+            "missing admin key",
+            remediation="send X-Admin-Key (or Authorization: Bearer) with an admin API key",
+        )
+    for key in settings.admin_api_keys:
+        if hmac.compare_digest(presented, key):
+            return
+    raise AuthError(
+        "invalid admin key",
+        remediation="use a configured BROKER_ADMIN_API_KEYS value",
+    )

@@ -138,6 +138,40 @@ class Settings(BaseSettings):
     # --- Limits ---
     max_request_bytes: int = 2_000_000
 
+    # --- Response cache (ADR 0012) ---
+    # Exact-match response cache, default OFF (defaults reproduce v0.4.0). When
+    # enabled, identical requests to the same model/key scope are served from a
+    # cache backed by the ADR 0009 StateStore (in-process or Redis), skipping
+    # inference. The key hashes (key/tenant scope, resolved public model,
+    # normalized messages/prompt/input, sampling + tools + response_format), so a
+    # cached answer can NEVER cross a key/tenant boundary. Errors and partial
+    # (streamed) responses are never cached; streaming requests bypass the cache.
+    #   deterministic_only: by default only cache deterministic requests
+    #     (temperature==0 or an explicit seed); set false to cache all requests.
+    #   max_bytes: per-entry cap — a serialized result larger than this is not
+    #     stored (0 = no cap). max_entries bounds the in-process index (LRU).
+    response_cache_enabled: bool = False
+    response_cache_ttl_seconds: float = 300.0
+    response_cache_max_entries: int = 1000
+    response_cache_max_bytes: int = 1_000_000
+    response_cache_deterministic_only: bool = True
+
+    # --- Admin runtime control (ADR 0012) ---
+    # Privileged runtime-control surface (GET /admin/models, model unload/load,
+    # registry hot-reload), default OFF. When enabled it is gated by a dedicated
+    # admin-key list via the `require_admin` dependency — intentionally separate
+    # from the normal API keys so a future virtual-key admin scope (ADR 0008) can
+    # replace BROKER_ADMIN_API_KEYS without touching the route code.
+    admin_enabled: bool = False
+    admin_api_keys: list[str] = Field(default_factory=list)
+    # Seconds to wait for in-flight requests to drain before an unload/reload
+    # gives up (and reports the model still busy).
+    admin_drain_timeout_seconds: float = 30.0
+
+    # --- Web UI / playground (ADR 0012) --- DEFERRED (see ADR 0012). The flag is
+    # reserved so a future static page at /ui is opt-in; it currently does nothing.
+    ui_enabled: bool = False
+
     # --- Security allow-lists ---
     allowed_exec_dirs: list[str] = Field(
         default_factory=lambda: ["/usr/bin", "/usr/local/bin", "/opt"]
@@ -158,7 +192,14 @@ class Settings(BaseSettings):
 
     # --- Observability ---
     metrics_enabled: bool = True
+    # Distributed tracing (ADR 0012): OFF by default, zero overhead when off.
+    # When true, the OPTIONAL `otel` extra must be installed (pip install
+    # 'backend-agnostic-broker[otel]') or startup fails fast with a ConfigError.
+    # Spans carry gen_ai.* metadata only — NEVER prompt/response content. The
+    # OTLP exporter is configured entirely via standard OTEL_* env vars
+    # (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL/HEADERS, ...).
     tracing_enabled: bool = False
+    tracing_service_name: str = "backend-agnostic-broker"
 
     # --- Usage accounting (request + routing-decision log; see ADR 0007) ---
     # One row per completed request (metadata + token counts only, never content).
@@ -223,6 +264,26 @@ class Settings(BaseSettings):
             raise ConfigError("BROKER_COOLDOWN_SECONDS must be >= 0")
         if self.redis_url is not None and not self.redis_url:
             raise ConfigError("BROKER_REDIS_URL must be a non-empty URL when set")
+        if self.response_cache_enabled:
+            if self.response_cache_ttl_seconds < 0:
+                raise ConfigError("BROKER_RESPONSE_CACHE_TTL_SECONDS must be >= 0 (0 = no TTL)")
+            if self.response_cache_max_entries < 0:
+                raise ConfigError("BROKER_RESPONSE_CACHE_MAX_ENTRIES must be >= 0 (0 = unbounded)")
+            if self.response_cache_max_bytes < 0:
+                raise ConfigError("BROKER_RESPONSE_CACHE_MAX_BYTES must be >= 0 (0 = no cap)")
+        if self.admin_enabled and self.auth_enabled and not self.admin_api_keys:
+            raise ConfigError(
+                "admin runtime control is enabled but no admin API keys are configured",
+                remediation="set BROKER_ADMIN_API_KEYS (separate from BROKER_API_KEYS)",
+            )
+        if self.tracing_enabled:
+            try:
+                import opentelemetry  # noqa: F401
+            except ImportError as exc:
+                raise ConfigError(
+                    "BROKER_TRACING_ENABLED=true but the 'opentelemetry' package is not installed",
+                    remediation="pip install 'backend-agnostic-broker[otel]'",
+                ) from exc
         if not Path(self.registry_path).exists():
             raise ConfigError(
                 f"registry not found: {self.registry_path!r}",
