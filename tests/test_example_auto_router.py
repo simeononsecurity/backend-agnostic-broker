@@ -27,6 +27,9 @@ def test_example_registry_loads_with_all_router_features():
     assert r.cascade.scorer.enabled is True
     assert r.cascade.stream_mode == "buffer"
     assert r.latency_budget_ms == 4000
+    # Opt-in cost normalization (ADR 0019): the example enables it to keep code on
+    # the dedicated code model rather than the cheap generalist (default is off).
+    assert r.weights.cost_normalized is True
     # Placement labels + cost tiers parsed on the models.
     by = reg.by_alias()
     assert by["coder"].cost_tier == 3 and "code" in by["coder"].tags

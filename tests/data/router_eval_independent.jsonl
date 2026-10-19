@@ -1,0 +1,44 @@
+{"prompt": "hey there, long day huh", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "can you recommend a good sci-fi book", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "what's a nice name for a golden retriever puppy", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "how do I politely decline a wedding invitation", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "is it going to be weird if I wear sneakers to an office party", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "what should I pack for a weekend in Chicago in October", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "thanks, that helped a lot!", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "who painted the Mona Lisa", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "my node app crashes with 'cannot read properties of undefined (reading map)' \u2014 what's going on", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "how do I reverse a linked list in rust", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "why is my SQL query with a LEFT JOIN returning duplicate rows", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "convert this bash loop to use xargs so it runs in parallel", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "what's the difference between git rebase and git merge", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "my react component re-renders infinitely when I call setState in useEffect", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "write a dockerfile for a flask app", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "how do I mock a datetime in pytest", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "explain big-O of quicksort's worst case and how to avoid it in my implementation", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "segfault when freeing a pointer twice in C \u2014 how do I track it down", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "make this go struct implement the Stringer interface", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "kubectl says CrashLoopBackOff, how do I debug the pod", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "what's 17% of 2,340", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "if a train leaves at 3pm going 60 mph and another at 4pm going 80 mph, when does the second catch up", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "find the roots of x^2 - 5x + 6", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "how many ways can 5 people sit around a round table", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "what's the sum of the first 100 odd numbers", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "is 221 prime", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "convert 0.375 to a fraction in lowest terms", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "what's the expected value of rolling two dice and taking the max", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "simplify (a^3 b^2)/(a b^5)", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "prove that the square root of 2 is irrational", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "write me a short bedtime story about a brave snail", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "creative"}
+{"prompt": "give me a funny toast for my brother's wedding", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "creative"}
+{"prompt": "compose four lines of verse about autumn rain", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "creative"}
+{"prompt": "write a limerick about a cat who codes", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "creative"}
+{"prompt": "come up with a tagline for a coffee shop called Bean There", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "creative"}
+{"prompt": "three boxes are mislabeled apples, oranges, mixed \u2014 you can pick one fruit from one box; how do you relabel all of them", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "if all bloops are razzies and some razzies are lazzies, are some bloops definitely lazzies", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "weigh the pros and cons of renting vs buying a home over 10 years given 6% mortgage rates", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "a bat and ball cost $1.10 and the bat costs $1 more than the ball, how much is the ball", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "plan a step-by-step migration of a monolith to microservices with minimal downtime", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "why does correlation not imply causation \u2014 give a concrete counterexample", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "if I fold a paper in half 42 times how thick would it be and why is that surprising", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "design a fair way for 3 roommates to split rent for rooms of different sizes", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "what is the flaw in the argument 'every event has a cause, so the universe has a first cause'", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
