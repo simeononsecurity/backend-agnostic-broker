@@ -23,7 +23,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
     "mypy>=1.8",
-    "fakeredis>=2",
+    "fakeredis[lua]>=2",
     "opentelemetry-sdk>=1.20",
 ]
 # Optional: shared routing/runtime state across replicas (ADR 0009). Absent this

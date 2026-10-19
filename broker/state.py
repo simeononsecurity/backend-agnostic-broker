@@ -49,6 +49,91 @@ from .errors import ConfigError
 
 
 @dataclass
+class GCRAResult:
+    """Outcome of a :meth:`StateStore.gcra` admission check (ADR 0016).
+
+    ``retry_after`` / ``reset_after`` are seconds (floats). ``remaining`` is the
+    number of further unit-cost requests allowed right now. They map directly onto
+    OpenAI's ``Retry-After`` / ``x-ratelimit-remaining-*`` / ``x-ratelimit-reset-*``
+    header contract.
+    """
+
+    allowed: bool
+    retry_after: float
+    remaining: int
+    reset_after: float
+
+
+def _gcra_compute(
+    tat_stored: float | None,
+    now: float,
+    emission_interval: float,
+    burst: float,
+    cost: float,
+) -> tuple[bool, float, int, float, float | None]:
+    """Pure GCRA (continuous-state leaky bucket) step — ITU-T Q.2961.1 GCRA(I, L).
+
+    ``emission_interval`` is ``I`` (= period/rate); the burst tolerance ``L`` is
+    ``emission_interval * burst`` (``burst`` = instantaneous requests allowed from
+    an idle bucket). A request of ``cost`` units arriving at ``now`` is conforming
+    iff ``now >= (max(tat, now) + I*cost) - I*burst``. Returns
+    ``(allowed, retry_after, remaining, reset_after, new_tat)`` where ``new_tat`` is
+    ``None`` when the request is rejected (the TAT is left unchanged). This is the
+    exact logic mirrored by the Redis Lua script so both backends agree.
+    """
+    if emission_interval <= 0:  # degenerate: no rate ⇒ never limit
+        return (True, 0.0, 0, 0.0, None)
+    tat = max(tat_stored if tat_stored is not None else now, now)
+    increment = emission_interval * cost
+    new_tat = tat + increment
+    burst_offset = emission_interval * burst
+    allow_at = new_tat - burst_offset
+    if now < allow_at:
+        retry_after = allow_at - now
+        remaining = max(0, int((burst_offset - (tat - now)) / emission_interval))
+        reset_after = max(0.0, tat - now)
+        return (False, retry_after, remaining, reset_after, None)
+    remaining = max(0, int((burst_offset - (new_tat - now)) / emission_interval))
+    reset_after = max(0.0, new_tat - now)
+    return (True, 0.0, remaining, reset_after, new_tat)
+
+
+# Redis-side GCRA: one atomic round-trip (KEYS[1]=tat key; ARGV=now,I,burst,cost).
+# Floats are returned as strings because Redis truncates Lua numbers to integers.
+_GCRA_LUA = """
+local tat = redis.call('GET', KEYS[1])
+local now = tonumber(ARGV[1])
+local emission = tonumber(ARGV[2])
+local burst = tonumber(ARGV[3])
+local cost = tonumber(ARGV[4])
+if tat then tat = tonumber(tat) else tat = now end
+if tat < now then tat = now end
+local increment = emission * cost
+local new_tat = tat + increment
+local burst_offset = emission * burst
+local allow_at = new_tat - burst_offset
+if now < allow_at then
+  local retry_after = allow_at - now
+  local remaining = math.floor((burst_offset - (tat - now)) / emission)
+  if remaining < 0 then remaining = 0 end
+  local reset = tat - now
+  if reset < 0 then reset = 0 end
+  return {0, tostring(retry_after), remaining, tostring(reset)}
+else
+  local ttl = new_tat - now
+  local px = math.ceil(ttl * 1000)
+  if px < 1 then px = 1 end
+  redis.call('SET', KEYS[1], tostring(new_tat), 'PX', px)
+  local remaining = math.floor((burst_offset - (new_tat - now)) / emission)
+  if remaining < 0 then remaining = 0 end
+  local reset = new_tat - now
+  if reset < 0 then reset = 0 end
+  return {1, '0', remaining, tostring(reset)}
+end
+"""
+
+
+@dataclass
 class CooldownRecord:
     """A member's consecutive-failure + cooldown state at a point in time."""
 
@@ -123,6 +208,24 @@ class StateStore:
     async def window_count(self, key: str, window_seconds: float, now: float | None = None) -> int:
         raise NotImplementedError
 
+    async def gcra(
+        self,
+        key: str,
+        *,
+        emission_interval: float,
+        burst: float,
+        cost: float = 1.0,
+        now: float | None = None,
+    ) -> GCRAResult:
+        """Atomic GCRA/token-bucket admission check (ADR 0016).
+
+        Consumes ``cost`` units from the bucket named ``key`` if conforming,
+        advancing the theoretical arrival time; a rejected request leaves state
+        untouched. Atomic on both backends (single event loop in-process; one Lua
+        round-trip on Redis), so it is safe across replicas.
+        """
+        raise NotImplementedError
+
     # --- cooldowns -------------------------------------------------------
     async def record_failure(
         self,
@@ -186,6 +289,7 @@ class InProcessStateStore(StateStore):
         self._cooldowns: dict[str, tuple[int, float]] = {}  # key -> (failures, until)
         self._halfopen: dict[str, float] = {}  # key -> trial-lock expiry ts
         self._kv: dict[str, tuple[bytes, float | None]] = {}
+        self._gcra: dict[str, tuple[float, float]] = {}  # key -> (tat, expiry)
 
     # --- sticky map ---
     async def sticky_get(self, pool: str, session: str) -> str | None:
@@ -247,6 +351,31 @@ class InProcessStateStore(StateStore):
         if not stamps:
             self._windows.pop(key, None)
         return len(stamps)
+
+    async def gcra(
+        self,
+        key: str,
+        *,
+        emission_interval: float,
+        burst: float,
+        cost: float = 1.0,
+        now: float | None = None,
+    ) -> GCRAResult:
+        now = time.time() if now is None else now
+        rec = self._gcra.get(key)
+        tat_stored: float | None = None
+        if rec is not None:
+            tat, exp = rec
+            if now >= exp:
+                self._gcra.pop(key, None)
+            else:
+                tat_stored = tat
+        allowed, retry_after, remaining, reset_after, new_tat = _gcra_compute(
+            tat_stored, now, emission_interval, burst, cost
+        )
+        if new_tat is not None:
+            self._gcra[key] = (new_tat, new_tat)  # expire once the bucket drains
+        return GCRAResult(allowed, retry_after, remaining, reset_after)
 
     # --- cooldowns ---
     async def record_failure(
@@ -408,6 +537,35 @@ class RedisStateStore(StateStore):
             pipe.zcard(k)
             results = await pipe.execute()
         return int(results[-1])
+
+    async def gcra(
+        self,
+        key: str,
+        *,
+        emission_interval: float,
+        burst: float,
+        cost: float = 1.0,
+        now: float | None = None,
+    ) -> GCRAResult:
+        now = time.time() if now is None else now
+        if emission_interval <= 0:
+            return GCRAResult(True, 0.0, 0, 0.0)
+        # EVAL (not EVALSHA) — one atomic round-trip that works on real Redis and
+        # on fakeredis (which does not implement the script cache / EVALSHA).
+        res = await self._r.eval(
+            _GCRA_LUA,
+            1,
+            self._k("gcra", key),
+            repr(now),
+            repr(emission_interval),
+            repr(float(burst)),
+            repr(float(cost)),
+        )
+        allowed = int(res[0]) == 1
+        retry_after = float(res[1])
+        remaining = int(res[2])
+        reset_after = float(res[3])
+        return GCRAResult(allowed, retry_after, remaining, reset_after)
 
     # --- cooldowns ---
     async def record_failure(

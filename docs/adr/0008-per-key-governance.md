@@ -3,6 +3,8 @@
 - Status: Accepted
 - Date: 2026-10-19
 - Supersedes: none
+- Extended by: ADR 0016 (governance v2 — GCRA/token-bucket, per-model + tenant
+  limits, per-key placement, key rotation, admin key API)
 - Related: ADR 0007 (usage store), ADR 0009 (`StateStore`, shared counters);
   `docs/security-model.md`, `docs/threat-model.md`, `docs/configuration.md`,
   `docs/api-reference.md`, `docs/operations-runbook.md`, `docs/roadmap.md`;

@@ -90,20 +90,92 @@ def _key_id_from_secret(secret: str) -> str | None:
 
 
 @dataclass
+class PerModelLimit:
+    """Per-model rpm/tpm override for a single key (ADR 0016).
+
+    Applied to the *resolved* model (the ``auto`` router's pick and every cascade
+    hop), so a model-scoped cap cannot be bypassed via ``auto`` or an escalation.
+    ``None`` on an axis means unlimited for that model on that axis.
+    """
+
+    rpm: int | None = None
+    tpm: int | None = None
+    rpm_burst: int | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> PerModelLimit:
+        d = d or {}
+        return cls(rpm=d.get("rpm"), tpm=d.get("tpm"), rpm_burst=d.get("rpm_burst"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            k: v
+            for k, v in {"rpm": self.rpm, "tpm": self.tpm, "rpm_burst": self.rpm_burst}.items()
+            if v is not None
+        }
+
+
+@dataclass
+class TenantLimits:
+    """Aggregate token/cost budgets shared by every key of a tenant (ADR 0016).
+
+    Enforced *in addition* to per-key budgets (LiteLLM's org>team>user>key model: a
+    request must pass every budget that applies). Only budgets live here — rpm/tpm
+    stay per-key.
+    """
+
+    daily_token_budget: int | None = None
+    monthly_token_budget: int | None = None
+    daily_cost_usd: float | None = None
+    monthly_cost_usd: float | None = None
+
+    @property
+    def any_budget(self) -> bool:
+        return any(
+            v is not None
+            for v in (
+                self.daily_token_budget,
+                self.monthly_token_budget,
+                self.daily_cost_usd,
+                self.monthly_cost_usd,
+            )
+        )
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> TenantLimits:
+        d = d or {}
+        return cls(
+            daily_token_budget=d.get("daily_token_budget"),
+            monthly_token_budget=d.get("monthly_token_budget"),
+            daily_cost_usd=d.get("daily_cost_usd"),
+            monthly_cost_usd=d.get("monthly_cost_usd"),
+        )
+
+
+@dataclass
 class KeyLimits:
     """Per-key governance limits. ``None``/empty means *unlimited* for that axis."""
 
     rpm: int | None = None
     tpm: int | None = None
+    rpm_burst: int | None = None  # GCRA burst capacity (ADR 0016); default = rpm
     max_concurrency: int | None = None
     daily_token_budget: int | None = None
     monthly_token_budget: int | None = None
     daily_cost_usd: float | None = None
     monthly_cost_usd: float | None = None
     allowed_models: list[str] = field(default_factory=list)
+    placement: list[str] = field(default_factory=list)  # ADR 0016 per-key placement
+    per_model: dict[str, PerModelLimit] = field(default_factory=dict)  # ADR 0016
 
     @property
     def any_limit(self) -> bool:
+        """True if any *metered* (counter-backed) per-key limit is set.
+
+        ``placement`` and ``per_model`` are enforced on their own paths (placement
+        machinery / model guard), independently of the global admission fast-path,
+        so they deliberately do not toggle this.
+        """
         return any(
             v is not None
             for v in (
@@ -120,15 +192,21 @@ class KeyLimits:
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> KeyLimits:
         d = d or {}
+        per_model = {
+            str(k): PerModelLimit.from_dict(v) for k, v in (d.get("per_model") or {}).items()
+        }
         return cls(
             rpm=d.get("rpm"),
             tpm=d.get("tpm"),
+            rpm_burst=d.get("rpm_burst"),
             max_concurrency=d.get("max_concurrency"),
             daily_token_budget=d.get("daily_token_budget"),
             monthly_token_budget=d.get("monthly_token_budget"),
             daily_cost_usd=d.get("daily_cost_usd"),
             monthly_cost_usd=d.get("monthly_cost_usd"),
             allowed_models=list(d.get("allowed_models") or []),
+            placement=list(d.get("placement") or []),
+            per_model=per_model,
         )
 
 
@@ -147,10 +225,16 @@ class Principal:
     label: str | None = None
     limits: KeyLimits = field(default_factory=KeyLimits)
     unlimited: bool = False
+    tenant_limits: TenantLimits | None = None  # ADR 0016: aggregate tenant budgets
 
     @property
     def is_admin(self) -> bool:
         return self.scope == "admin"
+
+    @property
+    def tenant_governed(self) -> bool:
+        """True if this principal's tenant carries an aggregate budget to enforce."""
+        return self.tenant_limits is not None and self.tenant_limits.any_budget
 
 
 @dataclass
@@ -217,12 +301,19 @@ class KeyRecord:
             for k, v in {
                 "rpm": self.limits.rpm,
                 "tpm": self.limits.tpm,
+                "rpm_burst": self.limits.rpm_burst,
                 "max_concurrency": self.limits.max_concurrency,
                 "daily_token_budget": self.limits.daily_token_budget,
                 "monthly_token_budget": self.limits.monthly_token_budget,
                 "daily_cost_usd": self.limits.daily_cost_usd,
                 "monthly_cost_usd": self.limits.monthly_cost_usd,
                 "allowed_models": self.limits.allowed_models or None,
+                "placement": self.limits.placement or None,
+                "per_model": (
+                    {m: pm.to_dict() for m, pm in self.limits.per_model.items()}
+                    if self.limits.per_model
+                    else None
+                ),
             }.items()
             if v is not None
         }
@@ -253,11 +344,19 @@ class KeyStore:
         self.keys_path = keys_path
         self.legacy_api_keys = list(legacy_api_keys or [])
         self.records: dict[str, KeyRecord] = {}
+        self.tenants: dict[str, TenantLimits] = {}
         if keys_path and Path(keys_path).exists():
-            self.records = self._load(keys_path)
+            self.records, self.tenants = self._load(keys_path)
+
+    def reload(self) -> None:
+        """Re-read the keys file into memory (after a mutation via the admin API)."""
+        if self.keys_path and Path(self.keys_path).exists():
+            self.records, self.tenants = self._load(self.keys_path)
+        else:
+            self.records, self.tenants = {}, {}
 
     @staticmethod
-    def _load(path: str) -> dict[str, KeyRecord]:
+    def _load(path: str) -> tuple[dict[str, KeyRecord], dict[str, TenantLimits]]:
         try:
             data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
         except Exception as exc:  # noqa: BLE001
@@ -277,7 +376,16 @@ class KeyStore:
             if rec.id in out:
                 raise ConfigError(f"duplicate key id in keys file: {rec.id!r}")
             out[rec.id] = rec
-        return out
+        tenants: dict[str, TenantLimits] = {}
+        raw_tenants = data.get("tenants") if isinstance(data, dict) else None
+        if raw_tenants:
+            if not isinstance(raw_tenants, dict):
+                raise ConfigError(
+                    "keys file 'tenants' must be a mapping of tenant -> budgets",
+                    remediation="see keys.example.yaml",
+                )
+            tenants = {str(name): TenantLimits.from_dict(v) for name, v in raw_tenants.items()}
+        return out, tenants
 
     @property
     def any_configured(self) -> bool:
@@ -286,7 +394,14 @@ class KeyStore:
     @property
     def governance_active(self) -> bool:
         """True if any virtual key declares a limit (so counters are needed)."""
-        return any(r.limits.any_limit for r in self.records.values())
+        return any(r.limits.any_limit for r in self.records.values()) or any(
+            t.any_budget for t in self.tenants.values()
+        )
+
+    def _attach_tenant(self, principal: Principal) -> Principal:
+        if principal.tenant is not None:
+            principal.tenant_limits = self.tenants.get(principal.tenant)
+        return principal
 
     def resolve(self, presented: str | None) -> Principal | None:
         """Return the :class:`Principal` for a presented secret, or ``None``.
@@ -315,7 +430,7 @@ class KeyStore:
         target_hash = rec.secret_sha256 if rec is not None else _DUMMY_HASH
         match = hmac.compare_digest(presented_hash, target_hash)
         if rec is not None and match and rec.enabled and not rec.is_expired():
-            return rec.principal()
+            return self._attach_tenant(rec.principal())
 
         # --- legacy flat keys (unlimited user) ---
         # Byte-wise constant-time compare: a non-ASCII presented key must fail to
@@ -327,6 +442,103 @@ class KeyStore:
             fp = hash_secret(presented)[:12]
             return Principal(usage_id=f"legacy_{fp}", scope="user", unlimited=True)
         return None
+
+    # --- mutation (admin key-management API, ADR 0016) -------------------
+    def _require_writable(self) -> str:
+        if not self.keys_path:
+            raise ConfigError(
+                "key management requires a keys file",
+                remediation="set BROKER_KEYS_PATH to a writable keys.yaml",
+            )
+        return self.keys_path
+
+    def create_key(
+        self,
+        *,
+        label: str | None = None,
+        tenant: str | None = None,
+        scope: str = "user",
+        limits: KeyLimits | None = None,
+        expiry: str | None = None,
+    ) -> tuple[KeyRecord, str]:
+        """Mint a new key, persist only its hash, and return ``(record, secret)``.
+
+        The plaintext ``secret`` is returned to the caller **once** and never
+        stored; persistence writes the SHA-256 hash only.
+        """
+        path = self._require_writable()
+        data = _read_raw(path)
+        existing = {str(k.get("id")) for k in data["keys"]}
+        key_id, secret = generate_secret()
+        while key_id in existing:  # vanishingly unlikely; still avoid a collision
+            key_id, secret = generate_secret()
+        rec = KeyRecord(
+            id=key_id,
+            secret_sha256=hash_secret(secret),
+            label=label,
+            tenant=tenant,
+            scope=scope if scope in ("user", "admin") else "user",
+            enabled=True,
+            expiry=expiry,
+            limits=limits or KeyLimits(),
+        )
+        data["keys"].append(rec.to_dict())
+        _write_raw(path, data)
+        self.reload()
+        return rec, secret
+
+    def revoke_key(self, key_id: str) -> bool:
+        """Disable a key by id (``brk_xxxx`` or ``xxxx``). Returns True if found."""
+        path = self._require_writable()
+        target = key_id.split("_", 2)[1] if key_id.startswith(f"{_SECRET_PREFIX}_") else key_id
+        data = _read_raw(path)
+        found = False
+        for item in data["keys"]:
+            if str(item.get("id")) == target:
+                item["enabled"] = False
+                found = True
+        if found:
+            _write_raw(path, data)
+            self.reload()
+        return found
+
+    def rotate_key(self, key_id: str, *, grace_days: int = 7) -> tuple[KeyRecord, str] | None:
+        """Mint a successor inheriting the predecessor's settings; return (rec, secret).
+
+        The old key is kept valid for ``grace_days`` (its ``expiry`` is set to
+        today+grace so both keys work during cutover); ``grace_days == 0`` revokes
+        it immediately. Returns ``None`` if no such key exists.
+        """
+        path = self._require_writable()
+        target = key_id.split("_", 2)[1] if key_id.startswith(f"{_SECRET_PREFIX}_") else key_id
+        data = _read_raw(path)
+        old_item = next((it for it in data["keys"] if str(it.get("id")) == target), None)
+        if old_item is None:
+            return None
+        old = KeyRecord.from_dict(old_item)
+        new_id, secret = generate_secret()
+        new_rec = KeyRecord(
+            id=new_id,
+            secret_sha256=hash_secret(secret),
+            label=old.label,
+            tenant=old.tenant,
+            scope=old.scope,
+            enabled=True,
+            expiry=None,
+            limits=old.limits,
+        )
+        if grace_days <= 0:
+            old_item["enabled"] = False
+        else:
+            grace = (_dt.datetime.now(_dt.UTC).date() + _dt.timedelta(days=grace_days)).isoformat()
+            old_item["expiry"] = grace
+        data["keys"].append(new_rec.to_dict())
+        _write_raw(path, data)
+        self.reload()
+        return new_rec, secret
+
+    def list_records(self) -> list[KeyRecord]:
+        return list(self.records.values())
 
 
 # --------------------------------------------------------------------------- #
@@ -354,20 +566,43 @@ def _write_raw(path: str, data: dict[str, Any]) -> None:
     Path(path).write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 
-def _cmd_create(args: argparse.Namespace) -> int:
-    path = _default_path(args.path)
-    data = _read_raw(path)
-    key_id, secret = generate_secret()
-    limits = KeyLimits(
+def _parse_per_model(specs: list[str] | None) -> dict[str, PerModelLimit]:
+    """Parse repeated ``--per-model model:rpm:tpm`` (blank = unlimited axis)."""
+    out: dict[str, PerModelLimit] = {}
+    for spec in specs or []:
+        parts = spec.split(":")
+        if not parts or not parts[0].strip():
+            raise ValueError(f"invalid --per-model {spec!r}; use model:rpm:tpm")
+        model = parts[0].strip()
+        rpm = int(parts[1]) if len(parts) > 1 and parts[1].strip() else None
+        tpm = int(parts[2]) if len(parts) > 2 and parts[2].strip() else None
+        out[model] = PerModelLimit(rpm=rpm, tpm=tpm)
+    return out
+
+
+def _limits_from_args(args: argparse.Namespace) -> KeyLimits:
+    return KeyLimits(
         rpm=args.rpm,
         tpm=args.tpm,
+        rpm_burst=getattr(args, "rpm_burst", None),
         max_concurrency=args.max_concurrency,
         daily_token_budget=args.daily_tokens,
         monthly_token_budget=args.monthly_tokens,
         daily_cost_usd=args.daily_cost,
         monthly_cost_usd=args.monthly_cost,
         allowed_models=[m.strip() for m in (args.allowed_models or "").split(",") if m.strip()],
+        placement=[
+            p.strip() for p in (getattr(args, "placement", None) or "").split(",") if p.strip()
+        ],
+        per_model=_parse_per_model(getattr(args, "per_model", None)),
     )
+
+
+def _cmd_create(args: argparse.Namespace) -> int:
+    path = _default_path(args.path)
+    data = _read_raw(path)
+    key_id, secret = generate_secret()
+    limits = _limits_from_args(args)
     rec = KeyRecord(
         id=key_id,
         secret_sha256=hash_secret(secret),
@@ -422,6 +657,22 @@ def _cmd_revoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_rotate(args: argparse.Namespace) -> int:
+    path = _default_path(args.path)
+    store = KeyStore(path)
+    result = store.rotate_key(args.id, grace_days=args.grace_days)
+    if result is None:
+        print(f"no key with id {args.id!r} in {path}", file=sys.stderr)
+        return 1
+    new_rec, secret = result
+    old_state = "revoked now" if args.grace_days <= 0 else f"valid for {args.grace_days}d (grace)"
+    print(f"Rotated {args.id} -> {new_rec.prefix}; predecessor {old_state}.")
+    print("New secret (shown once — store it now, it cannot be recovered):")
+    print(f"  {secret}")
+    print(f"Written to {path} (hash only).")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m broker.keys", description="Manage virtual API keys")
     p.add_argument("--path", help="keys file (default: $BROKER_KEYS_PATH or keys.yaml)")
@@ -433,6 +684,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--scope", choices=["user", "admin"], default="user")
     c.add_argument("--rpm", type=int)
     c.add_argument("--tpm", type=int)
+    c.add_argument(
+        "--rpm-burst", type=int, dest="rpm_burst", help="GCRA burst capacity (default=rpm)"
+    )
     c.add_argument("--max-concurrency", type=int, dest="max_concurrency")
     c.add_argument("--daily-tokens", type=int, dest="daily_tokens")
     c.add_argument("--monthly-tokens", type=int, dest="monthly_tokens")
@@ -440,6 +694,13 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--monthly-cost", type=float, dest="monthly_cost", help="USD/month cost budget")
     c.add_argument(
         "--allowed-models", dest="allowed_models", help="comma-separated model allow-list"
+    )
+    c.add_argument("--placement", help="comma-separated required placement labels for this key")
+    c.add_argument(
+        "--per-model",
+        dest="per_model",
+        action="append",
+        help="per-model limit 'model:rpm:tpm' (repeatable; blank axis = unlimited)",
     )
     c.add_argument("--expiry", help="ISO date YYYY-MM-DD (UTC), or omit for never")
     c.set_defaults(func=_cmd_create)
@@ -450,6 +711,17 @@ def build_parser() -> argparse.ArgumentParser:
     rv = sub.add_parser("revoke", help="disable a key by id")
     rv.add_argument("id", help="key id (brk_xxxx or xxxx)")
     rv.set_defaults(func=_cmd_revoke)
+
+    rot = sub.add_parser("rotate", help="mint a successor key with a grace overlap")
+    rot.add_argument("id", help="key id to rotate (brk_xxxx or xxxx)")
+    rot.add_argument(
+        "--grace-days",
+        type=int,
+        dest="grace_days",
+        default=7,
+        help="days the old key stays valid (0 = revoke immediately); default 7",
+    )
+    rot.set_defaults(func=_cmd_rotate)
     return p
 
 

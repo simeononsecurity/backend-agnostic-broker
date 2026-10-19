@@ -51,7 +51,7 @@ import itertools
 import logging
 import random
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -675,15 +675,19 @@ class ModelManager:
         required_placement: frozenset[str] | None = None,
         latency_budget_ms: float | None = None,
         allowed_models: set[str] | None = None,
+        model_guard: Callable[[str], Awaitable[None]] | None = None,
     ) -> dict:
         req = frozenset(required_placement or ())
         resolved = await self._resolve_route(name, payload, req, latency_budget_ms)
         # ADR 0008 fail-closed per-key scoping applies to the (possibly auto-
         # chosen) resolved model, so scoping cannot be bypassed via `auto`.
         self._check_allowed(resolved.hops[0], allowed_models)
+        # ADR 0016 per-model rpm/tpm limits on the resolved model (auto pick).
+        if model_guard is not None:
+            await model_guard(resolved.hops[0])
         if resolved.mode == "cascade" and len(resolved.hops) > 1:
             return await self._serve_cascade(
-                resolved, payload, request_id, route_key, allowed_models
+                resolved, payload, request_id, route_key, allowed_models, model_guard
             )
         result = await self._serve_one(resolved.hops[0], payload, request_id, route_key, req)
         if isinstance(result, dict):
@@ -721,6 +725,7 @@ class ModelManager:
         request_id: str,
         route_key: str | None,
         allowed_models: set[str] | None = None,
+        model_guard: Callable[[str], Awaitable[None]] | None = None,
     ) -> dict:
         """Serve the cheapest-capable hop; escalate once on a quality signal.
 
@@ -744,6 +749,8 @@ class ModelManager:
         # Escalate: fail-closed scoping on the stronger hop, record the primary
         # hop, then serve the stronger model.
         self._check_allowed(escalation, allowed_models)
+        if model_guard is not None:
+            await model_guard(escalation)
         self._record_hop("chat_cascade", resolved.public_name, result, request_id, "escalated")
         result2 = await self._serve_one(escalation, payload, request_id, route_key, req)
         served = result2.get("model", escalation) if isinstance(result2, dict) else escalation
@@ -817,12 +824,15 @@ class ModelManager:
         route_key: str | None = None,
         required_placement: frozenset[str] | None = None,
         allowed_models: set[str] | None = None,
+        model_guard: Callable[[str], Awaitable[None]] | None = None,
     ) -> AsyncIterator[bytes]:
         req = frozenset(required_placement or ())
         # ``name`` is already a concrete model (the API resolves streaming routes via
         # resolve_stream); placement is re-validated here when selecting members and
         # per-key scoping (ADR 0008) is re-checked fail-closed on the served model.
         self._check_allowed(name, allowed_models)
+        if model_guard is not None:
+            await model_guard(name)
         members = self._members_for(name, req)
         prefix_blocks = self._prefix_blocks(payload)
         exclude: set[str] = set()
@@ -901,6 +911,7 @@ class ModelManager:
         route_key: str | None = None,
         required_placement: frozenset[str] | None = None,
         allowed_models: set[str] | None = None,
+        model_guard: Callable[[str], Awaitable[None]] | None = None,
     ) -> dict:
         """Route an embeddings request through pool selection + failover.
 
@@ -911,6 +922,8 @@ class ModelManager:
         """
         req = frozenset(required_placement or ())
         self._check_allowed(name, allowed_models)
+        if model_guard is not None:
+            await model_guard(name)
         members = self._members_for(name, req)
         return await self._route_and_serve(
             name,
