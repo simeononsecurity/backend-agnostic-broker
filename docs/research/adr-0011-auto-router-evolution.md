@@ -84,17 +84,42 @@ weak model `M_w` (low quality, low cost); a router `MR_α` with cost threshold
 strong-call fraction (e.g. `calibrate_threshold --strong-model-pct 0.5` →
 `threshold = 0.11593`) ([lm-sys/RouteLLM README](https://github.com/lm-sys/RouteLLM/blob/main/README.md)).
 
-**Adaptation for our harness.** Our router is multi-model and deterministic (no
-continuous `α`), so there is no single `MR_α` family out of the box. We therefore
-compute the RouteLLM curve from the *labels* (an oracle frontier: weak = globally
-cheapest model, strong = the highest-cost acceptable model per prompt; sweep the
-strong-call fraction by greedily granting the strongest pick to the prompts that
-gain the most), yielding APGR and CPT(50/80%) that characterize the *dataset's*
-achievable cost–quality frontier. We then plot our actual router's operating
-point (its accuracy, its strong-call fraction, its PGR) against that frontier.
-This keeps RouteLLM's exact definitions while making them computable for a
-deterministic, >2-model router. This adaptation is recorded in both
-`scripts/router_eval.py` and ADR 0011.
+**Adaptation for our harness.** Our broker is multi-model and deterministic (no
+continuous `α`), and — unlike RouteLLM's two-model benchmark — no single concrete
+model is capable across every task type (e.g. the most expensive model, `reasoner`,
+cannot serve a vision prompt). Two consequences and how we handle them:
+
+1. **The strong reference must be a true quality ceiling.** Using the
+   globally-most-expensive model as `M_s` is *not* a ceiling here: it scores below
+   a capability-aware router, so `r(M_s) < r(MR)` and PGR saturates above 1 (our
+   first implementation silently clamped it to 1.000 — a meaningless value). We
+   instead define the strong reference as the **quality ceiling**
+   `r(M_s) = (1/|Q|) Σ_q max_m s(q, m)` — the accuracy of a perfect oracle that
+   always picks an acceptable model when one exists. By construction
+   `r(M_s) ≥ r(any router)`, so PGR ∈ [0, 1] with no clamping. `M_w` stays the
+   globally cheapest model. (The alternative — restricting to the subset where both
+   a fixed weak and fixed strong model are capable — degenerates on our catalogue:
+   `tiny` and `reasoner` are jointly capable only on trivial prompts, where both
+   score 1 and the gap is zero, so we use the ceiling definition instead.)
+
+2. **APGR/CPT must trace the *router's own* curve, not an oracle frontier.** There
+   is no single `MR_α` family, but the heuristic router exposes a real cost knob —
+   `router.weights.cost`, the cost-penalty weight. We **sweep it over ≥10 points**
+   and, at each setting, re-route the whole labeled set and record
+   `(normalized_mean_cost, PGR)`. Integrating PGR over that swept curve gives
+   `apgr_router`; `cpt_router(x%)` is the minimum normalized cost on it to reach
+   PGR ≥ x%. The router's default-weights operating point is reported on the same
+   curve. We additionally compute an **oracle cost–quality frontier** (keep every
+   weak-correct prompt on the cheapest model, upgrade each weak-wrong prompt to its
+   cheapest acceptable model, cheapest fixes first) as a **separately labeled
+   upper bound** (`oracle_*`), never under the bare name APGR. The oracle
+   dominates the router curve by construction (`apgr_oracle ≥ apgr_router`,
+   `cpt_oracle ≤ cpt_router`), which the harness tests assert.
+
+**No silent clamping.** PGR is reported raw. When the gap `r(M_s) − r(M_w) ≤ 0`,
+or a value falls outside `[0, 1]`, the affected metric is emitted as `invalid`
+with a reason in both the markdown and JSON output. This adaptation is recorded in
+`scripts/router_eval.py`, its tests, and ADR 0011.
 
 ## Findings
 

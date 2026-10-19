@@ -70,11 +70,17 @@ reproduces v0.4.0 behavior exactly.
    acceptable-model / cheapest-capable labels and quality tiers). It runs the
    **heuristic** backend offline (CI-able), optionally the LLM backend when a GGUF
    is present, and computes accuracy, cheapest-capable match, cost-weighting, and
-   RouteLLM's **PGR / APGR / CPT(50%,80%)** against an oracle cost–quality frontier
-   derived from the labels (the deterministic, >2-model adaptation of RouteLLM's
-   definitions is documented in the research note and the script). It emits a
-   markdown report; a pytest runs it on the heuristic backend and asserts the
-   metrics are computed and in range.
+   RouteLLM's **PGR / APGR / CPT(50%,80%)**. PGR uses a **true quality ceiling**
+   `r(M_s) = mean_q max_m s(q, m)` (perfect-oracle accuracy) rather than the
+   most-expensive model, which on a multi-capability catalogue is not a ceiling and
+   produced a meaningless clamped `PGR = 1.000`. APGR/CPT are traced from the
+   **router's own cost–quality curve** by sweeping `router.weights.cost` over ≥10
+   points; the oracle label frontier is reported **separately as an upper bound**.
+   PGR is raw (no clamping); a non-positive gap or out-of-range value is marked
+   `invalid` with a reason. The >2-model adaptation, definitions, and citations are
+   in the research note and the script. It emits a markdown report; a pytest runs
+   it on the heuristic backend and asserts the metrics (including the no-clamp and
+   `invalid` behaviors) against hand-computed values.
 
 No new mandatory dependency is introduced; cascade/latency/placement are pure
 Python over existing data, and the eval harness is stdlib-only.
@@ -111,10 +117,13 @@ Python over existing data, and the eval harness is stdlib-only.
 - **Risks** — an over-eager refusal regex could escalate too often (mitigation:
   signals are opt-in and data-driven, defaults conservative); a misconfigured
   placement label could deny all traffic (mitigation: fail-closed is intentional
-  and the 403 names the required labels); the harness's APGR/CPT are an adaptation
-  of RouteLLM's two-model definitions (mitigation: the adaptation is documented in
-  the research note and the script, and the raw accuracy/cost numbers are reported
-  alongside).
+  and the 403 names the required labels); the harness's RouteLLM metrics are an
+  adaptation of RouteLLM's two-model definitions to a deterministic, multi-model
+  router (mitigation: the strong reference is a true quality ceiling so PGR is not
+  clamped, APGR/CPT are swept from the router's own curve with the oracle frontier
+  reported separately as an upper bound, invalid cases are flagged with a reason,
+  and the adaptation is documented in the research note and the script with raw
+  accuracy/cost reported alongside).
 
 ## Confirmation
 
@@ -132,8 +141,11 @@ explicit models/pools), `broker/registry.py` (`placement`, `router.mode`,
   explicit model, and pool; pool member filtering; header parsing/validation.
 - `tests/test_router_latency.py` — latency-budget picks a faster capable model;
   budget never overrides capability; header parsing/validation.
-- `tests/test_router_eval.py` — the harness runs on the heuristic backend and
-  produces sane, in-range accuracy/APGR/CPT metrics on `tests/data/router_eval.jsonl`.
+- `tests/test_router_eval.py` — the RouteLLM metric primitives (PGR, frontier,
+  APGR, CPT, oracle frontier) are checked against hand-computed values, incl. the
+  no-clamping and `invalid`-on-degenerate behaviors; the harness runs offline on
+  the heuristic backend, and the router's swept curve is distinct from and bounded
+  by the oracle upper bound.
 - Existing `tests/test_router.py` is unchanged and green (default behavior
   preserved).
 

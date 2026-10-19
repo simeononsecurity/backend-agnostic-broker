@@ -26,10 +26,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     labels, else `403 placement_denied` — never spills to a non-compliant model.
   - **Eval harness**: `scripts/router_eval.py` + `tests/data/router_eval.jsonl`
     (45 labeled prompts) computes accuracy, cost-weighting, and RouteLLM
-    PGR/APGR/CPT; markdown/JSON report; runs offline on the heuristic backend.
+    PGR/APGR/CPT — PGR against a true quality ceiling (perfect-oracle accuracy,
+    not the most-expensive model), APGR/CPT swept from the router's own
+    cost-penalty curve (≥10 points) with the oracle label frontier reported
+    separately as an upper bound; PGR is raw (no clamping) and degenerate/out-of-
+    range values are flagged `invalid` with a reason. Markdown/JSON report; runs
+    offline on the heuristic backend.
   - New settings: `BROKER_ROUTER_LATENCY_BUDGET_MS`, `BROKER_ROUTER_LATENCY_WINDOW_SECONDS`,
     `BROKER_ROUTER_COLD_START_MS`, `BROKER_DEFAULT_PLACEMENT`. New error type
-    `placement_denied` (403); usage log gains `latency_percentiles`. 37 new tests.
+    `placement_denied` (403); usage log gains `latency_percentiles`. 45 new tests.
     See [docs/auto-router.md](docs/auto-router.md),
     [ADR 0011](docs/adr/0011-auto-router-evolution.md), and the research note.
 

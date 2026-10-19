@@ -228,10 +228,11 @@ curl -s localhost:8080/v1/chat/completions -H "Authorization: Bearer ***" \
 `scripts/router_eval.py` measures routing quality against a labeled set
 (`tests/data/router_eval.jsonl`, ≥40 prompts) instead of vibe-checking it. It runs
 the **heuristic** backend offline (no GPU/network) and optionally the LLM backend
-when a GGUF is available, computing accuracy, cheapest-capable match, cost
-weighting, and RouteLLM's **PGR / APGR / CPT(50%,80%)** against an oracle
-cost–quality frontier derived from the labels (the deterministic, multi-model
-adaptation of RouteLLM's definitions is documented in the research note).
+when a GGUF is available. It reports two families of numbers: **direct metrics**
+(always valid) and **RouteLLM metrics** (PGR / APGR / CPT), each computed both
+from the **router's own swept cost–quality curve** and from an **oracle upper
+bound** derived from the labels. The exact definitions and citations are in the
+research note (`docs/research/adr-0011-auto-router-evolution.md`).
 
 ```bash
 python scripts/router_eval.py                 # markdown report (heuristic backend)
@@ -242,23 +243,60 @@ python scripts/router_eval.py --backend llm   # use the GGUF classifier
 
 A CI run of the harness on the heuristic backend over the bundled 45-prompt set:
 
-| Metric | Value |
-|--------|-------|
+| Direct metric | Value |
+|---------------|-------|
 | Prompts | 45 |
 | Accuracy (chosen is acceptable) | 0.867 |
 | Cheapest-capable accuracy | 0.822 |
-| Mean cost_tier (router) | 2.29 |
-| Mean cost_tier (oracle) | 2.49 |
-| Weak-only accuracy r(Mw) | 0.267 |
-| Strong-only accuracy r(Ms) | 0.622 |
-| PGR (router operating point) | 1.000 |
-| APGR (oracle frontier) | 0.822 |
-| CPT(50%) strong-call fraction | 0.200 |
-| CPT(80%) strong-call fraction | 0.289 |
-| Router strong-call fraction | 0.022 |
+| Mean cost_tier (router) | 2.289 |
+| Mean cost_tier (oracle / cheapest-capable) | 2.489 |
+| Router strong-call fraction (top tier) | 0.022 |
+
+RouteLLM metrics. `r(M_w)` is the globally cheapest model's accuracy; `r(M_s)` is
+the **quality ceiling** — a perfect oracle that always picks an acceptable model
+(see "What the metrics mean" below). PGR / APGR / CPT in the *Router curve* column
+come from re-routing the whole set while sweeping `router.weights.cost` over 12
+points; the *Oracle upper bound* is the cost-optimal label frontier (a ceiling the
+router cannot beat), shown for reference only.
+
+| RouteLLM metric | Router curve | Oracle upper bound |
+|-----------------|--------------|--------------------|
+| r(M_w) / r(M_s) | 0.267 / 1.000 | — |
+| PGR (operating point) | 0.818 | — |
+| APGR | 0.724 | 0.849 |
+| CPT(50%) | 0.194 | 0.144 |
+| CPT(80%) | 0.322 | 0.272 |
 
 Per-task accuracy exposes real weaknesses — e.g. `math` ≈ 0.33 and `code` ≈ 0.60
 with the default weights, because a single tag match (+capability) can be
 outweighed by the cheap-model cost bonus. That is exactly the kind of regression
 the harness exists to surface (the motivating `tiny`-for-code mis-route); tune
-`router.weights` or add overrides and re-run to measure the effect.
+`router.weights` or add overrides and re-run to measure the effect. The swept
+curve confirms this directly: dropping `router.weights.cost` toward 0 lifts
+accuracy to ≈0.91 (PGR ≈0.88) by letting capability outweigh the cheap-model
+bonus — so the default weights are *not* this set's optimum.
+
+#### What the metrics mean (and the limits of label-based evaluation)
+
+- **Quality is binary capability-acceptability.** `s(q, m) = 1` iff model `m` is
+  in the prompt's `acceptable` list. "Accuracy" is the mean of `s` over the
+  router's picks. This measures *did the router pick a model that can serve the
+  request*, not answer quality — the labels encode capability, not graded merit.
+- **The strong reference is a true ceiling, not a single model.** RouteLLM's
+  two-model setup uses one strong model `M_s` that dominates the weak one. No
+  single concrete model here is capable across every task (e.g. `reasoner` cannot
+  do vision), so the most-expensive model is *not* a ceiling — using it produced
+  `r(M_s) < accuracy` and a meaningless `PGR` clamped to 1.000. We instead define
+  `r(M_s) = mean_q max_m s(q, m)` — the accuracy of perfect (oracle) routing — so
+  `r(M_s) ≥ r(any router)` and `PGR ∈ [0, 1]` by construction.
+- **APGR/CPT evaluate the router, via a swept knob.** They are integrated over
+  the router's *own* curve (sweeping `router.weights.cost`), with normalized mean
+  cost as the x-axis. The oracle frontier is the cost-optimal label bound and is
+  reported separately as an upper bound, never under the bare name APGR.
+- **No silent clamping.** PGR is reported raw; if the quality gap
+  `r(M_s) − r(M_w) ≤ 0`, or a value is out of `[0, 1]`, the metric is marked
+  `invalid` with a reason in both the markdown and JSON output.
+- **Limitations.** Numbers are only as good as the labels: small set (45),
+  hand-labeled capability (not human-graded quality), and a synthetic 6-model
+  catalogue. Treat them as a regression signal for routing *changes*, not an
+  absolute quality score. The LLM backend and real registries will shift them.

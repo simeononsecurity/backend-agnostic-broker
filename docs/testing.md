@@ -3,7 +3,7 @@
 Run the suite:
 
 ```bash
-make test                 # pytest -q  (180 tests)
+make test                 # pytest -q  (188 tests)
 make cov                  # with coverage
 python -m pytest -q tests/test_security.py   # one file
 ```
@@ -13,7 +13,7 @@ so they exercise the real request path, lifecycle, locking, and security
 boundaries without any external runtime. The suite is CPU-only; optional GPU
 tests (if added) should be marked and excluded from CI.
 
-## Coverage map (180 tests)
+## Coverage map (188 tests)
 
 | File | Tests | Covers |
 |------|-------|--------|
@@ -29,7 +29,7 @@ tests (if added) should be marked and excluded from CI.
 | `tests/test_router_cascade.py` | 13 | Cascade mode (ADR 0011): escalation on length/empty/refusal, no-escalation pass-through, both-hops recorded, streaming falls back to single, `should_escalate` signals. |
 | `tests/test_placement.py` | 11 | Placement pinning (ADR 0011), fail-closed: auto-filter, explicit + pool + embeddings `403 placement_denied`, pool member filtering, header parse/validation, config default. |
 | `tests/test_router_latency.py` | 10 | Latency-budget routing (ADR 0011): faster-capable pick, no-op when fast enough, capability safety, config default, header parse/validation. |
-| `tests/test_router_eval.py` | 3 | Eval harness: runs on the heuristic backend, metrics computed and sane (accuracy/APGR/CPT in range, CPT monotonic), markdown renders, dataset labels valid. |
+| `tests/test_router_eval.py` | 11 | Eval harness: RouteLLM metric primitives (PGR/frontier/APGR/CPT/oracle) vs hand-computed values incl. no-clamping + `invalid`-on-degenerate; quality ceiling is a true upper bound; router swept curve distinct from and bounded by the oracle; direct metrics in range; markdown renders; dataset labels valid. |
 | `tests/test_auth.py` | 6 | Bearer + `X-API-Key`, missing/invalid key, unauthenticated probes. |
 | `tests/test_streaming.py` | 1 | SSE streaming (`chat.completion.chunk` + `[DONE]`). |
 | `tests/test_lazy_load.py` | 4 | No model loads at startup; a request loads only its selected model; no fallback. |
