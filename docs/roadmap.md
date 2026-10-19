@@ -41,7 +41,7 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 |---|------|--------|-----|
 | 10 | Response caching (exact, then optional semantic) | ✅ done — exact cache ([0012](adr/0012-caching-runtime-control-observability.md)); semantic cache + streaming replay + per-request TTL/namespace controls ([0014](adr/0014-semantic-cache-and-cache-extensions.md)) | [0012](adr/0012-caching-runtime-control-observability.md) · [0014](adr/0014-semantic-cache-and-cache-extensions.md) |
 | 11 | Runtime control: manual unload + registry hot-reload | ✅ done — unload/load + transactional reload | [0012](adr/0012-caching-runtime-control-observability.md) |
-| 12 | OpenTelemetry tracing + optional web UI/playground | ✅ tracing (metadata [0012](adr/0012-caching-runtime-control-observability.md); **opt-in span content capture** [0014](adr/0014-semantic-cache-and-cache-extensions.md)); ❌ web UI still deferred ([0012](adr/0012-caching-runtime-control-observability.md), `BROKER_UI_ENABLED` reserved) | [0012](adr/0012-caching-runtime-control-observability.md) · [0014](adr/0014-semantic-cache-and-cache-extensions.md) |
+| 12 | OpenTelemetry tracing + optional web UI/playground | ✅ done — tracing (metadata [0012](adr/0012-caching-runtime-control-observability.md); **opt-in span content capture** [0014](adr/0014-semantic-cache-and-cache-extensions.md)); web UI ([0015](adr/0015-web-ui-playground.md)) | [0012](adr/0012-caching-runtime-control-observability.md) · [0014](adr/0014-semantic-cache-and-cache-extensions.md) · [0015](adr/0015-web-ui-playground.md) |
 
 ## Notes
 

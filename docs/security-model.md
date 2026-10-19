@@ -214,6 +214,38 @@ you have a specific debugging need and have reviewed the trust boundary of your
 OTLP collector/backend; prefer per-request `BROKER_TRACING_CONTENT_MAX_CHARS`
 truncation and short retention when enabled.
 
+## Web UI surface (ADR 0015)
+
+The optional static playground at `/ui` is **off by default** (`BROKER_UI_ENABLED=
+false`); when off, no route is registered and `/ui` returns 404. When on, it is
+designed to add attack surface without weakening the broker's posture:
+
+- **No new unauthenticated endpoints.** The UI is static assets only; it drives the
+  *existing authenticated* API. Enabling it adds exactly `/ui`, `/ui/`, and
+  `/ui/{path:path}` and nothing else — `/v1/*`, `/status`, `/usage`, `/admin/*`
+  still require their credentials.
+- **Strict CSP, no inline code.** Every `/ui` response sets `Content-Security-
+  Policy: default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src
+  'none'; form-action 'self'` — no `unsafe-inline`, no `unsafe-eval`, no external
+  origin. All script/style is external and same-origin; there is no inline
+  `<script>`/`<style>` and no `eval`/`Function` constructor. `connect-src 'self'`
+  means an injected script cannot exfiltrate a key to a third party.
+- **Clickjacking.** `frame-ancestors 'none'` (plus `X-Frame-Options: DENY`) blocks
+  embedding the UI in a hostile frame.
+- **MIME / referrer.** `X-Content-Type-Options: nosniff` and `Referrer-Policy:
+  no-referrer` on every response (and `Cache-Control: no-store`).
+- **Keys in memory only.** The operator's API key (and optional admin key) are held
+  in a JavaScript variable for the tab's lifetime — never `localStorage`,
+  `sessionStorage`, or cookies — so no secret persists past a reload and none is
+  readable from disk; a "Forget keys" control wipes them on demand.
+- **Path traversal.** Asset serving resolves the requested path and requires it to
+  stay under the packaged UI directory, serving only an allow-listed set of
+  extensions; `..` traversal and non-asset files return 404 (no package file is
+  ever disclosed).
+- **Admin panel gating.** The admin controls (load/unload/reload) appear only when
+  an admin key is supplied and still go through the same `require_admin`-gated
+  endpoints with confirmation prompts.
+
 ## Container hardening
 
 The image (`Dockerfile`) and Compose files apply defense in depth:

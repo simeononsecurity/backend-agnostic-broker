@@ -1,0 +1,9 @@
+models:
+  # A CPU-only, dependency-free fake backend so the playground works offline with
+  # no real model weights. Swap in your real Ollama/vLLM/llama.cpp models later.
+  - alias: echo-fake
+    backend: fake
+    runtime_model_id: fake-echo-v1
+    idle_timeout_seconds: 60
+    context_limit: 8192
+    supports_streaming: true

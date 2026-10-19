@@ -504,6 +504,45 @@ curl -s -X POST -H "X-Admin-Key: ***" -H 'Content-Type: application/json' \
 # -> 201 {"id":"brk_1a2b3c4d","scope":"user",...,"secret":"brk_1a2b3c4d_<shown once>"}
 ```
 
+## Web UI / playground (ADR 0015)
+
+### `GET /ui` — static operator playground (opt-in; no new API surface)
+
+Served **only** when `BROKER_UI_ENABLED=true`; otherwise `/ui` returns `404`
+(no route is registered). It is a hardened, fully-offline single-page app
+(vanilla HTML/CSS/JS package data — no CDN, no external URLs, no build step) that
+drives the **existing authenticated API**; it adds **no new unauthenticated
+endpoints**. The operator pastes an API key (and optionally an admin key) into the
+page; keys are held in browser memory only (never `localStorage`/`sessionStorage`/
+cookies).
+
+Routes registered when enabled: `GET /ui`, `GET /ui/`, and `GET /ui/{path:path}`
+(static assets only, confined to the packaged UI directory; path traversal and
+non-allow-listed extensions return `404`).
+
+Every `/ui` response carries strict security headers:
+
+```
+Content-Security-Policy: default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; form-action 'self'
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+X-Frame-Options: DENY
+Cache-Control: no-store
+```
+
+```bash
+# Enable, then load in a browser at http://127.0.0.1:8080/ui
+BROKER_UI_ENABLED=true broker
+curl -s -D - -o /dev/null http://127.0.0.1:8080/ui   # 200 + the headers above
+```
+
+Features: model list (capabilities/pool/candidates), chat playground with SSE
+streaming over `fetch()` (shows `x-broker-route`/`x-broker-cache`/rate-limit
+headers), completions/responses/embeddings tabs, a rerank tab that hides itself
+unless `/v1/rerank` exists, `/status` and scoped `/usage` views, and an admin
+panel (list/load/unload/reload, with confirmations) that appears only when an
+admin key is supplied. See [web-ui.md](web-ui.md).
+
 ## OpenAPI
 
 A generated OpenAPI document is at `docs/openapi.yaml` (regenerate with

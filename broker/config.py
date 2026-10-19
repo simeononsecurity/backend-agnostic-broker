@@ -349,8 +349,15 @@ class Settings(BaseSettings):
     # gives up (and reports the model still busy).
     admin_drain_timeout_seconds: float = 30.0
 
-    # --- Web UI / playground (ADR 0012) --- DEFERRED (see ADR 0012). The flag is
-    # reserved so a future static page at /ui is opt-in; it currently does nothing.
+    # --- Web UI / playground (ADR 0015; reserved in ADR 0012) --- default OFF.
+    # When true, a hardened, fully-offline static single-page operator playground
+    # is served at /ui (vanilla HTML/CSS/JS package data, no build step, no CDN,
+    # no external URLs). It calls the EXISTING authenticated API with a key the
+    # operator enters at runtime (held in browser memory only, never persisted);
+    # it adds NO new unauthenticated data endpoints. Disabled -> /ui returns 404.
+    # Responses carry a strict CSP (default-src 'self', no unsafe-inline/eval),
+    # frame-ancestors 'none', X-Content-Type-Options nosniff, Referrer-Policy
+    # no-referrer. Defaults reproduce v0.5.0 (UI absent).
     ui_enabled: bool = False
 
     # --- Security allow-lists ---
