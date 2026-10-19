@@ -150,6 +150,10 @@ incapable model.
 | `BROKER_ROUTER_CACHE_SIZE` | `512` | decision cache entries (LRU) |
 | `BROKER_ROUTER_TIMEOUT_SECONDS` | `10` | per-classification timeout |
 | `BROKER_ROUTER_DEFAULT_MODEL` | _(unset)_ | fallback model id (overrides `router.default`) |
+| `BROKER_ROUTER_LATENCY_BUDGET_MS` | _(unset)_ | default latency budget (ms); header/registry win first |
+| `BROKER_ROUTER_LATENCY_WINDOW_SECONDS` | `3600` | usage-log window for the latency estimate |
+| `BROKER_ROUTER_COLD_START_MS` | `1500` | cold-start penalty for a not-resident model |
+| `BROKER_DEFAULT_PLACEMENT` | `[]` | baseline placement labels required of every request |
 
 ## Safety rails
 
@@ -162,3 +166,99 @@ incapable model.
   blocks the event loop; a backend error falls back to the heuristic.
 - No model loads at broker startup — the classifier model loads lazily on first
   `auto` request and stays resident.
+
+## Advanced routing (ADR 0011, all opt-in)
+
+These four features are **off by default**; with none configured, `auto` behaves
+exactly as above. Design rationale and prior art: [ADR 0011](adr/0011-auto-router-evolution.md)
+and [docs/research/adr-0011-auto-router-evolution.md](research/adr-0011-auto-router-evolution.md).
+
+### 1. Cascade mode (cheap → escalate once)
+
+Set `router.mode: cascade` to serve the **cheapest capable** model first, inspect
+its *actual* answer, and escalate **once** to a stronger capable model only when a
+signal fires (FrugalGPT-style). Signals are data-driven (`router.cascade`):
+`finish_reason == "length"` (truncation), empty/too-short output (`min_chars`), or
+a refusal regex (`refusal_patterns`) — each individually toggleable.
+
+```yaml
+router:
+  mode: cascade
+  cascade:
+    escalate_on_length: true
+    escalate_on_empty: true
+    min_chars: 1
+    escalate_on_refusal: true
+```
+
+Both hops are recorded (usage log + `GET /status` → `router.recent_decisions`),
+and the response header **`x-broker-route`** shows the path (`tiny` or
+`tiny->coder`). **Streaming**: a live stream cannot be cheaply re-scored, so a
+streaming cascade request **falls back to the single strong pick** and the route
+header reads `strong (cascade->single: streaming)`.
+
+### 2. Latency budget
+
+Send `x-broker-latency-budget-ms: 2000` (or set `router.latency_budget_ms` /
+`BROKER_ROUTER_LATENCY_BUDGET_MS`). The router estimates each candidate's latency
+from the usage log (ADR 0007) — p90 over `BROKER_ROUTER_LATENCY_WINDOW_SECONDS`,
+plus `BROKER_ROUTER_COLD_START_MS` when the model is not currently resident — and,
+if the chosen model would exceed the budget, picks the fastest capable candidate
+instead. It **never** violates the Stage-1 capability filter or placement. The
+estimate is end-to-end latency (not time-to-first-token).
+
+### 3. Placement / data-residency pinning (fail-closed)
+
+Tag models with `placement` labels in the registry (e.g. `[local, trusted]`,
+`[region:eu]`). Send `x-broker-placement: region:eu` (and/or set a baseline with
+`BROKER_DEFAULT_PLACEMENT`). Only models/pool members carrying **all** required
+labels are eligible — for `auto`, for an explicit model, and for pool members. If
+nothing qualifies the broker returns **`403 placement_denied`** and never spills to
+a non-compliant model. See [security-model.md](security-model.md).
+
+```bash
+curl -s localhost:8080/v1/chat/completions -H "Authorization: Bearer ***" \
+  -H "x-broker-placement: region:eu" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
+# -> served only by a model tagged region:eu, or 403 placement_denied
+```
+
+### 4. Evaluation harness
+
+`scripts/router_eval.py` measures routing quality against a labeled set
+(`tests/data/router_eval.jsonl`, ≥40 prompts) instead of vibe-checking it. It runs
+the **heuristic** backend offline (no GPU/network) and optionally the LLM backend
+when a GGUF is available, computing accuracy, cheapest-capable match, cost
+weighting, and RouteLLM's **PGR / APGR / CPT(50%,80%)** against an oracle
+cost–quality frontier derived from the labels (the deterministic, multi-model
+adaptation of RouteLLM's definitions is documented in the research note).
+
+```bash
+python scripts/router_eval.py                 # markdown report (heuristic backend)
+python scripts/router_eval.py --format json   # metrics as JSON
+python scripts/router_eval.py --out report.md # write the report
+python scripts/router_eval.py --backend llm   # use the GGUF classifier
+```
+
+A CI run of the harness on the heuristic backend over the bundled 45-prompt set:
+
+| Metric | Value |
+|--------|-------|
+| Prompts | 45 |
+| Accuracy (chosen is acceptable) | 0.867 |
+| Cheapest-capable accuracy | 0.822 |
+| Mean cost_tier (router) | 2.29 |
+| Mean cost_tier (oracle) | 2.49 |
+| Weak-only accuracy r(Mw) | 0.267 |
+| Strong-only accuracy r(Ms) | 0.622 |
+| PGR (router operating point) | 1.000 |
+| APGR (oracle frontier) | 0.822 |
+| CPT(50%) strong-call fraction | 0.200 |
+| CPT(80%) strong-call fraction | 0.289 |
+| Router strong-call fraction | 0.022 |
+
+Per-task accuracy exposes real weaknesses — e.g. `math` ≈ 0.33 and `code` ≈ 0.60
+with the default weights, because a single tag match (+capability) can be
+outweighed by the cheap-model cost bonus. That is exactly the kind of regression
+the harness exists to surface (the motivating `tiny`-for-code mis-route); tune
+`router.weights` or add overrides and re-run to measure the effect.

@@ -59,6 +59,27 @@ logged or committed.
 An unknown model alias raises `ModelNotFoundError` (404). The broker never
 substitutes a different model.
 
+## Placement / data-residency pinning (fail-closed)
+
+Per-model `placement` labels in the registry (e.g. `local`, `trusted`,
+`region:eu`) express where a model may process data. A request requirement comes
+from the `x-broker-placement` header **unioned with** the `BROKER_DEFAULT_PLACEMENT`
+baseline, and is enforced **fail-closed** (ADR 0011):
+
+- Only models/pool members carrying **every** required label are eligible — for
+  the `auto` router (candidate pre-filter), for an explicitly named model, and for
+  pool members (non-compliant members are dropped).
+- If nothing qualifies, the broker returns a structured `403 placement_denied` and
+  **never** spills to a non-compliant model (matching the no-silent-fallback
+  posture above).
+- The requirement is set **server-side** — the header is intended to be stamped by
+  a trusted caller/gateway, and it can only *narrow* eligibility, never widen it
+  below the configured baseline. Labels are validated (`[A-Za-z0-9][A-Za-z0-9._:-]*`);
+  a malformed label is rejected (`400`) before any routing.
+
+This makes residency/sovereignty an auditable hard wall rather than a best-effort
+preference.
+
 ## Container hardening
 
 The image (`Dockerfile`) and Compose files apply defense in depth:

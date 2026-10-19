@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Auto-router evolution (ADR 0011)** — four opt-in, default-off routing features;
+  with none configured, `auto` behaves exactly as v0.4.0:
+  - **Cascade mode** (`router.mode: cascade`): serve the cheapest capable model
+    first, inspect the actual answer, and escalate **once** to a stronger capable
+    model on a data-driven signal (`finish_reason=length`, empty/too-short output,
+    or a refusal regex — all in `router.cascade`). Both hops are recorded (usage +
+    decision log) and the response header `x-broker-route` shows the path
+    (`tiny->coder`). Streaming falls back to the single strong pick (documented).
+  - **Latency budget**: `x-broker-latency-budget-ms` header (+ registry
+    `router.latency_budget_ms` / `BROKER_ROUTER_LATENCY_BUDGET_MS`) picks a faster
+    capable model when the pick's estimated latency (usage-log p90 + cold-start
+    penalty) exceeds the budget; never overrides capability/placement.
+  - **Placement / data-residency pinning (fail-closed)**: per-model `placement`
+    labels + `x-broker-placement` header and `BROKER_DEFAULT_PLACEMENT`; candidates,
+    explicit models, and pool members are filtered to those carrying all required
+    labels, else `403 placement_denied` — never spills to a non-compliant model.
+  - **Eval harness**: `scripts/router_eval.py` + `tests/data/router_eval.jsonl`
+    (45 labeled prompts) computes accuracy, cost-weighting, and RouteLLM
+    PGR/APGR/CPT; markdown/JSON report; runs offline on the heuristic backend.
+  - New settings: `BROKER_ROUTER_LATENCY_BUDGET_MS`, `BROKER_ROUTER_LATENCY_WINDOW_SECONDS`,
+    `BROKER_ROUTER_COLD_START_MS`, `BROKER_DEFAULT_PLACEMENT`. New error type
+    `placement_denied` (403); usage log gains `latency_percentiles`. 37 new tests.
+    See [docs/auto-router.md](docs/auto-router.md),
+    [ADR 0011](docs/adr/0011-auto-router-evolution.md), and the research note.
+
 ## [0.4.0] - 2026-10-18
 
 ### Added

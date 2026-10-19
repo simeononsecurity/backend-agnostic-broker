@@ -19,6 +19,21 @@ keys return `401` with error type `authentication_error`.
 
 - **Request ID** — every response carries `x-request-id` (echoes an inbound
   `x-request-id` or generates `req-<hex>`). It is also included in error bodies.
+- **Routing controls (ADR 0011)** — chat/completions/responses accept optional
+  request headers and echo the resolved path:
+  - `x-broker-placement: <labels>` — comma-separated data-residency labels
+    (e.g. `local` or `region:eu,trusted`). Only models/pool members carrying
+    **all** required labels are eligible (for `auto`, an explicit model, and pool
+    members); if none qualify the request returns `403 placement_denied` and the
+    broker never spills to a non-compliant model. Unioned with the
+    `BROKER_DEFAULT_PLACEMENT` baseline. Invalid labels → `400`.
+  - `x-broker-latency-budget-ms: <ms>` — pick a faster capable model when the
+    chosen model's estimated latency (usage-log p90 + cold-start penalty) exceeds
+    the budget; never overrides the capability/placement filters. Non-positive or
+    non-numeric → `400`.
+  - `x-broker-route` (**response** header) — the model actually served, or a
+    cascade path like `tiny->coder`; for a streaming cascade it reads
+    `strong (cascade->single: streaming)`.
 - **Request-size limit** — bodies over `BROKER_MAX_REQUEST_BYTES` (default
   2,000,000) return `413 request_too_large`.
 - **Timeouts** — each request is bounded by the model's
@@ -49,9 +64,9 @@ Errors use an OpenAI-style envelope with broker context (`broker/errors.py`):
 ```
 
 Error types and HTTP status: `config_error` (500), `invalid_request_error`
-(400), `security_error` (400), `authentication_error` (401), `model_not_found`
-(404), `model_load_error` (503), `backend_unavailable` (502), `timeout_error`
-(504), `rate_limit_error` (429), `request_too_large` (413).
+(400), `security_error` (400), `authentication_error` (401), `placement_denied`
+(403), `model_not_found` (404), `model_load_error` (503), `backend_unavailable`
+(502), `timeout_error` (504), `rate_limit_error` (429), `request_too_large` (413).
 
 ## Endpoints
 

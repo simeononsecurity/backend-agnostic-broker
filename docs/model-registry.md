@@ -48,6 +48,7 @@ and toggle backends via config. Duplicate aliases are rejected.
 | `router_eligible` | bool | `true` | Whether the `auto` router may select this model. |
 | `priority` | int | `0` | Auto-router tie-break preference (higher = preferred). |
 | `cost_tier` | int | `2` | Relative cost/size `1`(cheapest)..`5`(most expensive); the router prefers the cheapest capable model. |
+| `placement` | list[str] | `[]` | Data-residency labels (e.g. `local`, `trusted`, `region:eu`). A request carrying a placement requirement is only served by models/pool members that carry **all** required labels; otherwise `403 placement_denied` (fail-closed). See [auto-router.md](auto-router.md). |
 
 ### `router` (top-level, optional)
 
@@ -59,9 +60,25 @@ Data-driven policy for the `auto` alias (see [auto-router.md](auto-router.md)):
 | `policy` | str? | _(none)_ | System-prompt / routing-policy override for the LLM classifier. |
 | `overrides` | list | `[]` | Hard `when → use` rules, first match bypasses the LLM (skipped if the target isn't a valid candidate). |
 | `weights` | object | _(see below)_ | Heuristic scoring weights: `capability` (3.0), `cost` (1.0), `prefer_loaded` (1.0), `priority` (1.0). |
+| `mode` | str | `single` | `single` (one-shot, default) or `cascade` (cheapest-capable first, escalate once on a signal — ADR 0011). |
+| `cascade` | object | _(see below)_ | Escalation signals for `mode: cascade`. |
+| `latency_budget_ms` | float? | _(none)_ | Default latency budget (ms); the `x-broker-latency-budget-ms` header wins, then this, then `BROKER_ROUTER_LATENCY_BUDGET_MS`. |
 
 Each override `when` supports `has_images`, `has_tools`, `needs_json`,
 `min_ctx_tokens`, and `regex` (matched against the last user message).
+
+#### `cascade` (CascadeConfig)
+
+Signals checked against the cheapest-capable model's actual answer; if any fires,
+the request escalates once to a stronger capable model (ADR 0011).
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `escalate_on_length` | bool | `true` | Escalate when the first hop was truncated (`finish_reason == "length"`). |
+| `escalate_on_empty` | bool | `true` | Escalate on an empty / too-short answer. |
+| `min_chars` | int | `1` | Minimum acceptable answer length (characters, stripped). |
+| `escalate_on_refusal` | bool | `true` | Escalate when the answer matches a refusal regex. |
+| `refusal_patterns` | list[str] | _(built-in set)_ | Refusal regexes (validated at load). |
 
 ### `gpu` (GPURequirements)
 
