@@ -80,6 +80,7 @@ class CooldownRecord:
         return {
             "failures": self.failures,
             "in_cooldown": self.in_cooldown,
+            "recovering": self.recovering,
             "until": self.until if self.until else None,
             "seconds_remaining": round(self.seconds_remaining, 3),
             "ejections": self.ejections,
@@ -148,10 +149,25 @@ class StateStore:
     ) -> None:
         raise NotImplementedError
 
+    async def bench(self, key: str, seconds: float, now: float | None = None) -> CooldownRecord:
+        """Bench a member for ``seconds`` immediately (ADR 0017 Retry-After).
+
+        Unlike :meth:`record_failure` (which benches only once a consecutive-failure
+        threshold is crossed), this benches the member right away for a known
+        window — used to honor an upstream ``Retry-After`` on a throttled member
+        regardless of the failure-threshold config. Extends an existing window,
+        never shortens it, and counts as one ejection for observability.
+        """
+        raise NotImplementedError
+
     async def get_cooldown(self, key: str, now: float | None = None) -> CooldownRecord:
         raise NotImplementedError
 
     async def try_half_open(self, key: str, ttl_seconds: float, now: float | None = None) -> bool:
+        raise NotImplementedError
+
+    async def half_open_active(self, key: str, now: float | None = None) -> bool:
+        """True while a single-trial half-open probe lock is currently held."""
         raise NotImplementedError
 
     # --- generic KV ------------------------------------------------------
@@ -321,6 +337,21 @@ class InProcessStateStore(StateStore):
             return False
         self._halfopen[key] = now + ttl_seconds
         return True
+
+    async def half_open_active(self, key: str, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        exp = self._halfopen.get(key)
+        return exp is not None and now < exp
+
+    async def bench(self, key: str, seconds: float, now: float | None = None) -> CooldownRecord:
+        now = time.time() if now is None else now
+        failures, until = self._cooldowns.get(key, (0, 0.0))
+        failures += 1
+        new_until = max(until, now + seconds)
+        ejections = self._ejections.get(key, (0, 0.0))[0] + 1
+        self._cooldowns[key] = (failures, new_until)
+        self._ejections[key] = (ejections, now)
+        return CooldownRecord(failures=failures, until=new_until, now=now, ejections=ejections)
 
     # --- generic KV ---
     async def kv_get(self, key: str) -> bytes | None:
@@ -552,6 +583,27 @@ class RedisStateStore(StateStore):
             self._k("ho", key), b"1", nx=True, ex=self._ttl_int(ttl_seconds) or 1
         )
         return bool(ok)
+
+    async def half_open_active(self, key: str, now: float | None = None) -> bool:
+        return bool(await self._r.exists(self._k("ho", key)))
+
+    async def bench(self, key: str, seconds: float, now: float | None = None) -> CooldownRecord:
+        now = time.time() if now is None else now
+        cf = self._k("cf", key)
+        failures = int(await self._r.incr(cf))
+        await self._r.expire(cf, self._ttl_int(seconds) or 1)
+        raw_u = await self._r.get(self._k("cd", key))
+        existing_until = float(raw_u) if raw_u is not None else 0.0
+        until = max(existing_until, now + seconds)
+        raw_ej = await self._r.get(self._k("ej", key))
+        ejections = (int(raw_ej) if raw_ej is not None else 0) + 1
+        ej_ttl = self._ttl_int(max(seconds, 1.0) * 4) or 1
+        async with self._r.pipeline(transaction=True) as pipe:
+            pipe.set(self._k("cd", key), str(until).encode(), ex=self._ttl_int(until - now) or 1)
+            pipe.set(self._k("ej", key), str(ejections).encode(), ex=ej_ttl)
+            pipe.set(self._k("le", key), str(now).encode(), ex=ej_ttl)
+            await pipe.execute()
+        return CooldownRecord(failures=failures, until=until, now=now, ejections=ejections)
 
     # --- generic KV ---
     async def kv_get(self, key: str) -> bytes | None:

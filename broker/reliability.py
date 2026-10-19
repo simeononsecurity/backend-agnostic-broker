@@ -66,14 +66,30 @@ _VALID_CLASS_NAMES = frozenset(c.value for c in ErrorClass)
 def classify_error(exc: BaseException) -> ErrorClass:
     """Bucket an exception into an :class:`ErrorClass`.
 
-    Subclass identity wins (it carries intent); otherwise the HTTP status on a
-    :class:`~broker.errors.BrokerError` decides (429 → backpressure, other 4xx →
-    client_error, 5xx → server_error). Anything else is ``other``.
+    A typed :class:`~broker.errors.UpstreamHTTPError` (the backend *responded*
+    with an HTTP error) is classified by its ``upstream_status``: 408 → timeout,
+    429 → backpressure, other 4xx → client_error, 5xx → server_error. Otherwise
+    subclass identity wins (it carries intent), then the broker-facing HTTP status
+    on a :class:`~broker.errors.BrokerError` decides. Anything else is ``other``.
     """
     if isinstance(exc, TimeoutError_):
         return ErrorClass.TIMEOUT
     if isinstance(exc, ModelLoadError):
         return ErrorClass.SERVER_ERROR
+    # Typed upstream HTTP error: classify by the UPSTREAM status, never the
+    # broker-facing http_status (which it remaps for the client envelope). This is
+    # what makes a client's own bad request (4xx) stop at one member instead of
+    # being retried across the pool as a CONNECTION failure.
+    upstream = getattr(exc, "upstream_status", None)
+    if isinstance(upstream, int):
+        if upstream == 408:
+            return ErrorClass.TIMEOUT
+        if upstream == 429:
+            return ErrorClass.BACKPRESSURE
+        if 400 <= upstream < 500:
+            return ErrorClass.CLIENT_ERROR
+        if upstream >= 500:
+            return ErrorClass.SERVER_ERROR
     if isinstance(exc, BackendUnavailableError):
         return ErrorClass.CONNECTION
     if isinstance(exc, (ConcurrencyLimitError, RateLimitExceededError, InsufficientQuotaError)):
@@ -158,6 +174,23 @@ class RetryPolicy:
     def is_retryable(self, cls: ErrorClass) -> bool:
         if cls in _NEVER:
             return False
+        return self._retryable.get(cls, False)
+
+    def fails_over(self, cls: ErrorClass) -> bool:
+        """Whether this class should try another pool member (immediate failover).
+
+        Failover (try a *different* healthy member, no sleep) is distinct from
+        sleep-retrying a benched member (:meth:`is_retryable`). ``backpressure``
+        (429 / upstream Retry-After) always fails over to a healthy member and
+        benches the throttled one — even though it is not sleep-retryable by
+        default (a lone throttled member returns 429 to the client rather than
+        sleeping). ``client_error`` / ``other`` never fail over. The remaining
+        classes fail over exactly when they are retryable.
+        """
+        if cls in _NEVER:
+            return False
+        if cls is ErrorClass.BACKPRESSURE:
+            return True
         return self._retryable.get(cls, False)
 
     def counts_toward_cooldown(self, cls: ErrorClass) -> bool:

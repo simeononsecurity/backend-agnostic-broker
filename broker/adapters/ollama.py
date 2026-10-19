@@ -143,11 +143,7 @@ class OllamaAdapter(HTTPBackendAdapter):
                 remediation="check the Ollama daemon/base_url",
             ) from exc
         if resp.status_code >= 400:
-            raise BackendUnavailableError(
-                f"backend returned {resp.status_code}: {resp.text[:200]}",
-                backend=self.name,
-                model=self.entry.alias,
-            )
+            self._raise_upstream(resp.status_code, resp.text, resp.headers)
         data = resp.json()
         vectors = data.get("embeddings") or []
         prompt_tokens = int(data.get("prompt_eval_count") or 0)

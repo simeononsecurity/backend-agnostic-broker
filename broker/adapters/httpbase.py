@@ -17,6 +17,8 @@ the lifecycle hooks.
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -26,6 +28,7 @@ from ..errors import (
     BackendUnavailableError,
     ModelLoadError,
     TimeoutError_,
+    UpstreamHTTPError,
 )
 from ..proc import ProcessSupervisor
 from ..security import (
@@ -35,6 +38,56 @@ from ..security import (
     validate_upstream_url,
 )
 from .base import BackendAdapter, HealthResult
+
+#: Max characters of an upstream error body reflected back to the caller. Upstream
+#: bodies are untrusted and may be large or echo request content, so we cap and
+#: strip control characters before surfacing any of it.
+_UPSTREAM_MSG_MAX = 200
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _sanitize_upstream_message(status: int, body: str | None) -> str:
+    """Build a short, safe client-facing message from an upstream error body.
+
+    Prefers an OpenAI-style ``{"error": {"message": ...}}`` field, falling back to
+    the raw body. The result is control-character-stripped and truncated to
+    :data:`_UPSTREAM_MSG_MAX` so a huge or hostile upstream body can never be
+    reflected verbatim (and we never echo request/secret material at length).
+    """
+    msg = ""
+    if body:
+        try:
+            data = json.loads(body)
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict):
+            err = data.get("error")
+            if isinstance(err, dict):
+                msg = str(err.get("message") or err.get("type") or "")
+            elif isinstance(err, str):
+                msg = err
+            if not msg:
+                msg = str(data.get("message") or "")
+        if not msg:
+            msg = body
+    msg = _CONTROL_CHARS.sub(" ", msg).strip()
+    if len(msg) > _UPSTREAM_MSG_MAX:
+        msg = msg[:_UPSTREAM_MSG_MAX].rstrip() + "…"
+    base = f"upstream returned {status}"
+    return f"{base}: {msg}" if msg else base
+
+
+def _retry_after_headers(headers: Any) -> dict[str, str] | None:
+    """Extract only the ``Retry-After`` header (if any) to carry on the error.
+
+    Never forwards arbitrary upstream headers (which could leak upstream cookies /
+    auth echoes) — only the one header the retry policy needs.
+    """
+    try:
+        ra = headers.get("retry-after")
+    except AttributeError:
+        ra = None
+    return {"retry-after": str(ra)} if ra else None
 
 
 def _parse_waiting(metrics_text: str) -> float | None:
@@ -231,6 +284,21 @@ class HTTPBackendAdapter(BackendAdapter):
         body["model"] = self.entry.runtime_model_id
         return body
 
+    def _raise_upstream(self, status: int, body: str | None, headers: Any) -> None:
+        """Raise a typed :class:`UpstreamHTTPError` for an upstream error status.
+
+        The backend replied with ``status >= 400``; we surface it as a typed error
+        carrying the status + ``Retry-After`` (sanitized message) so the per-error
+        policy classifies it by status instead of collapsing it to a 502/CONNECTION.
+        """
+        raise UpstreamHTTPError(
+            _sanitize_upstream_message(status, body),
+            upstream_status=status,
+            backend=self.name,
+            model=self.entry.alias,
+            headers=_retry_after_headers(headers),
+        )
+
     async def chat(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
         url = self._validated_url(self.chat_path)
         client = self._client_or_new()
@@ -246,11 +314,7 @@ class HTTPBackendAdapter(BackendAdapter):
                 remediation="check the runtime process/endpoint",
             ) from exc
         if resp.status_code >= 400:
-            raise BackendUnavailableError(
-                f"backend returned {resp.status_code}: {resp.text[:200]}",
-                backend=self.name,
-                model=self.entry.alias,
-            )
+            self._raise_upstream(resp.status_code, resp.text, resp.headers)
         data = resp.json()
         # Present the public alias back to the caller.
         data["model"] = self.entry.alias
@@ -269,11 +333,7 @@ class HTTPBackendAdapter(BackendAdapter):
             async with client.stream("POST", url, json=body) as resp:
                 if resp.status_code >= 400:
                     text = (await resp.aread()).decode("utf-8", "replace")
-                    raise BackendUnavailableError(
-                        f"backend returned {resp.status_code}: {text[:200]}",
-                        backend=self.name,
-                        model=self.entry.alias,
-                    )
+                    self._raise_upstream(resp.status_code, text, resp.headers)
                 async for line in resp.aiter_lines():
                     if cancel_event.is_set():
                         break
@@ -320,11 +380,7 @@ class HTTPBackendAdapter(BackendAdapter):
                 remediation="check the runtime process/endpoint",
             ) from exc
         if resp.status_code >= 400:
-            raise BackendUnavailableError(
-                f"backend returned {resp.status_code}: {resp.text[:200]}",
-                backend=self.name,
-                model=self.entry.alias,
-            )
+            self._raise_upstream(resp.status_code, resp.text, resp.headers)
         data = resp.json()
         if isinstance(data, dict):
             data["model"] = self.entry.alias

@@ -8,6 +8,7 @@ network beyond their configured base URLs, and no model loads at startup.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from pydantic import Field, field_validator
@@ -227,6 +228,14 @@ class Settings(BaseSettings):
     # on a RETRIED error, clamped to the remaining retry budget. No effect on the
     # legacy single-pass default unless a retried error actually carries one.
     retry_respect_retry_after: bool = True
+    # Absolute ceiling (seconds) on how long the broker will EVER wait for an
+    # upstream Retry-After, and how long a throttled member is benched for its
+    # Retry-After. This is the finite safety cap that makes a hostile/huge
+    # Retry-After (or request_timeout_seconds == 0, i.e. unbounded) impossible to
+    # turn into an unbounded sleep: every Retry-After wait is min(header, this,
+    # remaining request deadline). Must be finite and >= 0 (0 = never sleep for
+    # Retry-After, only fail over).
+    retry_after_max_seconds: float = 120.0
     # Optional per-class attempt cap (JSON, e.g. '{"timeout": 5, "server_error": 2}').
     # A class listed here caps attempts for its failures; unlisted classes use
     # retry_max_attempts. Keys must be ErrorClass names.
@@ -396,20 +405,35 @@ class Settings(BaseSettings):
             raise ConfigError("BROKER_RETRY_BACKOFF_MAX_MS must be >= BROKER_RETRY_BACKOFF_BASE_MS")
         if self.cooldown_failures < 0:
             raise ConfigError("BROKER_COOLDOWN_FAILURES must be >= 0 (0 = disabled)")
-        if self.cooldown_seconds < 0:
-            raise ConfigError("BROKER_COOLDOWN_SECONDS must be >= 0")
+        if not math.isfinite(self.cooldown_seconds) or self.cooldown_seconds < 0:
+            raise ConfigError("BROKER_COOLDOWN_SECONDS must be a finite number >= 0")
         if self.max_ejection_percent < 0 or self.max_ejection_percent > 100:
             raise ConfigError("BROKER_MAX_EJECTION_PERCENT must be in 0..100 (0 = no cap)")
-        if self.cooldown_backoff_multiplier < 1.0:
+        if (
+            not math.isfinite(self.cooldown_backoff_multiplier)
+            or self.cooldown_backoff_multiplier < 1.0
+        ):
             raise ConfigError(
-                "BROKER_COOLDOWN_BACKOFF_MULTIPLIER must be >= 1.0 (1.0 = fixed window)"
+                "BROKER_COOLDOWN_BACKOFF_MULTIPLIER must be a finite number >= 1.0 "
+                "(1.0 = fixed window)"
             )
-        if self.cooldown_max_seconds < 0:
-            raise ConfigError("BROKER_COOLDOWN_MAX_SECONDS must be >= 0 (0 = no cap)")
-        if self.cooldown_decay_seconds < 0:
-            raise ConfigError("BROKER_COOLDOWN_DECAY_SECONDS must be >= 0")
-        if self.cooldown_half_open_ttl_seconds < 0:
-            raise ConfigError("BROKER_COOLDOWN_HALF_OPEN_TTL_SECONDS must be >= 0 (0 = derive)")
+        if not math.isfinite(self.cooldown_max_seconds) or self.cooldown_max_seconds < 0:
+            raise ConfigError(
+                "BROKER_COOLDOWN_MAX_SECONDS must be a finite number >= 0 (0 = no cap)"
+            )
+        if not math.isfinite(self.cooldown_decay_seconds) or self.cooldown_decay_seconds < 0:
+            raise ConfigError("BROKER_COOLDOWN_DECAY_SECONDS must be a finite number >= 0")
+        if (
+            not math.isfinite(self.cooldown_half_open_ttl_seconds)
+            or self.cooldown_half_open_ttl_seconds < 0
+        ):
+            raise ConfigError(
+                "BROKER_COOLDOWN_HALF_OPEN_TTL_SECONDS must be a finite number >= 0 (0 = derive)"
+            )
+        if not math.isfinite(self.retry_after_max_seconds) or self.retry_after_max_seconds < 0:
+            raise ConfigError(
+                "BROKER_RETRY_AFTER_MAX_SECONDS must be a finite number >= 0 (0 = never sleep)"
+            )
         for _cls, _n in self.retry_max_attempts_by_class.items():
             if _cls not in _ERROR_CLASS_NAMES:
                 raise ConfigError(
