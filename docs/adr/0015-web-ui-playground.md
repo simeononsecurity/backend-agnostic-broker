@@ -148,7 +148,7 @@ served by the broker at `/ui`, gated by `BROKER_UI_ENABLED` (default **off**).
 
 ## Confirmation
 
-Verified by `tests/test_ui.py` (26 tests, green in the shared venv and the private
+Verified by `tests/test_ui.py` (241 tests, green in the shared venv and the private
 `[dev,redis,otel]` venv, and under the Python 3.11 container gate incl. mypy):
 
 - **Default-off**: `/ui` and `/ui/app.js` 404 when disabled.
@@ -168,6 +168,17 @@ Verified by `tests/test_ui.py` (26 tests, green in the shared venv and the priva
   file contents leaked); unknown assets and non-allow-listed extensions 404.
 - **Functional smoke**: a streaming chat against the fake backend yields deltas,
   `[DONE]`, and the `x-broker-route` header the UI displays.
+- **Hardened path handling (follow-up)**: `_serve_asset` never raises for any
+  client-supplied path — embedded NUL, C0/DEL control chars, backslashes,
+  drive-like/colon prefixes, over-long segments, and over-long total paths are
+  rejected *before* the filesystem is touched, and `resolve`/`is_file`/`read_bytes`
+  are wrapped in `except (ValueError, OSError)`, so every such request returns the
+  hardened 404 **with the full security headers** instead of a header-less 500.
+  Covered by a 13-case regression matrix (incl. `%252e%252e` double-encoding) plus
+  a 200-path deterministic fuzz asserting status ∈ {200, 404} and CSP present. We
+  kept the resolve-under-`_STATIC_DIR` guard rather than a startup allow-list: the
+  pre-validation + exception wrapping is a smaller, equally safe change that keeps
+  the traversal/symlink defense already shipped, with no new startup scan.
 
 Additionally exercised manually (evidence in `docs/web-ui.md`): the page was
 served by a live broker and loaded in a real browser under the strict CSP with no

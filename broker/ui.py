@@ -21,6 +21,13 @@ Security headers on every UI response (including 404s):
 
 Path traversal is defeated by resolving every requested path and requiring it to
 stay under the static directory; only allow-listed asset extensions are served.
+
+Robustness: ``_serve_asset`` **never raises** for any client-supplied path. Hostile
+inputs (embedded NUL, control characters, backslashes, drive-like prefixes, or
+over-long segments/paths) are rejected *before* the filesystem is touched, and the
+remaining ``resolve``/``is_file``/``read_bytes`` calls are wrapped so a stray
+``ValueError``/``OSError`` still degrades to the hardened 404 (security headers
+attached) rather than a header-less 500.
 """
 
 from __future__ import annotations
@@ -74,6 +81,38 @@ def _not_found() -> Response:
     )
 
 
+# Defensive caps applied before any filesystem access. ``NAME_MAX`` is 255 on the
+# common filesystems; a generous whole-path cap guards against pathological inputs.
+_MAX_SEGMENT_LEN = 255
+_MAX_PATH_LEN = 1024
+
+
+def _is_safe_rel(rel: str) -> bool:
+    """Reject obviously hostile request paths *before* touching the filesystem.
+
+    An embedded NUL makes ``Path.resolve`` raise ``ValueError`` and an over-long
+    name makes it (or ``is_file``) raise ``OSError`` (``ENAMETOOLONG``); both would
+    otherwise escape as a header-less 500. We refuse NUL/control characters,
+    backslashes, Windows drive-like prefixes, and anything over the length caps so
+    the request is answered with the hardened 404 instead.
+    """
+    if not rel or len(rel) > _MAX_PATH_LEN:
+        return False
+    for ch in rel:
+        # NUL, C0 controls, and DEL have no place in an asset name.
+        if ch == "\x00" or ord(ch) < 0x20 or ord(ch) == 0x7F:
+            return False
+    if "\\" in rel:
+        return False
+    # Drive-like prefix (``c:``) or any bare ``:`` — not a valid static asset name.
+    if ":" in rel:
+        return False
+    for seg in rel.split("/"):
+        if len(seg) > _MAX_SEGMENT_LEN:
+            return False
+    return True
+
+
 def _serve_asset(rel: str) -> Response:
     """Serve a static UI asset confined to the static dir, or 404.
 
@@ -81,22 +120,29 @@ def _serve_asset(rel: str) -> Response:
     empty path maps to ``index.html``. The candidate path is resolved and MUST
     remain under :data:`_STATIC_DIR` (defeats ``..`` traversal and symlink
     escapes); only allow-listed extensions are returned.
+
+    This function never raises for client-supplied input: hostile paths are
+    rejected up front by :func:`_is_safe_rel`, and the filesystem calls are wrapped
+    so any residual ``ValueError``/``OSError`` falls through to the hardened 404.
     """
     rel = rel.lstrip("/")
     if not rel:
         rel = "index.html"
-    candidate = (_STATIC_DIR / rel).resolve()
+    if not _is_safe_rel(rel):
+        return _not_found()
     try:
+        candidate = (_STATIC_DIR / rel).resolve()
         candidate.relative_to(_STATIC_DIR)
-    except ValueError:
-        return _not_found()
-    if not candidate.is_file():
-        return _not_found()
-    ctype = _CONTENT_TYPES.get(candidate.suffix.lower())
-    if ctype is None:
+        if not candidate.is_file():
+            return _not_found()
+        ctype = _CONTENT_TYPES.get(candidate.suffix.lower())
+        if ctype is None:
+            return _not_found()
+        payload = candidate.read_bytes()
+    except (ValueError, OSError):
         return _not_found()
     return Response(
-        content=candidate.read_bytes(),
+        content=payload,
         media_type=ctype,
         headers=dict(_SECURITY_HEADERS),
     )

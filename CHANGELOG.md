@@ -22,7 +22,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Options: nosniff`, and `Referrer-Policy: no-referrer`. The operator's API/admin
   keys are held in browser memory only (never `localStorage`/`sessionStorage`/
   cookies). The UI drives the **existing authenticated API** and adds **no new
-  unauthenticated endpoints**. Disabled (the default) → `/ui` 404s and nothing
+  unauthenticated endpoints**. Asset serving never raises on hostile paths
+  (embedded NUL, control chars, backslashes, over-long segments/paths): each is
+  rejected before any filesystem access and returns a hardened 404 **with the
+  full security headers**. Disabled (the default) → `/ui` 404s and nothing
   changes vs v0.5.0. Docs: `docs/web-ui.md`; example: `examples/web-ui/`.
 
 ## [0.5.0] - 2026-10-19

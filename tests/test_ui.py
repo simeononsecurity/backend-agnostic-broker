@@ -301,3 +301,109 @@ def test_example_web_ui_config():
         )
         assert r.status_code == 200
         assert r.json()["choices"][0]["message"]["role"] == "assistant"
+
+
+# --- hardened path handling: never 500, always security headers (regression) --
+# Follow-up to ADR 0015: `_serve_asset` used to let an embedded NUL raise
+# ValueError and an over-long name raise OSError (ENAMETOOLONG), surfacing as a
+# header-less 500. Every hostile path below must degrade to a hardened 404.
+CSP = EXPECTED_SECURITY_HEADERS["content-security-policy"]
+
+MALFORMED_PATHS = [
+    # Embedded NUL byte, three placements.
+    "/ui/index.html%00.js",
+    "/ui/%00",
+    "/ui/a%00b",
+    # One over-long path segment (> NAME_MAX) -> would OSError on resolve/is_file.
+    "/ui/" + "a" * 5000,
+    # Over-long *total* path built from many in-spec-length segments.
+    "/ui/" + "/".join(["a" * 200] * 10),
+    # C0 control characters and DEL.
+    "/ui/a%01b.js",
+    "/ui/%1f",
+    "/ui/%7f.css",
+    # Backslashes (Windows-style separators / drive hints).
+    "/ui/..%5c..%5capp.py",
+    "/ui/a%5cb.js",
+    # Drive-like / colon prefixes.
+    "/ui/c:/windows/system32",
+    # Double-encoded traversal (%252e%252e -> %2e%2e -> ..).
+    "/ui/%252e%252e%252fapp.py",
+    "/ui/%252e%252e%252f%252e%252e%252fconfig.py",
+]
+
+
+@pytest.mark.parametrize("path", MALFORMED_PATHS)
+def test_ui_malformed_path_is_hardened_404(ui_client, path):
+    r = ui_client.get(path)
+    assert r.status_code == 404, (path, r.status_code)
+    # Security headers — crucially the CSP — must be present on the error path.
+    assert r.headers.get("content-security-policy") == CSP, path
+    for name, value in EXPECTED_SECURITY_HEADERS.items():
+        assert r.headers.get(name) == value, (path, name)
+
+
+def test_ui_malformed_paths_never_leak_source(ui_client):
+    # Defense-in-depth: none of the traversal attempts may return package source.
+    for path in MALFORMED_PATHS:
+        body = ui_client.get(path).text
+        assert "ui_enabled" not in body
+        assert "_serve_asset" not in body
+
+
+def _fuzz_paths(n: int) -> list[str]:
+    """Generate ~`n` deterministic odd request paths under /ui.
+
+    Mixes percent-encoded NUL/control bytes, traversal fragments, over-long
+    segments, backslashes, colons, allow-listed and disallowed extensions, and
+    occasionally a real asset name so some requests legitimately hit 200.
+    """
+    import random
+
+    rng = random.Random(0xB0CA)
+    real = ["index.html", "app.js", "styles.css", "favicon.svg"]
+    pieces = [
+        "%00",
+        "%01",
+        "%1f",
+        "%7f",
+        "..",
+        "%2e%2e",
+        "%252e%252e",
+        "%2f",
+        "%5c",
+        "\\",
+        ":",
+        "a" * rng.randint(1, 400),
+        "x" * rng.randint(250, 300),
+        ".py",
+        ".html",
+        ".js",
+        ".css",
+        ".svg",
+        ".txt",
+        "/",
+        "foo",
+    ]
+    out = []
+    for _ in range(n):
+        if rng.random() < 0.1:
+            out.append("/ui/" + rng.choice(real))
+            continue
+        k = rng.randint(1, 6)
+        seg = "".join(rng.choice(pieces) for _ in range(k))
+        out.append("/ui/" + seg)
+    return out
+
+
+@pytest.mark.parametrize("path", _fuzz_paths(200))
+def test_ui_fuzz_paths_never_500(ui_client, path):
+    r = ui_client.get(path)
+    # The only acceptable outcomes are a served asset or a hardened 404; never a
+    # 500 and never a response missing the CSP header.
+    assert r.status_code in {200, 404}, (path, r.status_code)
+    # httpx performs RFC 3986 dot-segment removal client-side, so a path with a
+    # literal ``..`` can normalize out of /ui before it is sent; only assert the
+    # CSP when the request that actually reached the server stayed under /ui.
+    if r.request.url.path.startswith("/ui"):
+        assert r.headers.get("content-security-policy") == CSP, path
