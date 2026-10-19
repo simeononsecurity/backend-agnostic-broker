@@ -93,13 +93,15 @@ class Settings(BaseSettings):
     #     1.0 = "a member at 2x fleet-average load is docked one full cache hit's
     #     worth of preference"; 0.0 = pure prefix affinity (ignore load). Default
     #     0.5 was chosen from the scripts/bench_routing.py scenario x beta matrix
-    #     under a QUEUEING model (ADR 0018): it is the smallest beta whose
-    #     low-pressure load spread stays within 1.25x AND that is no worse than
-    #     sticky on p95 TTFT in any scenario. ADR 0010 shipped 0.25 from a
-    #     balance-only heuristic because its harness modeled no queueing; once
-    #     load imbalance is priced as latency, 0.25 hot-spots (long_lived spread
-    #     1.35x) and 0.5 is the balanced choice (and matches llm-d/KServe's ~2:1
-    #     prefix:load weighting). beta=1.0 over-spreads and gives up cache reuse.
+    #     under a QUEUEING model (ADR 0018), re-evaluated against the right baseline
+    #     (least_busy, the tail-latency-best strategy) at a MODERATE ~85% util load:
+    #     it is the smallest beta whose low-pressure load spread stays within 1.25x
+    #     AND whose p95 TTFT is within 10% of least_busy in every scenario. ADR 0010
+    #     shipped 0.25 from a balance-only heuristic; once queueing is priced, 0.25
+    #     both hot-spots (long_lived spread ~1.5x) and loses >10% p95 vs least_busy.
+    #     beta=1.0 over-spreads and gives up cache reuse. NOTE: cache_aware is not
+    #     the latency-best strategy (least_busy is); its benefit is fewer uncached
+    #     prefill tokens (GPU work) and higher hit rate on shared-prefix workloads.
     cache_aware_beta: float = 0.5
     # Characters per prefix block (approximate; ~4 chars/token). Larger = smaller
     # index but coarser prefix matching. Only full blocks are hashed.

@@ -20,22 +20,28 @@ load imbalance as real latency:
   manager and the real ``_select_member`` picks the target; cache_aware reads the real
   prefix index. Only the *service* is simulated.
 
-It ships named, seeded scenarios and three modes:
+It ships named, seeded scenarios and several modes:
 
 * a per-scenario strategy table (``round_robin``/``least_busy``/``sticky``/
   ``cache_aware``), reporting prefix hit rate, **TTFT p50/p95/p99 incl. queueing**,
-  **throughput**, **max member utilization**, and load spread;
-* a **β-sweep matrix** (``--matrix``) that prints ``sticky`` as the baseline and
-  ``cache_aware`` across β for every scenario, and
-* ``--select-beta``, which applies the documented ADR 0018 selection rule to the
-  matrix and prints the β it picks (and why).
+  **prefill work/req (uncached prefill tokens computed)**, **throughput**, **max
+  member utilization**, and load spread;
+* a **utilization sweep** (``--sweep``) that runs all four strategies at ~50/70/85/95%
+  max utilization (arrival rate calibrated per scenario via least_busy) and then
+  reports each strategy's **capacity** — the max sustained arrival rate that keeps
+  TTFT p95 under an SLO, found by bisection;
+* a **β matrix** (``--matrix``) at a moderate (~85% util) load, printing
+  ``least_busy`` and ``sticky`` baselines plus ``cache_aware`` across β per scenario, and
+* ``--select-beta``, which applies the β selection rule (p95 within a tolerance of
+  ``least_busy`` at ≤85% util + a balance bound) and prints the β it picks (and why).
 
 The script inserts the repo root on ``sys.path`` itself, so it runs from anywhere
 with **no** ``PYTHONPATH=.`` needed:
 
     python scripts/bench_routing.py                  # default scenario, all strategies
-    python scripts/bench_routing.py --matrix         # scenario × β matrix (headline)
-    python scripts/bench_routing.py --select-beta     # apply the β selection rule
+    python scripts/bench_routing.py --sweep           # utilization sweep + SLO capacity
+    python scripts/bench_routing.py --matrix          # scenario × β matrix (moderate load)
+    python scripts/bench_routing.py --select-beta      # apply the β selection rule
     python scripts/bench_routing.py --scenario cache_pressure
     python scripts/bench_routing.py --load-signal chars   # compare load signals (ADR 0018 item 3)
     python scripts/bench_routing.py --smoke          # tiny, fast (CI smoke)
@@ -349,6 +355,7 @@ async def _run_strategy(
     ttfts: list[float] = []
     hit_fracs: list[float] = []
     completions = 0
+    prefill_tokens_total = 0  # uncached prefill tokens actually computed (GPU work)
 
     heap: list[tuple[float, int, int, object]] = []
     order = itertools.count()
@@ -408,6 +415,7 @@ async def _run_strategy(
             hit = caches[alias].hit_fraction(seq.req.blocks)
             hit_fracs.append(hit)
             uncached = max(1, int(round((1.0 - hit) * seq.req.prompt_tokens)))
+            prefill_tokens_total += uncached
             seq.prefill_iters = max(1, math.ceil(uncached / sc.prefill_chunk_tokens))
             seq.decode_iters = seq.req.output_tokens
             caches[alias].add(seq.req.blocks)  # KV blocks created during prefill
@@ -457,6 +465,8 @@ async def _run_strategy(
         "throughput": throughput,
         "util_max": max(utils.values()) if utils else 0.0,
         "util_mean": statistics.mean(utils.values()) if utils else 0.0,
+        "prefill_tokens": prefill_tokens_total,
+        "prefill_tokens_per_req": (prefill_tokens_total / completions) if completions else 0.0,
         "load_stdev": statistics.pstdev(load_values) if len(load_values) > 1 else 0.0,
         "load_spread": f"{min(load_values)}-{max(load_values)}",
         "load_min": min(load_values),
@@ -486,14 +496,15 @@ def _pct(sorted_vals: list[float], pct: int) -> float:
 def _format_table(rows: list[dict], first_col: str = "strategy") -> str:
     header = (
         f"| {first_col} | hit rate | TTFT p50 | p95 | p99 (ms) | "
-        "throughput (req/s) | max util | load spread |"
+        "work/req | throughput (req/s) | max util | load spread |"
     )
-    sep = "|---|---|---|---|---|---|---|---|"
+    sep = "|---|---|---|---|---|---|---|---|---|"
     lines = [header, sep]
     for r in rows:
         lines.append(
             f"| {r['label']} | {r['hit_rate'] * 100:.1f}% | {r['ttft_p50']:.0f} | "
-            f"{r['ttft_p95']:.0f} | {r['ttft_p99']:.0f} | {r['throughput']:.1f} | "
+            f"{r['ttft_p95']:.0f} | {r['ttft_p99']:.0f} | "
+            f"{r.get('prefill_tokens_per_req', 0.0):.0f} | {r['throughput']:.1f} | "
             f"{r['util_max'] * 100:.0f}% | {r['load_spread']} |"
         )
     return "\n".join(lines)
@@ -514,40 +525,144 @@ async def _scenario_strategies(sc: Scenario, beta: float, load_signal: str) -> l
 async def _scenario_beta_sweep(
     sc: Scenario, betas: list[float], load_signal: str = "count"
 ) -> list[dict]:
-    """sticky baseline + cache_aware across β for one scenario (shared workload)."""
+    """least_busy + sticky baselines + cache_aware across β for one scenario.
+
+    ``least_busy`` (the tail-latency-best strategy) is the reference the β selection
+    rule compares against; ``sticky`` is kept for context (the default strategy).
+    A single shared workload is replayed across all rows so only routing differs.
+    """
     rng = random.Random(sc.seed)
     requests = _build_workload(sc, rng)
     rows = []
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        mgr = _make_manager(tmp, sc, "sticky", 0.0)
-        rows.append(await _run_strategy(mgr, sc, "sticky", 0.0, requests, load_signal))
+        for strat in ("least_busy", "sticky"):
+            mgr = _make_manager(tmp, sc, strat, 0.0)
+            rows.append(await _run_strategy(mgr, sc, strat, 0.0, requests, load_signal))
         for beta in betas:
             mgr = _make_manager(tmp, sc, "cache_aware", beta)
             rows.append(await _run_strategy(mgr, sc, "cache_aware", beta, requests, load_signal))
     return rows
 
 
-# --- β selection rule (ADR 0018) --------------------------------------------
+# --- load calibration + capacity (ADR 0018 follow-up) -----------------------
 
-#: Max fraction by which cache_aware's p95 TTFT may exceed sticky's in ANY scenario.
+#: Arrival-rate bisection bounds (requests/second) for calibration + capacity.
+_RATE_LO, _RATE_HI = 0.25, 60.0
+
+#: Target max-utilization load levels for the utilization sweep (``--sweep``).
+SWEEP_TARGET_UTILS: tuple[float, ...] = (0.50, 0.70, 0.85, 0.95)
+
+#: SLO on TTFT p95 (ms) for the capacity bisection. Chosen as a common interactive
+#: first-token budget that sits ~an order of magnitude above the unloaded batched
+#: prefill latency (~6-15 ms in this service model) and above the bursty service
+#: floor, so "capacity" measures the onset of *queueing* delay, not the service
+#: floor. Override with ``--slo-ms``.
+SLO_TTFT_P95_MS: float = 200.0
+
+
+async def calibrate_rate(
+    sc: Scenario,
+    target_util: float,
+    *,
+    strategy: str = "least_busy",
+    beta: float = 0.5,
+    load_signal: str = "count",
+    iters: int = 16,
+) -> float:
+    """Bisection: arrival rate at which ``strategy`` reaches ~``target_util`` max
+    utilization. Defaults to ``least_busy`` (the balanced strategy) as the common
+    load reference, so at each sweep level every strategy sees the *same* offered
+    load. Deterministic for a fixed scenario seed."""
+    lo, hi = _RATE_LO, _RATE_HI
+    for _ in range(iters):
+        mid = (lo + hi) / 2
+        row = await run_one(replace(sc, arrival_rate=mid), strategy, beta, load_signal)
+        if row["util_max"] < target_util:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+async def capacity_for(
+    sc: Scenario,
+    strategy: str,
+    beta: float = 0.5,
+    *,
+    slo_ms: float = SLO_TTFT_P95_MS,
+    load_signal: str = "count",
+    iters: int = 16,
+) -> float:
+    """Bisection: the max arrival rate (req/s) that keeps TTFT p95 ≤ ``slo_ms`` for
+    ``strategy`` — the strategy's **sustained capacity** under the SLO. p95 is
+    monotone non-decreasing in arrival rate here, so a bisection is well-defined."""
+    lo, hi = _RATE_LO, _RATE_HI
+    for _ in range(iters):
+        mid = (lo + hi) / 2
+        row = await run_one(replace(sc, arrival_rate=mid), strategy, beta, load_signal)
+        if row["ttft_p95"] <= slo_ms:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+async def run_sweep(
+    sc: Scenario,
+    *,
+    targets: tuple[float, ...] = SWEEP_TARGET_UTILS,
+    beta: float = 0.5,
+    load_signal: str = "count",
+    calib_iters: int = 16,
+) -> list[dict]:
+    """Utilization sweep: for each target max-util level (calibrated via least_busy),
+    run all four strategies at that **same** offered load and return metric rows
+    tagged with ``target_util`` + the calibrated ``arrival_rate``. Deterministic."""
+    rows: list[dict] = []
+    for u in targets:
+        rate = await calibrate_rate(sc, u, load_signal=load_signal, iters=calib_iters)
+        sc_u = replace(sc, arrival_rate=rate)
+        for strategy in STRATEGIES:
+            row = dict(await run_one(sc_u, strategy, beta, load_signal))
+            row["target_util"] = u
+            row["arrival_rate"] = rate
+            rows.append(row)
+    return rows
+
+
+# --- β selection rule (ADR 0018 follow-up) ----------------------------------
+
+#: Max fraction by which cache_aware's p95 TTFT may exceed **least_busy's** (the
+#: tail-latency-best strategy) at a moderate, non-saturated load, in ANY scenario.
 BETA_P95_TOLERANCE = 0.10
-#: Max load-spread ratio (max/min served) allowed on the low-pressure scenario.
+#: Max low-pressure (long_lived) served-count spread ratio (max/min) allowed.
 BETA_BALANCE_RATIO = 1.25
+#: Load level (target max utilization) at which the rule is evaluated — moderate,
+#: not saturated, so a strategy's steady-state tail is measured, not pure queueing.
+BETA_SELECT_TARGET_UTIL = 0.85
 
 
 def select_beta(matrix: dict[str, list[dict]], betas: list[float]) -> dict:
-    """Apply the documented ADR 0018 selection rule to a scenario→rows matrix.
+    """Apply the ADR 0018-follow-up β selection rule to a scenario→rows matrix.
 
-    Rule: among the swept β, keep only those that (a) on the low-pressure
-    ``long_lived`` scenario hold the load-spread ratio ≤ ``BETA_BALANCE_RATIO`` and
-    (b) in NO scenario are worse than ``sticky`` on p95 TTFT by more than
-    ``BETA_P95_TOLERANCE``. Among the survivors pick the **smallest β** — the least
-    load-spreading that already meets the balance + tail-latency bounds, so it keeps
-    the most cache reuse (highest hit rate). Returns the decision + trace.
+    The rule reflects what ``cache_aware`` is *for* — cache reuse / prefill-work
+    saved — while refusing to pay a tail-latency penalty versus the tail-best
+    strategy (``least_busy``) at a realistic (non-saturated) load:
+
+    > Among the swept β, keep those that (a) hold the low-pressure ``long_lived``
+    > served-count spread ≤ ``BETA_BALANCE_RATIO`` and (b) in NO scenario are worse
+    > than ``least_busy`` on p95 TTFT by more than ``BETA_P95_TOLERANCE`` **at
+    > ≤85% utilization**. Among the survivors pick the **smallest β** — the least
+    > load spreading, hence the most cache reuse / least prefill work (the metric
+    > the feature exists to improve).
+
+    ``least_busy`` is the reference, so the matrix MUST carry a ``least_busy`` row
+    per scenario and SHOULD be built at the moderate load (see ``_build_matrix``).
+    The trace also carries mean prefill work/req so the pick is auditable.
     """
-    sticky = {
-        scn: next(r for r in rows if r["strategy"] == "sticky") for scn, rows in matrix.items()
+    least_busy = {
+        scn: next(r for r in rows if r["strategy"] == "least_busy") for scn, rows in matrix.items()
     }
     candidates = []
     trace = []
@@ -561,20 +676,22 @@ def select_beta(matrix: dict[str, list[dict]], betas: list[float]) -> dict:
         balance_ok = balance <= BETA_BALANCE_RATIO
         worst_ratio = 0.0
         for scn, r in rows_by_scn.items():
-            st = sticky[scn]["ttft_p95"]
-            if st > 0:
-                worst_ratio = max(worst_ratio, (r["ttft_p95"] - st) / st)
+            lb = least_busy[scn]["ttft_p95"]
+            if lb > 0:
+                worst_ratio = max(worst_ratio, (r["ttft_p95"] - lb) / lb)
         p95_ok = worst_ratio <= BETA_P95_TOLERANCE
-        mean_p95 = statistics.mean(r["ttft_p95"] for r in rows_by_scn.values())
+        mean_work = statistics.mean(
+            r.get("prefill_tokens_per_req", 0.0) for r in rows_by_scn.values()
+        )
         eligible = balance_ok and p95_ok
         trace.append(
             {
                 "beta": beta,
                 "balance_ratio": balance,
                 "balance_ok": balance_ok,
-                "worst_p95_vs_sticky": worst_ratio,
+                "worst_p95_vs_least_busy": worst_ratio,
                 "p95_ok": p95_ok,
-                "mean_p95": mean_p95,
+                "mean_work_per_req": mean_work,
                 "eligible": eligible,
             }
         )
@@ -584,9 +701,24 @@ def select_beta(matrix: dict[str, list[dict]], betas: list[float]) -> dict:
     return {"chosen": chosen, "trace": trace}
 
 
-async def _build_matrix(betas: list[float], load_signal: str = "count") -> dict[str, list[dict]]:
+async def _build_matrix(
+    betas: list[float],
+    load_signal: str = "count",
+    *,
+    target_util: float | None = BETA_SELECT_TARGET_UTIL,
+) -> dict[str, list[dict]]:
+    """Scenario→rows matrix (least_busy + sticky baselines + cache_aware per β).
+
+    When ``target_util`` is set (the default), each scenario's arrival rate is first
+    calibrated (via least_busy) to that moderate load, so the β selection rule and
+    the headline matrix measure steady-state tails rather than pure saturation
+    queueing. Pass ``target_util=None`` to use each scenario's native arrival rate.
+    """
     matrix: dict[str, list[dict]] = {}
     for sc in SCENARIOS.values():
+        if target_util is not None:
+            rate = await calibrate_rate(sc, target_util, load_signal=load_signal)
+            sc = replace(sc, arrival_rate=rate)
         matrix[sc.name] = await _scenario_beta_sweep(sc, betas, load_signal)
     return matrix
 
@@ -597,22 +729,25 @@ async def _main_async(args: argparse.Namespace) -> int:
     if args.select_beta:
         matrix = await _build_matrix(betas, args.load_signal)
         decision = select_beta(matrix, betas)
-        print("\nADR 0018 β selection rule (queueing model)\n")
+        print("\nADR 0018 β selection rule (queueing model, moderate load)\n")
         print(
-            f"Rule: long_lived spread ≤ {BETA_BALANCE_RATIO:g}× AND no scenario worse than "
-            f"sticky on p95 by >{BETA_P95_TOLERANCE * 100:.0f}%; "
-            "then pick the smallest eligible β (keeps the most cache reuse).\n"
+            f"Rule: evaluated at ~{BETA_SELECT_TARGET_UTIL * 100:.0f}% max utilization "
+            f"(not saturation). Keep β with long_lived served spread ≤ "
+            f"{BETA_BALANCE_RATIO:g}× AND no scenario worse than LEAST_BUSY (the "
+            f"tail-best strategy) on p95 by >{BETA_P95_TOLERANCE * 100:.0f}%; then pick "
+            "the smallest eligible β (most cache reuse / least prefill work).\n"
         )
         print(
-            "| β | long_lived spread | balance ok | worst p95 vs sticky | p95 ok | mean p95 (ms) | eligible |"
+            "| β | long_lived spread | balance ok | worst p95 vs least_busy | "
+            "p95 ok | mean work/req | eligible |"
         )
         print("|---|---|---|---|---|---|---|")
         for row in decision["trace"]:
             print(
                 f"| {row['beta']:g} | {row['balance_ratio']:.2f}× | "
                 f"{'yes' if row['balance_ok'] else 'no'} | "
-                f"{row['worst_p95_vs_sticky'] * 100:+.0f}% | "
-                f"{'yes' if row['p95_ok'] else 'no'} | {row['mean_p95']:.0f} | "
+                f"{row['worst_p95_vs_least_busy'] * 100:+.0f}% | "
+                f"{'yes' if row['p95_ok'] else 'no'} | {row['mean_work_per_req']:.0f} | "
                 f"{'YES' if row['eligible'] else 'no'} |"
             )
         print(f"\nSelected default β = {decision['chosen']}")
@@ -620,7 +755,10 @@ async def _main_async(args: argparse.Namespace) -> int:
         return 0
 
     if args.matrix:
-        print("\nCache-aware routing — scenario × β matrix (queueing model; sticky baseline)\n")
+        print(
+            "\nCache-aware routing — scenario × β matrix (queueing model, moderate "
+            f"~{BETA_SELECT_TARGET_UTIL * 100:.0f}% util; least_busy + sticky baselines)\n"
+        )
         matrix = await _build_matrix(betas, args.load_signal)
         for sc in SCENARIOS.values():
             rows = matrix[sc.name]
@@ -628,8 +766,8 @@ async def _main_async(args: argparse.Namespace) -> int:
             print(
                 f"(members={sc.members}, sessions={sc.sessions}, requests={sc.requests}, "
                 f"system_prompts={sc.system_prompts}, cache_capacity={sc.cache_capacity}, "
-                f"arrival_rate={sc.arrival_rate}/s, slots={sc.member_slots}, skew={sc.skew}, "
-                f"load_signal={args.load_signal})\n"
+                f"arrival_rate calibrated to ~{BETA_SELECT_TARGET_UTIL * 100:.0f}% util, "
+                f"slots={sc.member_slots}, skew={sc.skew}, load_signal={args.load_signal})\n"
             )
             print(_format_table(rows, first_col="strategy"))
             print()
@@ -637,6 +775,69 @@ async def _main_async(args: argparse.Namespace) -> int:
         print(
             f"β selection rule picks: {decision['chosen']} "
             f"(config default {Settings().cache_aware_beta:g}). Run --select-beta for the trace."
+        )
+        return 0
+
+    if args.sweep:
+        targets = SWEEP_TARGET_UTILS if not args.smoke else (0.5, 0.9)
+        scen_names = sorted(SCENARIOS) if not args.smoke else ["cross_session"]
+        print(
+            "\nUtilization sweep (queueing model) — all four strategies at matched "
+            f"offered load; cache_aware at β={args.beta:g}\n"
+        )
+        for name in scen_names:
+            base = SCENARIOS[name]
+            if args.smoke:
+                base = replace(base, members=3, sessions=40, requests=120)
+            rows = await run_sweep(
+                base,
+                targets=targets,
+                beta=args.beta,
+                load_signal=args.load_signal,
+                calib_iters=10 if args.smoke else 16,
+            )
+            print(f"### {name} — {base.description}")
+            print(
+                "Rows grouped by target max-utilization level (arrival rate calibrated "
+                "via least_busy; 'util' is the achieved max utilization per strategy).\n"
+            )
+            by_level: dict[float, list[dict]] = {}
+            for r in rows:
+                by_level.setdefault(r["target_util"], []).append(r)
+            for u, lvl_rows in by_level.items():
+                rate = lvl_rows[0]["arrival_rate"]
+                print(f"load ≈{u * 100:.0f}% util (λ={rate:.1f}/s):")
+                print(_format_table(lvl_rows, first_col="strategy"))
+                print()
+        # Capacity: max sustained arrival rate under the p95 SLO (bisection).
+        print(
+            f"### Capacity — max sustained λ (req/s) with TTFT p95 ≤ SLO={args.slo_ms:g} ms "
+            "(bisection per strategy)\n"
+        )
+        print(f"| scenario | round_robin | least_busy | sticky | cache_aware β={args.beta:g} |")
+        print("|---|---|---|---|---|")
+        for name in scen_names:
+            base = SCENARIOS[name]
+            if args.smoke:
+                base = replace(base, members=3, sessions=40, requests=120)
+            caps = {}
+            for strat in STRATEGIES:
+                caps[strat] = await capacity_for(
+                    base,
+                    strat,
+                    args.beta,
+                    slo_ms=args.slo_ms,
+                    load_signal=args.load_signal,
+                    iters=10 if args.smoke else 16,
+                )
+            print(
+                f"| {name} | {caps['round_robin']:.1f} | {caps['least_busy']:.1f} | "
+                f"{caps['sticky']:.1f} | {caps['cache_aware']:.1f} |"
+            )
+        print(
+            "\n(Capacity is p95-SLO sustained load. cache_aware also reports lower "
+            "prefill work/req in the sweep tables above — its distinct benefit when the "
+            "bottleneck is prefill compute rather than batch slots.)"
         )
         return 0
 
@@ -698,6 +899,17 @@ def main() -> int:
         "--capacity-sweep",
         action="store_true",
         help="sticky vs cache_aware across cache capacities (long_lived traffic)",
+    )
+    p.add_argument(
+        "--sweep",
+        action="store_true",
+        help="utilization sweep: all 4 strategies at ~50/70/85/95%% util + SLO capacity",
+    )
+    p.add_argument(
+        "--slo-ms",
+        type=float,
+        default=SLO_TTFT_P95_MS,
+        help=f"TTFT p95 SLO (ms) for the --sweep capacity bisection (default {SLO_TTFT_P95_MS:g})",
     )
     p.add_argument(
         "--beta",
