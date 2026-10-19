@@ -29,6 +29,8 @@
 | Faster idle reclaim | lower `BROKER_IDLE_SWEEP_INTERVAL_SECONDS` |
 | Slow-loading runtimes | raise `startup_timeout_seconds` / `readiness.timeout_seconds` |
 | Sharpen `auto` routing | refine per-model `tags`/`priority`/`cost_tier`, add `router.overrides`, or set `BROKER_ROUTER_BACKEND=heuristic`\|`llm` |
+| Retry transient backend failures | `BROKER_RETRY_MAX_ATTEMPTS>0` + `BROKER_RETRY_BACKOFF_BASE_MS>0` (full-jitter backoff; retries stay within the pool, bounded by the request timeout) |
+| Bench flapping backends | `BROKER_COOLDOWN_FAILURES`/`BROKER_COOLDOWN_SECONDS` (circuit breaker; default-off) |
 
 ## Capacity model
 
@@ -47,6 +49,39 @@
   message); timeouts as `504 timeout_error`.
 - Inspect `GET /status` for `last_error` and pid/running state; check runtime
   logs (broker surfaces recent child logs on startup failures).
+
+### Retries, cooldowns & circuit breaking (ADR 0009)
+
+- **Retries** (`BROKER_RETRY_MAX_ATTEMPTS`): a request retries within its pool up
+  to the cap, sleeping `uniform(0, min(MAX_MS, BASE_MS·2^n))` between attempts
+  (full jitter). Retrying never crosses to a different model and is bounded by
+  `BROKER_REQUEST_TIMEOUT_SECONDS`. Defaults (`0`) = one failover pass, no sleep.
+- **Cooldowns** (`BROKER_COOLDOWN_FAILURES`): after N consecutive failures a
+  member is benched for `BROKER_COOLDOWN_SECONDS` and skipped; it half-opens for a
+  trial after the window (success closes it, failure re-benches). Watch
+  `cooldown.in_cooldown`/`seconds_remaining` in `GET /healthz/backends`. If every
+  member is benched the pool falls through so it can still self-heal. Disable with
+  `BROKER_COOLDOWN_FAILURES=0`.
+
+## Multi-replica / shared state (ADR 0009)
+
+By default each broker keeps routing state (sticky map, cooldowns, counters)
+**in-process**, so one replica is fully self-contained. To run several replicas
+behind a load balancer with one consistent view:
+
+1. Install the extra: `pip install 'backend-agnostic-broker[redis]'` (or use an
+   image built with it).
+2. Point every replica at the same Redis: `BROKER_REDIS_URL=redis://<host>:6379/0`.
+   Give each broker *group* its own `BROKER_REDIS_PREFIX` if they share one Redis.
+3. Optionally set `BROKER_ROUTE_STICKY_TTL_SECONDS` to bound Redis sticky memory
+   (in-process uses the LRU `BROKER_ROUTE_STICKY_MAX_ENTRIES` instead).
+
+Verify with `GET /status` → `state_backend: "redis"`. If `BROKER_REDIS_URL` is set
+but `redis` is not installed the broker **fails fast** (no silent downgrade).
+Operationally, Redis then becomes a shared dependency: monitor it, and note that a
+Redis outage degrades cross-replica routing consistency (a single replica with no
+Redis URL is unaffected). Keep connection URLs/credentials in env/secret stores —
+never in committed files.
 
 ## Logging
 

@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Retries with full-jitter backoff** (ADR 0009): `BROKER_RETRY_MAX_ATTEMPTS`,
+  `BROKER_RETRY_BACKOFF_BASE_MS`, `BROKER_RETRY_BACKOFF_MAX_MS`. Retries re-select
+  a member **within the requested model's pool only** (never a different model),
+  wait `uniform(0, min(max, base·2^n))` between attempts, respect the request
+  timeout as a deadline, and never retry once a stream is emitting. **Defaults
+  (`0`/`0`) reproduce v0.4.0 exactly** — one failover pass, no sleep.
+- **Member cooldowns / circuit breaker** (ADR 0009): `BROKER_COOLDOWN_FAILURES`,
+  `BROKER_COOLDOWN_SECONDS`. After N consecutive failures a pool member is benched
+  and skipped; after the window it half-opens for a trial (success resets, failure
+  re-benches). Visible per member in `GET /status` and `GET /healthz/backends`.
+  Default-off preserves current behavior.
+- **`StateStore` abstraction** (`broker/state.py`, ADR 0009): one async API over
+  the sticky map, counters (+ sliding-window helper), cooldown records, and a
+  generic bytes/JSON KV. `InProcessStateStore` is the default; **optional
+  `RedisStateStore`** (`BROKER_REDIS_URL`, `BROKER_REDIS_PREFIX`,
+  `BROKER_ROUTE_STICKY_TTL_SECONDS`) shares state across replicas. `redis` is an
+  optional extra (`pip install 'backend-agnostic-broker[redis]'`), import-guarded
+  → `ConfigError` if enabled-but-missing. The manager's sticky map is migrated
+  onto `StateStore`.
+
+### Changed
+
+- `GET /status` now reports `state_backend`, `retry_max_attempts`,
+  `cooldowns_enabled`, and (when cooldowns are on) per-model `cooldown`.
+- `GET /healthz/backends` entries now include a per-member `cooldown` object.
+
 ## [0.4.0] - 2026-10-18
 
 ### Added

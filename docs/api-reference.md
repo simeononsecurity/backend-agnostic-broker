@@ -79,7 +79,9 @@ Live, **non-loading** liveness of every backend member. Ollama daemons are probe
 via `GET /api/tags`; broker-managed runtimes (vLLM/llama.cpp/Strata) are probed
 only while their process is already running — an unloaded managed model reports
 `not_loaded` (not a failure, and never a spawn). Returns `200` with an overall
-`status` of `ok` or `degraded`.
+`status` of `ok` or `degraded`. When member cooldowns are enabled (ADR 0009),
+each backend entry also carries a `cooldown` object
+(`{failures, in_cooldown, until, seconds_remaining}`).
 
 ```bash
 curl -s -H "Authorization: Bearer my-key" http://127.0.0.1:8080/healthz/backends
@@ -99,9 +101,11 @@ Exposes request counts, latency, in-flight gauge, and loaded-model gauge.
 ### `GET /status` — lifecycle + GPU (auth)
 
 Per-model snapshot (state, inflight, pid, idle seconds, last error, live
-`healthy`/`last_health`, public `model` name) and adapter status (endpoint, GPU
-allocation), plus a `pools` map (public name → member aliases) and loaded/limit
-counts.
+`healthy`/`last_health`, public `model` name, and `cooldown` when enabled) and
+adapter status (endpoint, GPU allocation), plus a `pools` map (public name →
+member aliases), loaded/limit counts, and routing info: `route_strategy`,
+`sticky_sessions`, `state_backend` (`in_process`|`redis`), `retry_max_attempts`,
+`cooldowns_enabled`.
 
 ```bash
 curl -s -H "Authorization: Bearer my-key" http://127.0.0.1:8080/status
