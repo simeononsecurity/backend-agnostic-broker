@@ -64,21 +64,41 @@ All five are **adopted**, each opt-in with a default that reproduces v0.5.0.
    claimed only for the member actually selected, never wasted. Default-off
    preserves ADR 0009's post-expiry re-eligibility for existing cooldown users.
 
-4. **Per-error retry/cooldown policies.** A new `broker.reliability` module
-   classifies every `BrokerError` into `timeout` / `connection` / `server_error` /
-   `backpressure` (429) / `client_error` (4xx) / `other`. A `RetryPolicy` built
-   from per-class settings answers *retryable?*, *counts toward cooldown?*, and
-   *per-class attempt cap?*. **Defaults reproduce ADR 0009 exactly**: timeout +
-   connection + server_error are retried and count toward cooldown; backpressure
-   and client/other are not. **4xx client errors are hard-wired non-retryable and
-   never counted** — no configuration can change that. `BROKER_RETRY_ON_*` /
-   `BROKER_COOLDOWN_ON_*` toggle the other classes (e.g. opt a 429 into retry), and
-   `BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS` sets per-class attempt caps. When a
-   *retried* error carries an HTTP `Retry-After` (RFC 9110: delay-seconds or
-   HTTP-date) and `BROKER_RETRY_RESPECT_RETRY_AFTER` is set (default on), the retry
-   waits that long instead of the jittered backoff, clamped to the request-timeout
-   deadline. Streaming applies the same policy to the pre-stream select/ready phase
-   and still never retries once bytes are flowing.
+4. **Per-error retry/cooldown policies + typed upstream errors.** A new
+   `broker.reliability` module classifies failures into `timeout` / `connection` /
+   `server_error` / `backpressure` (429) / `client_error` (4xx) / `other`. For this
+   to apply to *real* backends, every HTTP adapter raises a typed
+   `UpstreamHTTPError(upstream_status=..., headers=...)` when the backend
+   **responds** with a status `>= 400` (chat non-stream + pre-first-byte stream,
+   completions/responses via chat, and embeddings) — distinct from
+   `BackendUnavailableError`, which now means only a *transport* failure (connect
+   error, read timeout, unreachable). `classify_error` buckets an upstream error by
+   its status: `408` → timeout, `429` → backpressure, other `4xx` → client_error,
+   `5xx` → server_error. Upstream bodies are sanitized (control-stripped, truncated
+   to ~200 chars, no secret reflection) before any of the message reaches a client.
+   A `RetryPolicy` built from per-class settings answers *retryable?* (sleep-retry),
+   *fails over?* (try another member), *counts toward cooldown?*, and *per-class
+   attempt cap?*. **Defaults reproduce ADR 0009 exactly**: timeout + connection +
+   server_error are retried and count toward cooldown; backpressure and
+   client/other are not. **4xx client errors are hard-wired non-retryable, never
+   failed over, and never counted** — the broker returns the upstream `4xx` to the
+   caller with type `upstream_client_error` (a client's own bad request is **never**
+   reported as a `502` and never retried across the pool). `BROKER_RETRY_ON_*` /
+   `BROKER_COOLDOWN_ON_*` toggle the other classes, and
+   `BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS` sets per-class attempt caps.
+
+   **Backpressure / `Retry-After` (RFC 9110: delay-seconds or HTTP-date).** A `429`
+   and a `503` always fail over to a healthy member **immediately** (no sleep) and
+   bench the throttled member for `min(Retry-After, cooldown_max_seconds or
+   retry_after_max_seconds)`; a lone throttled member returns its `429`/`Retry-After`
+   to the client rather than sleeping (clients self-pace), while a `5xx`
+   (server_error) sleep-retries a lone member within budget. Every `Retry-After`
+   wait is clamped to **both** `BROKER_RETRY_AFTER_MAX_SECONDS` (default 120s) and
+   the remaining request deadline, so neither a hostile header nor
+   `request_timeout_seconds = 0` (unbounded) can ever produce an unbounded sleep.
+   Streaming applies the same policy to the pre-stream select/ready phase and still
+   never retries once bytes are flowing (a pre-first-byte `4xx` is surfaced in the
+   SSE error frame, upstream called once, no bench).
 
 5. **Redis sticky global LRU bound (`BROKER_REDIS_STICKY_MAX_ENTRIES`, 0 =
    TTL-only).** A sorted-set index scored by last pin (= last use) caps the total
@@ -86,9 +106,11 @@ All five are **adopted**, each opt-in with a default that reproduces v0.5.0.
    the orphaned sticky keys deleted. Shared across replicas. `0` keeps v0.5.0's
    TTL-only behavior; in-process sticky keeps its `OrderedDict` LRU.
 
-New reliability state is surfaced under `reliability` in `/status`, and the
-per-member cooldown record (now including the `ejections` count) appears in both
-`/status` and `/healthz/backends`.
+New reliability state is surfaced under `reliability` in `/status` (now including
+`retry_after_max_seconds`), and the per-member cooldown record — `failures`,
+`in_cooldown`, `recovering`, `until`, `seconds_remaining`, `ejections`, and (when
+single-trial half-open is enabled) `half_open_trial` — appears in both `/status`
+and `/healthz/backends`.
 
 ## Alternatives considered
 
@@ -119,17 +141,26 @@ per-member cooldown record (now including the `ejections` count) appears in both
 - **Positive** — a correlated outage can no longer bench a whole pool; a
   persistently flapping member is ejected for exponentially longer; recovering
   members get one careful probe instead of a herd; failures are handled by class
-  (never retry/charge a 4xx; honor upstream backpressure); multi-replica sticky has
-  a hard memory bound. All opt-in; defaults unchanged.
+  using the **real upstream status** (never retry/charge a 4xx; an upstream 4xx is
+  returned to the caller as that 4xx, not a 502; honor upstream backpressure with
+  immediate failover); multi-replica sticky has a hard memory bound. All opt-in;
+  defaults unchanged.
+- **Behavior change (documented)** — an upstream HTTP `4xx` (e.g. a context-length
+  `400`) now returns that `4xx` with type `upstream_client_error` and is called
+  exactly once, instead of being collapsed to `502 backend_unavailable` and retried
+  across every pool member (the pre-fix behavior, also present in v0.5.0). An
+  upstream `429`/`503` now fails over immediately and benches the throttled member.
+  Any v0.5.0 test asserting the old 502-on-upstream-4xx is an intended change.
 - **Negative** — more routing configuration surface; `_select_member` carries the
   ejection-cap + half-open logic; a second cooldown sub-structure (ejection count)
   to maintain across both stores; the Redis sticky LRU adds a write on the sticky
-  write path when enabled.
+  write path when enabled; a typed-upstream-error path in every adapter.
 - **Risks** — a misconfigured cap could keep a known-bad member eligible (mitigated:
   it only reinstates the soonest-to-recover, and a genuinely failing member is
-  re-benched on its next failure); a large `Retry-After` could stall a retry
-  (mitigated: clamped to the request-timeout deadline); exponential growth could
-  over-bench a member (mitigated: `cooldown_max_seconds` cap + decay).
+  re-benched on its next failure); a large or hostile `Retry-After` could stall a
+  retry (mitigated: clamped to **both** `retry_after_max_seconds` and the request
+  deadline — bounded even when `request_timeout_seconds = 0`); exponential growth
+  could over-bench a member (mitigated: `cooldown_max_seconds` cap + decay).
 
 ## Confirmation
 
@@ -147,12 +178,19 @@ skip cleanly where the optional extra is absent). New tests:
   claims (both stores), release on success, and manager single-trial gating:
   concurrent probes routed away from the held member, success closes / failure
   re-benches, and default-off allows multiple probes.
-- `tests/test_error_policy.py` — the classification matrix, `Retry-After` parsing
-  (seconds, HTTP-date, absent/invalid), policy defaults = ADR 0009, 4xx never
-  retried/counted even if configured, backpressure opt-in, per-class attempt caps,
-  and manager integration (4xx not retried/benched, 429 retried only when opted in,
-  cooldown counts only configured classes, upstream `Retry-After` honored, per-class
-  cap stops retrying).
+- `tests/test_error_policy.py` — the classification matrix (incl. upstream-status
+  typing), `Retry-After` parsing (seconds, HTTP-date, absent/invalid), policy
+  defaults = ADR 0009, 4xx never retried/counted even if configured, backpressure
+  **fails over to a healthy member** (and a lone member returns 429, no sleep),
+  cooldown counts only configured classes, upstream `Retry-After` immediate failover
+  vs. clamped sleep-only-when-no-member, and per-class cap stops retrying.
+- `tests/test_upstream_errors.py` — **end-to-end** against a local
+  `ThreadingHTTPServer` upstream (not hand-built exceptions): upstream
+  `400/404/413/422` → client `4xx` `upstream_client_error`, called once, no bench;
+  message sanitized + truncated; `429`/`503`+`Retry-After` → immediate failover +
+  throttled member benched; single-member and `request_timeout = 0` + huge
+  `Retry-After` both bounded; streaming pre-first-byte `4xx` same as non-stream;
+  embeddings `4xx` → client `4xx`; non-finite reliability knobs rejected.
 - `tests/test_redis_sticky_lru.py` — LRU eviction of least-recently-pinned,
   re-pin refreshes position, unbounded keeps everything, bounded `sticky_len` uses
   the index (fakeredis).

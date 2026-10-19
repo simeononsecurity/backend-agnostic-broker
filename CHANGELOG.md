@@ -26,18 +26,36 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **Per-error retry/cooldown policies** (`broker/reliability.py`): each failure is
     classified (`timeout`/`connection`/`server_error`/`backpressure`/`client_error`)
     and `BROKER_RETRY_ON_*` / `BROKER_COOLDOWN_ON_*` decide retry/cooldown per class.
-    **4xx client errors are never retried or counted.** An upstream `Retry-After`
-    (RFC 9110) on a retried error is honored within the request-timeout budget
-    (`BROKER_RETRY_RESPECT_RETRY_AFTER`); `BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS` sets
-    per-class attempt caps. Defaults reproduce ADR 0009's failover set.
+    Every HTTP adapter now raises a **typed upstream error** (carrying the upstream
+    status + `Retry-After`) when the backend responds with `>= 400`, so the policy
+    keys on the real status: `408`→timeout, `429`→backpressure, other `4xx`→client_error,
+    `5xx`→server_error. **4xx client errors are never retried, failed over, or counted.**
+    An upstream `Retry-After` (RFC 9110) triggers immediate failover + a throttle
+    bench; sleep only when no other member, clamped to the new
+    `BROKER_RETRY_AFTER_MAX_SECONDS` (default 120s) and the request deadline — so even
+    `BROKER_REQUEST_TIMEOUT_SECONDS=0` can't stall unbounded.
+    `BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS` sets per-class attempt caps. Defaults
+    reproduce ADR 0009's failover set.
   - **Redis sticky global LRU bound** `BROKER_REDIS_STICKY_MAX_ENTRIES`: a
     sorted-set index scored by last pin caps total sticky entries per Redis prefix,
     evicting least-recently-pinned on overflow (`ZPOPMIN`). `0` = TTL-only.
-  - `GET /status` gains a `reliability` block; `CooldownRecord`/`cooldown` JSON gains
-    `ejections`.
+  - `GET /status` gains a `reliability` block (incl. `retry_after_max_seconds`); the
+    `cooldown` JSON in `/status` + `/healthz/backends` gains `ejections`, `recovering`,
+    and (when single-trial half-open is on) `half_open_trial`.
   - `examples/reliability/` — a runnable, GPU-free demo (multi-member fake pool +
     tuned settings + README showing how to observe cooldowns in `/status` and
     `/healthz/backends`).
+
+### Changed
+
+- **Upstream HTTP errors are surfaced by status instead of collapsed to `502`**
+  (ADR 0017). A backend 4xx (e.g. a context-length `400`) now returns that `4xx`
+  with `error.type` `upstream_client_error`, is called exactly once, and never
+  benches a pool member — previously it became `502 backend_unavailable` and was
+  retried across every member (the behavior in v0.5.0 and earlier). An upstream
+  `429`/`503` now fails over to a healthy member immediately and benches the
+  throttled one. Transport failures (connect/read timeout, unreachable) remain
+  `502`. See `docs/api-reference.md#upstream-backend-errors-adr-0017`.
 
 ## [0.5.0] - 2026-10-19
 

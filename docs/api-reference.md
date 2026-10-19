@@ -92,7 +92,26 @@ Error types and HTTP status: `config_error` (500), `invalid_request_error`
 (404), `model_load_error` (503), `backend_unavailable` (502), `timeout_error`
 (504), `rate_limit_error` (429), `rate_limit_exceeded` (429, per-key
 rpm/tpm/concurrency), `insufficient_quota` (429, per-key budget exhausted),
-`request_too_large` (413).
+`request_too_large` (413), `upstream_client_error` (the upstream 4xx; see below).
+
+### Upstream backend errors (ADR 0017)
+
+When a backend *responds* with an HTTP error (status `>= 400`), the broker surfaces
+it by the upstream status rather than collapsing everything to `502`:
+
+| Upstream status | Client status | `error.type` | Retry / failover |
+|-----------------|---------------|--------------|------------------|
+| `400`, `404`, `413`, `422`, other `4xx` | the same `4xx` | `upstream_client_error` | never retried, failed over, or benched — the request itself is bad |
+| `408` | `504` | `timeout_error` | retried/failed over as a timeout |
+| `429` | `429` | `rate_limit_error` (with `Retry-After`) | immediate failover to a healthy member + throttled member benched; a lone member returns `429` (no sleep) |
+| `5xx` (e.g. `500`, `503`) | `502` | `backend_unavailable` | retried/failed over; a `503` + `Retry-After` benches the throttled member and (lone member only) sleep-retries within a bounded budget |
+
+A pure *transport* failure (connect error, read timeout, unreachable) remains
+`502 backend_unavailable`. Upstream error messages are sanitized and truncated
+before being echoed. Every `Retry-After` wait is clamped to
+`BROKER_RETRY_AFTER_MAX_SECONDS` and the request deadline (never unbounded). For a
+streaming request the transport status is already `200`; a pre-first-byte upstream
+error rides in the terminal SSE error frame with the same `error.type`.
 
 ## Endpoints
 

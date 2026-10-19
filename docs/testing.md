@@ -3,7 +3,7 @@
 Run the suite:
 
 ```bash
-make test                 # pytest -q  (436 collected: 396 passed, 40 skipped)
+make test                 # pytest -q  (455 collected: 415 passed, 40 skipped)
 make cov                  # with coverage
 python -m pytest -q tests/test_security.py   # one file
 ```
@@ -13,14 +13,14 @@ so they exercise the real request path, lifecycle, locking, and security
 boundaries without any external runtime. The suite is CPU-only; optional GPU
 tests (if added) should be marked and excluded from CI.
 
-In the default CPU venv, 396 pass and 40 skip — the skips are the Redis-backed
+In the default CPU venv, 415 pass and 40 skip — the skips are the Redis-backed
 `StateStore` paths (counters, prefix index, response cache, cooldown/half-open,
 sticky LRU) and the OpenTelemetry span path, which need the optional
 `redis`/`otel` extras. In a venv with `pip install -e '.[dev,redis,otel]'` those
-run too: **434 passed, 2 skipped** (the remaining 2 are import-guard paths that
+run too: **453 passed, 2 skipped** (the remaining 2 are import-guard paths that
 only fire when a package is *absent*).
 
-## Coverage map (436 collected)
+## Coverage map (455 collected)
 
 | File | Tests | Covers |
 |------|-------|--------|
@@ -36,7 +36,8 @@ only fire when a package is *absent*).
 | `tests/test_ejection_cap.py` | 7 | Ejection cap (ADR 0017, Envoy `max_ejection_percent`): the cap function keeps soonest-to-recover eligible, selection honors it, **never-strand** when a whole pool is benched, and `0` falls through to the ADR 0009 self-heal. |
 | `tests/test_cooldown_backoff.py` | 15 | Exponential ejection growth + decay (ADR 0017): window grows per consecutive ejection, `max_seconds` cap, `multiplier=1.0` fixed, repeated-failure-within-window is one ejection, decay on any success vs sustained-success, `ejections` surfaced — parametrized over in-process + fakeredis, plus an end-to-end manager check. |
 | `tests/test_half_open.py` | 10 | Single-trial half-open (ADR 0017): `try_half_open` single-winner under 20 concurrent claims + release-on-success (both stores); manager gating routes concurrent probes away from the held member, success closes / failure re-benches, default-off allows multiple probes. |
-| `tests/test_error_policy.py` | 16 | Per-error retry/cooldown policy (ADR 0017): classification matrix + HTTP-status fallback, `Retry-After` parsing (seconds/HTTP-date/absent/invalid), policy defaults = ADR 0009, 4xx never retried/counted even if configured, backpressure opt-in, per-class attempt caps; manager integration (4xx not retried, 429 retried only when opted in, cooldown counts only configured classes, upstream `Retry-After` honored, per-class cap stops retrying). |
+| `tests/test_error_policy.py` | 18 | Per-error retry/cooldown policy (ADR 0017): classification matrix + upstream-status + HTTP-status fallback, `Retry-After` parsing (seconds/HTTP-date/absent/invalid), policy defaults = ADR 0009, 4xx never retried/counted even if configured, per-class attempt caps; manager integration (4xx not retried, backpressure fails over to a healthy member and a lone member returns 429 no-sleep, cooldown counts only configured classes, upstream `Retry-After` immediate failover vs. clamped sleep-only-when-no-member, per-class cap stops retrying). |
+| `tests/test_upstream_errors.py` | 17 | **End-to-end** typed upstream HTTP errors (ADR 0017 follow-up) against a local `ThreadingHTTPServer`: upstream 400/404/413/422 → client 4xx `upstream_client_error`, called once, no bench; message sanitized + truncated; 429/503+Retry-After → immediate failover + throttled member benched; single-member + `request_timeout=0` + huge Retry-After both bounded; streaming pre-first-byte 4xx same as non-stream; embeddings 4xx → client 4xx; non-finite reliability knobs rejected. |
 | `tests/test_redis_sticky_lru.py` | 4 | Redis sticky global LRU bound (ADR 0017, fakeredis): evicts least-recently-pinned on overflow, re-pin refreshes position, unbounded keeps everything, bounded `sticky_len` uses the index. |
 | `tests/test_example_reliability.py` | 5 | The `examples/reliability` demo: example registry + settings load/validate, pooled `chat` serves, `/status.reliability` exposed, injected failure surfaces cooldown in `/status` + `/healthz/backends`, 4xx not retried/benched. |
 | `tests/test_cache_routing.py` | 26 | Cache-aware routing (ADR 0010): prompt normalization + chained block hashing, longest-prefix match, LRU/TTL index eviction, hit-rate stats, vLLM `/metrics` parse; manager routing (warm-member reuse, no-match→least_busy, load flips choice, beta=0 affinity, 3-member longest-prefix); invariants (unhealthy/cooldown excluded, failover, single-member, sticky map untouched, default builds no router, embeddings); StateStore index in-process + Redis (fakeredis); bench smoke run. |

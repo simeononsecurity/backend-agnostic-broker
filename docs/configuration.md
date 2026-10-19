@@ -198,7 +198,8 @@ count toward cooldown; backpressure and client/other are not).
 | `BROKER_COOLDOWN_ON_CONNECTION` | bool | `true` | Count connection failures toward cooldown. |
 | `BROKER_COOLDOWN_ON_SERVER_ERROR` | bool | `true` | Count 5xx toward cooldown. |
 | `BROKER_COOLDOWN_ON_BACKPRESSURE` | bool | `false` | Count 429 toward cooldown. |
-| `BROKER_RETRY_RESPECT_RETRY_AFTER` | bool | `true` | On a retried error carrying `Retry-After` (RFC 9110; delay-seconds or HTTP-date), wait that long instead of the jittered backoff, clamped to the request-timeout deadline. |
+| `BROKER_RETRY_RESPECT_RETRY_AFTER` | bool | `true` | On a retried error carrying `Retry-After` (RFC 9110; delay-seconds or HTTP-date), honor it: fail over to a healthy member immediately (no sleep) and bench the throttled member; sleep only when no other member is available, clamped to `BROKER_RETRY_AFTER_MAX_SECONDS` and the request deadline. |
+| `BROKER_RETRY_AFTER_MAX_SECONDS` | float | `120.0` | Finite ceiling (seconds) on any `Retry-After` wait and on how long a throttled member is benched for its `Retry-After`. Guarantees a hostile/huge header — or `BROKER_REQUEST_TIMEOUT_SECONDS=0` (unbounded) — can never produce an unbounded sleep. `0` = never sleep for `Retry-After` (fail over only). Must be finite and >= 0. |
 | `BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS` | JSON dict | `{}` | Per-class attempt cap, e.g. `{"timeout": 5, "server_error": 2}`. A listed class caps attempts for its failures; unlisted classes use `BROKER_RETRY_MAX_ATTEMPTS`. |
 
 ## Shared state / Redis (ADR 0009)

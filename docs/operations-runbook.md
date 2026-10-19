@@ -83,11 +83,14 @@ All opt-in; defaults reproduce v0.5.0. Read live state from `GET /status`
   bursty load this stops a thundering herd from hammering a just-recovered member —
   only one probe goes through per recovery window.
 - **Per-error policy** (`BROKER_RETRY_ON_*` / `BROKER_COOLDOWN_ON_*`,
-  `BROKER_RETRY_RESPECT_RETRY_AFTER`, `BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS`): decide
-  retry/cooldown per failure class. A 4xx is never retried or benched. To respect an
-  upstream rate limiter, set `BROKER_RETRY_ON_BACKPRESSURE=true` and keep
-  `BROKER_RETRY_RESPECT_RETRY_AFTER=true` so the broker waits the advertised
-  `Retry-After` (within the request-timeout budget).
+  `BROKER_RETRY_RESPECT_RETRY_AFTER`, `BROKER_RETRY_AFTER_MAX_SECONDS`,
+  `BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS`): decide retry/cooldown per failure class,
+  keyed on the real upstream HTTP status. A 4xx is returned to the caller as that
+  4xx (`upstream_client_error`), never retried or benched. To respect an upstream
+  rate limiter, keep `BROKER_RETRY_RESPECT_RETRY_AFTER=true`: a 429/503 fails over
+  to a healthy member immediately and benches the throttled one; a lone member's
+  wait is clamped to `BROKER_RETRY_AFTER_MAX_SECONDS` (default 120s) and the request
+  deadline — so even `BROKER_REQUEST_TIMEOUT_SECONDS=0` can't stall unbounded.
 - See the runnable [`examples/reliability/`](../examples/reliability/) demo.
 
 ## Multi-replica / shared state (ADR 0009)

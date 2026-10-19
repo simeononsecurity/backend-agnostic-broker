@@ -145,11 +145,17 @@ Four refinements on the circuit breaker above, all opt-in (defaults = v0.5.0):
   recovering member admits exactly ONE probe (via the StateStore half-open lock);
   concurrent requests skip it until the trial resolves. Default off keeps the ADR
   0009 behavior (any post-expiry request may probe).
-- **Per-error policies.** Each failure is classified — `timeout`, `connection`,
-  `server_error`, `backpressure` (429), `client_error` (4xx) — and per-class
-  settings decide whether it is retried and whether it counts toward cooldown.
-  **A 4xx client error is never retried or benched.** An upstream `Retry-After`
-  (RFC 9110) on a retried error is honored within the request-timeout budget. See
+- **Per-error policies.** When a backend *responds* with an HTTP error (status
+  `>= 400`) the adapter raises a typed error carrying that status + `Retry-After`;
+  it is classified by status — `408` → `timeout`, `429` → `backpressure`, other
+  `4xx` → `client_error`, `5xx` → `server_error` — while a transport failure stays
+  `connection`. Per-class settings decide retry and cooldown-counting. **A 4xx
+  client error is never retried, failed over, or benched** — the upstream `4xx` is
+  returned to the caller as that status (type `upstream_client_error`), never a
+  `502`. An upstream `Retry-After` (RFC 9110) triggers immediate failover to a
+  healthy member plus a throttle bench; the broker sleeps only when no other member
+  is available, clamped to `BROKER_RETRY_AFTER_MAX_SECONDS` and the request
+  deadline (bounded even when `request_timeout_seconds = 0`). See
   [configuration.md](configuration.md#per-error-retry--cooldown-policies-adr-0017).
 
 A runnable demo lives in [`examples/reliability/`](../examples/reliability/).
@@ -414,7 +420,8 @@ never touch a member that is mid-request.
 | `BROKER_COOLDOWN_HALF_OPEN_TTL_SECONDS` | `0` | trial-lock lifetime (`0` = derive from request timeout) |
 | `BROKER_RETRY_ON_{TIMEOUT,CONNECTION,SERVER_ERROR,BACKPRESSURE}` | `true`/`true`/`true`/`false` | per-class retry toggles (4xx never retried) |
 | `BROKER_COOLDOWN_ON_{TIMEOUT,CONNECTION,SERVER_ERROR,BACKPRESSURE}` | `true`/`true`/`true`/`false` | per-class cooldown-counting toggles (4xx never counted) |
-| `BROKER_RETRY_RESPECT_RETRY_AFTER` | `true` | honor an upstream `Retry-After` on a retried error (within budget) |
+| `BROKER_RETRY_RESPECT_RETRY_AFTER` | `true` | honor an upstream `Retry-After`: immediate failover + bench the throttled member; sleep only when no other member (clamped) |
+| `BROKER_RETRY_AFTER_MAX_SECONDS` | `120.0` | finite ceiling on any `Retry-After` wait / throttle bench (bounds even `request_timeout=0`) |
 | `BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS` | `{}` | optional JSON per-class attempt cap |
 | `BROKER_REDIS_URL` | _(unset)_ | share routing state across replicas (optional `[redis]` extra) |
 | `BROKER_REDIS_PREFIX` | `broker` | Redis key namespace |
