@@ -3,7 +3,7 @@
 Run the suite:
 
 ```bash
-make test                 # pytest -q  (455 collected: 415 passed, 40 skipped)
+make test                 # pytest -q  (count reconciled at integration; see coverage map)
 make cov                  # with coverage
 python -m pytest -q tests/test_security.py   # one file
 ```
@@ -13,14 +13,13 @@ so they exercise the real request path, lifecycle, locking, and security
 boundaries without any external runtime. The suite is CPU-only; optional GPU
 tests (if added) should be marked and excluded from CI.
 
-In the default CPU venv, 415 pass and 40 skip — the skips are the Redis-backed
-`StateStore` paths (counters, prefix index, response cache, cooldown/half-open,
-sticky LRU) and the OpenTelemetry span path, which need the optional
-`redis`/`otel` extras. In a venv with `pip install -e '.[dev,redis,otel]'` those
-run too: **453 passed, 2 skipped** (the remaining 2 are import-guard paths that
-only fire when a package is *absent*).
+In the default CPU venv the Redis-backed `StateStore` paths (counters, prefix index,
+response cache, cooldown/half-open, sticky LRU, prefix-index sorted-set LRU) and the
+OpenTelemetry span path skip — they need the optional `redis`/`otel` extras. In a venv
+with `pip install -e '.[dev,redis,otel]'` those run too (the remaining 2 skips are
+import-guard paths that only fire when a package is *absent*).
 
-## Coverage map (455 collected)
+## Coverage map
 
 | File | Tests | Covers |
 |------|-------|--------|
@@ -40,8 +39,8 @@ only fire when a package is *absent*).
 | `tests/test_upstream_errors.py` | 17 | **End-to-end** typed upstream HTTP errors (ADR 0017 follow-up) against a local `ThreadingHTTPServer`: upstream 400/404/413/422 → client 4xx `upstream_client_error`, called once, no bench; message sanitized + truncated; 429/503+Retry-After → immediate failover + throttled member benched; single-member + `request_timeout=0` + huge Retry-After both bounded; streaming pre-first-byte 4xx same as non-stream; embeddings 4xx → client 4xx; non-finite reliability knobs rejected. |
 | `tests/test_redis_sticky_lru.py` | 4 | Redis sticky global LRU bound (ADR 0017, fakeredis): evicts least-recently-pinned on overflow, re-pin refreshes position, unbounded keeps everything, bounded `sticky_len` uses the index. |
 | `tests/test_example_reliability.py` | 5 | The `examples/reliability` demo: example registry + settings load/validate, pooled `chat` serves, `/status.reliability` exposed, injected failure surfaces cooldown in `/status` + `/healthz/backends`, 4xx not retried/benched. |
-| `tests/test_cache_routing.py` | 26 | Cache-aware routing (ADR 0010): prompt normalization + chained block hashing, longest-prefix match, LRU/TTL index eviction, hit-rate stats, vLLM `/metrics` parse; manager routing (warm-member reuse, no-match→least_busy, load flips choice, beta=0 affinity, 3-member longest-prefix); invariants (unhealthy/cooldown excluded, failover, single-member, sticky map untouched, default builds no router, embeddings); StateStore index in-process + Redis (fakeredis); bench smoke run. |
-| `tests/test_bench_routing.py` | 5 | Cache-aware **default-β regression** (ADR 0010 follow-up): drives `scripts/bench_routing.py` seeded scenarios through the real manager and pins that the config default β (0.25) beats `sticky` on hit rate *and* TTFT p95 for `cache_pressure` + `cross_session`, roughly doubles the cache-pressure hit rate, and respects the low-pressure load-balance bound the default was selected by. |
+| `tests/test_cache_routing.py` | 31 | Cache-aware routing (ADR 0010/0018): prompt normalization + chained block hashing, longest-prefix match, LRU/TTL index eviction, hit-rate stats, vLLM `/metrics` parse; manager routing (warm-member reuse, no-match→least_busy, load flips choice, beta=0 affinity, 3-member longest-prefix); invariants (unhealthy/cooldown excluded, failover, single-member, sticky map untouched, default builds no router, embeddings); StateStore index in-process + Redis (fakeredis); **sorted-set LRU size bound (ADR 0018) in-process + Redis + a cross-replica shared-bound test**; bench smoke run. |
+| `tests/test_bench_routing.py` | 30 | Queueing-model routing bench (ADR 0018 + follow-up): pins the config default β (`0.5`); asserts `cache_aware` **saves prefill work** and **lifts hit rate vs `least_busy`** (cache_pressure/cross_session), its p95 is within the rule's tolerance of `least_busy` at ≤85% util, and `least_busy` is **tail-best at saturation** (p95 ≤ cache_aware < sticky); holds the 1.25× low-pressure balance bound while β=0.25 fails a selection bound at moderate load; **SLO capacity** (cache_aware > sticky, least_busy leads) and the **utilization-sweep** helpers; model correctness (percentile ordering, bounded utilization, throughput ≤ offered, uniform⇒symmetric queues, zero-cache⇒cache_aware≈least_busy, β monotonicity, prefill-work consistency); the (least_busy-referenced) β selection-rule unit tests + a real-matrix integration test; `--smoke` and `--sweep --smoke` CLI. |
 | `tests/test_state.py` | 31 | `StateStore` contract parametrized over in-process + Redis (fakeredis, skips if absent): sticky/LRU, counters + sliding window, cooldown transitions, half-open claim, bytes/JSON KV, factory fail-fast. |
 | `tests/test_health_probe.py` | 8 | Non-loading health: `/healthz/backends`, periodic probe marks dead backends failed (never loads), `/api/ps` aggregation. |
 | `tests/test_router.py` | 29 | `auto` router: flag extraction, Stage-1 capability filter, overrides, heuristic task routing, fallback, cache, GBNF/prompt builders, manager + API end-to-end. |
@@ -59,6 +58,7 @@ only fire when a package is *absent*).
 | `tests/test_unload.py` | 4 | Idle unload sweep; unload while idle; not while serving. |
 | `tests/test_security.py` | 17 | SSRF guard, path traversal, executable allow-list, flag/shell-injection rejection, no-shell argv. |
 | `tests/test_docs_examples.py` | 4 | Documentation/API examples run against the real API. |
+| `tests/test_examples_cache_aware.py` | 3 | `examples/cache-aware-routing/` is real (ADR 0018): the registry parses into the 3-member `chat` pool, `.env.example` encodes `cache_aware`/`β=0.5` matching the config default, and those settings drive cache-aware selection end-to-end on the fake backend (repeat prefix → warm member; `/status.cache_aware` stats populated). |
 | `tests/test_cache.py` | 18 | Response cache (ADR 0012): key stability + scope/model/endpoint isolation, sampling/tools/format in key, deterministic-only default, hit/miss/bypass headers, per-key isolation, errors-not-cached, embeddings cached, disabled pass-through, StateStore-backed roundtrip + TTL + LRU eviction + max-bytes. |
 | `tests/test_admin.py` | 19 | Admin runtime control (ADR 0012): disabled blocks, admin-key required, model list, load/unload, refuse/drain/timeout on in-flight, draining member skipped, registry reload add/remove, unchanged-instance kept, invalid-registry rollback; **admin scope reconciliation** — non-ASCII/over-long admin key → 401 (not 500) on every header, and an ADR 0008 admin-scope virtual key authorizes `/admin` while a user-scope key is denied. |
 | `tests/test_tracing.py` | 4 | Tracing (ADR 0012): no-op when disabled, app serves with tracing off, `ConfigError` when enabled without otel (skipped if installed), `gen_ai.*` spans asserted via in-memory exporter with **no content captured** (skipped without the SDK). |

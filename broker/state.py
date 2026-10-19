@@ -189,6 +189,22 @@ class StateStore:
     async def kv_set_json(self, key: str, value: Any, ttl: float | None = None) -> None:
         await self.kv_set(key, json.dumps(value).encode("utf-8"), ttl=ttl)
 
+    # --- sorted-set LRU (ADR 0018) ---------------------------------------
+    # A last-access-scored set used to size-bound the cache-aware prefix index
+    # (ADR 0010) ACROSS replicas when backed by Redis: ``zlru_touch`` records an
+    # access, ``zlru_trim`` evicts the oldest members beyond ``max_entries`` and
+    # returns them so the caller can delete the associated KV entries.
+    async def zlru_touch(
+        self, index: str, member: str, score: float, ttl: float | None = None
+    ) -> None:
+        raise NotImplementedError
+
+    async def zlru_trim(self, index: str, max_entries: int) -> list[str]:
+        raise NotImplementedError
+
+    async def zlru_size(self, index: str) -> int:
+        raise NotImplementedError
+
     # --- lifecycle -------------------------------------------------------
     async def close(self) -> None:
         return None
@@ -217,6 +233,7 @@ class InProcessStateStore(StateStore):
         self._ejections: dict[str, tuple[int, float]] = {}
         self._halfopen: dict[str, float] = {}  # key -> trial-lock expiry ts
         self._kv: dict[str, tuple[bytes, float | None]] = {}
+        self._zlru: dict[str, dict[str, float]] = {}  # index -> {member: score}
 
     # --- sticky map ---
     async def sticky_get(self, pool: str, session: str) -> str | None:
@@ -370,6 +387,26 @@ class InProcessStateStore(StateStore):
 
     async def kv_delete(self, key: str) -> None:
         self._kv.pop(key, None)
+
+    # --- sorted-set LRU ---
+    async def zlru_touch(
+        self, index: str, member: str, score: float, ttl: float | None = None
+    ) -> None:
+        self._zlru.setdefault(index, {})[member] = score
+
+    async def zlru_trim(self, index: str, max_entries: int) -> list[str]:
+        d = self._zlru.get(index)
+        if not d or max_entries <= 0 or len(d) <= max_entries:
+            return []
+        # Oldest = lowest score; ties broken by insertion order (stable sort).
+        ordered = sorted(d.items(), key=lambda kv: kv[1])
+        evict = [m for m, _ in ordered[: len(d) - max_entries]]
+        for m in evict:
+            d.pop(m, None)
+        return evict
+
+    async def zlru_size(self, index: str) -> int:
+        return len(self._zlru.get(index, {}))
 
 
 class RedisStateStore(StateStore):
@@ -614,6 +651,31 @@ class RedisStateStore(StateStore):
 
     async def kv_delete(self, key: str) -> None:
         await self._r.delete(self._k("kv", key))
+
+    # --- sorted-set LRU ---
+    async def zlru_touch(
+        self, index: str, member: str, score: float, ttl: float | None = None
+    ) -> None:
+        k = self._k("zlru", index)
+        await self._r.zadd(k, {member.encode("utf-8"): score})
+        sec = self._ttl_int(ttl)
+        if sec is not None:
+            await self._r.expire(k, sec)
+
+    async def zlru_trim(self, index: str, max_entries: int) -> list[str]:
+        k = self._k("zlru", index)
+        n = int(await self._r.zcard(k))
+        if max_entries <= 0 or n <= max_entries:
+            return []
+        to_remove = n - max_entries
+        # Lowest-scored (oldest) members, as a cross-replica LRU bound.
+        members = await self._r.zrange(k, 0, to_remove - 1)
+        if members:
+            await self._r.zremrangebyrank(k, 0, to_remove - 1)
+        return [m.decode("utf-8") if isinstance(m, bytes) else str(m) for m in members]
+
+    async def zlru_size(self, index: str) -> int:
+        return int(await self._r.zcard(self._k("zlru", index)))
 
     # --- lifecycle ---
     async def close(self) -> None:

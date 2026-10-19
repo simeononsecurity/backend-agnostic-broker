@@ -25,7 +25,7 @@ Design (prior art, see ``docs/research/adr-0010-cache-aware-pool-routing.md``):
 from __future__ import annotations
 
 import hashlib
-from collections import OrderedDict
+import time
 from typing import Any
 
 from .state import StateStore
@@ -118,9 +118,10 @@ class CacheRouter:
 
     One instance per :class:`~broker.manager.ModelManager`. All index I/O goes
     through the injected :class:`~broker.state.StateStore` so a Redis deployment
-    shares the index across replicas. The LRU size bound is tracked per replica
-    (only keys this replica wrote); the TTL is the authoritative cross-replica
-    bound.
+    shares the index across replicas. The LRU size bound is maintained on the
+    StateStore's sorted-set LRU (``zlru_*``), which under Redis is **shared across
+    replicas** (a true cross-replica size bound, ADR 0018); the TTL remains a
+    second, time-based bound.
     """
 
     def __init__(
@@ -137,7 +138,8 @@ class CacheRouter:
         self.beta = beta
         self.max_entries = max_entries
         self.ttl_seconds = ttl_seconds
-        self._lru: OrderedDict[str, None] = OrderedDict()
+        #: Per-pool sorted-set LRU index name on the StateStore.
+        self._index_size = 0
         self._lookups = 0
         self._hits = 0  # lookups where >=1 member had a non-zero matched fraction
 
@@ -191,10 +193,17 @@ class CacheRouter:
 
     # --- record ----------------------------------------------------------
     async def record(self, pool: str, blocks: list[str], member: str) -> None:
-        """Record that ``member`` served ``blocks`` (called after a success)."""
+        """Record that ``member`` served ``blocks`` (called after a success).
+
+        Each block key's last-access time is refreshed on the StateStore's
+        sorted-set LRU for this pool; once the index exceeds ``max_entries`` the
+        oldest keys are evicted and their index entries deleted. Under Redis the
+        sorted set is shared, so the size bound holds **across replicas** (ADR 0018).
+        """
         if not blocks:
             return
         ttl = self.ttl_seconds or None
+        now = time.time()
         for h in blocks:
             key = self._key(pool, h)
             existing = await self.state.kv_get_json(key)
@@ -205,17 +214,17 @@ class CacheRouter:
             if len(members) > MAX_MEMBERS_PER_BLOCK:
                 members = members[-MAX_MEMBERS_PER_BLOCK:]
             await self.state.kv_set_json(key, members, ttl=ttl)
-            self._lru[key] = None
-            self._lru.move_to_end(key)
-        while self.max_entries > 0 and len(self._lru) > self.max_entries:
-            old, _ = self._lru.popitem(last=False)
-            await self.state.kv_delete(old)
+            await self.state.zlru_touch(pool, key, now, ttl=ttl)
+        if self.max_entries > 0:
+            for old in await self.state.zlru_trim(pool, self.max_entries):
+                await self.state.kv_delete(old)
+        self._index_size = await self.state.zlru_size(pool)
 
     # --- observability ---------------------------------------------------
     def stats(self) -> dict[str, Any]:
         rate = (self._hits / self._lookups) if self._lookups else 0.0
         return {
-            "index_size": len(self._lru),
+            "index_size": self._index_size,
             "lookups": self._lookups,
             "hits": self._hits,
             "hit_rate": round(rate, 4),

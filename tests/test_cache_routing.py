@@ -363,6 +363,69 @@ async def test_prefix_index_on_redis_statestore():
     await store.close()
 
 
+# --- sorted-set LRU size bound (ADR 0018) -------------------------------
+
+
+async def test_zlru_inprocess_bounds_and_evicts_oldest():
+    store = InProcessStateStore()
+    for i in range(10):
+        await store.zlru_touch("idx", f"k{i}", score=float(i))
+    evicted = await store.zlru_trim("idx", 4)
+    # Oldest (lowest score) four are evicted; newest four remain.
+    assert evicted == ["k0", "k1", "k2", "k3", "k4", "k5"]
+    assert await store.zlru_size("idx") == 4
+
+
+async def test_zlru_inprocess_trim_noop_when_under_bound():
+    store = InProcessStateStore()
+    await store.zlru_touch("idx", "a", 1.0)
+    assert await store.zlru_trim("idx", 10) == []
+    assert await store.zlru_trim("idx", 0) == []  # 0 = unbounded
+
+
+async def test_cache_router_lru_evicts_oldest_access_inprocess():
+    cr = CacheRouter(InProcessStateStore(), block_chars=8, beta=1.0, max_entries=3, ttl_seconds=0)
+    # Record four distinct single-block prefixes; index is bounded to 3.
+    for i in range(4):
+        await cr.record("chat", block_hashes(f"{i:08d}", 8), "node-a")
+    assert cr.stats()["index_size"] == 3
+
+
+@pytest.mark.skipif(not _HAVE_FAKEREDIS, reason="redis/fakeredis not installed")
+async def test_zlru_redis_bounds_and_evicts_oldest():
+    client = _fakeredis_aio.FakeRedis()
+    store = RedisStateStore("redis://fake", prefix="t", client=client)
+    for i in range(10):
+        await store.zlru_touch("idx", f"k{i}", score=float(i))
+    assert await store.zlru_size("idx") == 10
+    evicted = await store.zlru_trim("idx", 4)
+    assert set(evicted) == {"k0", "k1", "k2", "k3", "k4", "k5"}
+    assert await store.zlru_size("idx") == 4
+    await store.close()
+
+
+@pytest.mark.skipif(not _HAVE_FAKEREDIS, reason="redis/fakeredis not installed")
+async def test_cache_router_redis_cross_replica_size_bound():
+    """ADR 0018 item 4: two CacheRouters sharing one Redis StateStore enforce the
+    prefix-index size bound ACROSS replicas (the sorted-set LRU is shared), so the
+    combined index never exceeds max_entries — unlike the old per-replica bound,
+    which would keep max_entries on EACH replica."""
+    client = _fakeredis_aio.FakeRedis()
+    store_a = RedisStateStore("redis://fake", prefix="t", client=client)
+    store_b = RedisStateStore("redis://fake", prefix="t", client=client)
+    cr_a = CacheRouter(store_a, block_chars=8, beta=1.0, max_entries=5, ttl_seconds=0)
+    cr_b = CacheRouter(store_b, block_chars=8, beta=1.0, max_entries=5, ttl_seconds=0)
+    for i in range(8):
+        await cr_a.record("chat", block_hashes(f"a{i:07d}", 8), "node-a")
+    for i in range(8):
+        await cr_b.record("chat", block_hashes(f"b{i:07d}", 8), "node-b")
+    # Shared bound: the combined index is capped at 5, not 10.
+    assert await store_a.zlru_size("chat") == 5
+    assert cr_b.stats()["index_size"] == 5
+    await store_a.close()
+    await store_b.close()
+
+
 # --- bench smoke --------------------------------------------------------
 
 

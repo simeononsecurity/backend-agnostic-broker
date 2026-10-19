@@ -121,9 +121,9 @@ no effect and the broker behaves exactly as v0.4.0.
 
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
-| `BROKER_CACHE_AWARE_BETA` | float | `0.25` | Load-penalty weight in `score = matched_fraction - beta*relative_load`. `0` = pure prefix affinity; higher spreads load harder. Default `0.25` is tuned from the `scripts/bench_routing.py` scenario×β matrix (see [routing-and-health.md](routing-and-health.md#cache-aware-routing-adr-0010)); `1.0` over-penalized affinity. |
+| `BROKER_CACHE_AWARE_BETA` | float | `0.5` | Load-penalty weight in `score = matched_fraction - beta*relative_load`. `0` = pure prefix affinity; higher spreads load harder. Default `0.5` is re-tuned from the `scripts/bench_routing.py` scenario×β matrix under a **queueing model** (ADR 0018): the smallest β that keeps low-pressure load spread ≤1.25× and is **no worse than `least_busy` (the tail-latency-best strategy) on p95 TTFT by >10% at a moderate ≤85% utilization** (see [routing-and-health.md](routing-and-health.md#benchmark)). ADR 0010 shipped `0.25` from a balance-only heuristic; once queueing is priced it both hot-spots (spread 1.5×) and loses >10% p95 vs `least_busy`. Note `cache_aware` is **not** the latency-best strategy — `least_busy` is; `cache_aware`'s benefit is fewer uncached prefill tokens (GPU work) and higher hit rate. |
 | `BROKER_CACHE_AWARE_BLOCK_CHARS` | int | `128` | Characters per prefix block (~4 chars/token). Larger = smaller index, coarser matching. Only full blocks are hashed. |
-| `BROKER_CACHE_AWARE_MAX_ENTRIES` | int | `10000` | Prefix-index LRU bound per replica. `0` = unbounded (TTL still applies). |
+| `BROKER_CACHE_AWARE_MAX_ENTRIES` | int | `10000` | Prefix-index LRU bound. `0` = unbounded (TTL still applies). Maintained on the StateStore sorted-set LRU, so under Redis the bound is **shared across replicas** (ADR 0018). |
 | `BROKER_CACHE_AWARE_TTL_SECONDS` | float | `1800` | TTL on prefix-index entries, approximating KV-cache residency. `0` = no expiry. |
 | `BROKER_CACHE_AWARE_USE_METRICS` | bool | `false` | Let the non-loading health probe scrape vLLM `/metrics` (`vllm:num_requests_waiting`) for a real load signal; falls back to in-flight counts. Never loads a model. |
 

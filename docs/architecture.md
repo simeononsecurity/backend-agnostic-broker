@@ -211,6 +211,7 @@ dicts; across replicas it is Redis. The `ModelManager` owns one `StateStore`
 | Counters | `incr(key, amount, ttl)`, `get_counter(key)`, `window_incr(key, window_s, …)`, `window_count(key, window_s, …)` | **ADR 0008** per-key rate limits (rpm/tpm sliding window) |
 | Cooldowns | `record_failure(key, *, threshold, cooldown_seconds, multiplier, max_cooldown_seconds)`, `record_success(key, decay_seconds)`, `get_cooldown(key)` → `CooldownRecord`, `try_half_open(key, ttl_seconds)` | manager member cooldowns (ADR 0009) + ejection growth / single-trial half-open (ADR 0017) |
 | Generic KV | `kv_get/kv_set` (bytes + TTL), `kv_get_json/kv_set_json`, `kv_delete` | **ADR 0010** prefix→member index, **ADR 0012** response cache |
+| Sorted-set LRU | `zlru_touch(index, member, score, ttl)`, `zlru_trim(index, max_entries)` → evicted members, `zlru_size(index)` | **ADR 0018** cross-replica prefix-index size bound (shared under Redis) |
 | Lifecycle | `close()` | shutdown |
 
 `CooldownRecord` carries `failures`, `until`, `now`, and `ejections` (ADR 0017),

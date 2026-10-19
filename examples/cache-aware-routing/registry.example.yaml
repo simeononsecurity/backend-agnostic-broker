@@ -1,0 +1,63 @@
+# Example registry for cache-aware pool routing (ADR 0010 / ADR 0018).
+#
+# A single logical model "chat" backed by a 3-member vLLM pool. With
+# BROKER_ROUTE_STRATEGY=cache_aware (see .env.example), the broker routes each
+# request to the member that already holds its prompt PREFIX (warm KV cache),
+# backing off to a less-loaded member once a warm one saturates.
+#
+# Host URLs come from the environment so no real IPs are committed — set
+# VLLM_URL_1..3 in a gitignored .env (defaults below point at localhost ports).
+
+pricing:
+  chat:
+    input_per_million: 0.20
+    output_per_million: 0.60
+
+models:
+  - alias: chat-node-1
+    backend: vllm
+    runtime_model_id: meta-llama/Llama-3.1-8B-Instruct
+    model_path: /models/Llama-3.1-8B-Instruct
+    pool: chat                       # <- clients request model: "chat"
+    base_url: ${VLLM_URL_1:-http://127.0.0.1:8001}
+    context_limit: 32768
+    output_limit: 2048
+    idle_timeout_seconds: 600
+    tags: [general, chat]
+    description: pooled chat model (cache-aware member)
+    cost_tier: 3
+    readiness: { kind: http, path: /health, expect_status: 200, timeout_seconds: 300 }
+    supports_streaming: true
+    supports_tools: true
+
+  - alias: chat-node-2
+    backend: vllm
+    runtime_model_id: meta-llama/Llama-3.1-8B-Instruct
+    model_path: /models/Llama-3.1-8B-Instruct
+    pool: chat
+    base_url: ${VLLM_URL_2:-http://127.0.0.1:8002}
+    context_limit: 32768
+    output_limit: 2048
+    idle_timeout_seconds: 600
+    tags: [general, chat]
+    description: pooled chat model (cache-aware member)
+    cost_tier: 3
+    readiness: { kind: http, path: /health, expect_status: 200, timeout_seconds: 300 }
+    supports_streaming: true
+    supports_tools: true
+
+  - alias: chat-node-3
+    backend: vllm
+    runtime_model_id: meta-llama/Llama-3.1-8B-Instruct
+    model_path: /models/Llama-3.1-8B-Instruct
+    pool: chat
+    base_url: ${VLLM_URL_3:-http://127.0.0.1:8003}
+    context_limit: 32768
+    output_limit: 2048
+    idle_timeout_seconds: 600
+    tags: [general, chat]
+    description: pooled chat model (cache-aware member)
+    cost_tier: 3
+    readiness: { kind: http, path: /health, expect_status: 200, timeout_seconds: 300 }
+    supports_streaming: true
+    supports_tools: true

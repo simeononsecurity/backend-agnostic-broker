@@ -134,7 +134,7 @@ def test_bad_route_strategy_rejected(fake_registry_file):
 def test_cache_aware_defaults_preserve_legacy(settings):
     # Cache-aware settings exist but default strategy stays sticky (off).
     assert settings.route_strategy == "sticky"
-    assert settings.cache_aware_beta == 0.25
+    assert settings.cache_aware_beta == 0.5  # ADR 0018: retuned under the queueing model
     assert settings.cache_aware_block_chars == 128
     assert settings.cache_aware_use_metrics is False
     settings.validate_runtime()

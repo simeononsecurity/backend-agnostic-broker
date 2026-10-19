@@ -21,7 +21,7 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 | 3 | Per-key rate limits (rpm/tpm) + virtual keys + budgets | ✅ done | [0008](adr/0008-per-key-governance.md) |
 | 4 | Retries w/ exponential backoff + member cooldowns | ✅ done | [0009](adr/0009-routing-reliability-and-scale.md), [0017](adr/0017-reliability-v2.md) |
 | 5 | Optional Redis shared state (multi-replica) | ✅ done | [0009](adr/0009-routing-reliability-and-scale.md), [0017](adr/0017-reliability-v2.md) |
-| 6 | Prefix/cache-aware pool routing + load-aware scoring | ✅ done | [0010](adr/0010-cache-aware-pool-routing.md) |
+| 6 | Prefix/cache-aware pool routing + load-aware scoring | ✅ done | [0010](adr/0010-cache-aware-pool-routing.md), extended by [0018](adr/0018-cache-aware-v2.md) |
 | 7 | Cascade mode for `auto` (cheap→escalate) | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
 | 8 | Latency-budget fallback + privacy/placement pinning | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
 | 9 | Router eval harness (CPT/APGR) | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
@@ -48,6 +48,13 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 - Invariants that constrain every item: lazy load, **no silent cross-model
   fallback**, non-loading health, security guards (see `AGENTS.md`).
 - Deferred follow-ups: semantic (embedding-similarity) response cache (item 10);
-  web UI/playground (item 12, `BROKER_UI_ENABLED` reserved); and a **queueing model
-  for `scripts/bench_routing.py`** so the cache-aware TTFT/p95 figures reflect
-  load-imbalance queueing rather than routing-only savings (ADR 0010).
+  web UI/playground (item 12, `BROKER_UI_ENABLED` reserved).
+- **Item 6 cache-aware deferrals — all resolved by [ADR 0018](adr/0018-cache-aware-v2.md):**
+  - ✅ queueing model for `scripts/bench_routing.py` (TTFT p50/p95/p99 incl. queueing,
+    throughput, utilization) + re-validated default β (`0.25`→`0.5`).
+  - ✅ cross-replica prefix-index LRU size bound under Redis (sorted-set LRU).
+  - ❌ output-length / queue-aware load signal — Rejected (bench shows no consistent
+    gain; in-flight count suffices; real signal via `BROKER_CACHE_AWARE_USE_METRICS`).
+  - ❌ token-ID block hashing — Rejected (needs a per-model tokenizer).
+  - ❌ precise KV-event (ZMQ) index — Rejected (couples to engine internals).
+  - ❌ Preble-style prefix autoscaling — Rejected (scheduler/placement, out of scope).
