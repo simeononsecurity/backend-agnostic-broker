@@ -31,6 +31,27 @@ router:
   # model's `priority` field.
   weights: { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0 }
 
+  # --- Cascade mode (opt-in; ADR 0011) ---------------------------------------
+  # "single" (default) = one-shot classification. "cascade" = serve the cheapest
+  # capable model first, inspect its ACTUAL answer, and escalate ONCE to a stronger
+  # capable model when a signal fires. Non-streaming only; a streaming cascade
+  # request falls back to the single strong pick (see docs/auto-router.md).
+  # mode: cascade
+  # cascade:
+  #   escalate_on_length: true     # first hop truncated (finish_reason == "length")
+  #   escalate_on_empty: true      # empty / too-short answer
+  #   min_chars: 1                 # shorter than this (stripped) => escalate
+  #   escalate_on_refusal: true    # answer matches a refusal pattern
+  #   refusal_patterns: ["(?i)\\bI\\s+cannot\\b", "(?i)as an AI\\b"]
+
+  # --- Latency budget (opt-in; ADR 0011) -------------------------------------
+  # Default per-request latency budget in ms. If the chosen model's estimated
+  # latency (usage-log p90 + a cold-start penalty for a not-resident model)
+  # exceeds the budget, a faster CAPABLE model is picked instead (never below the
+  # capability/placement filters). The x-broker-latency-budget-ms header wins over
+  # this; BROKER_ROUTER_LATENCY_BUDGET_MS is the final fallback.
+  # latency_budget_ms: 2000
+
   # Hard rules, evaluated IN ORDER, BEFORE the classifier. The first rule whose
   # conditions ALL match wins and bypasses the LLM. A rule is skipped if its
   # target can't actually serve the request (e.g. no vision for an image), so an
@@ -65,6 +86,11 @@ models:
     cost_tier: 1                       # 1 (cheapest) .. 5 (priciest); router prefers cheaper
     priority: 0                        # tie-break bias; higher = preferred on a tie
     router_eligible: true              # set false to exclude this model from "auto"
+    # Placement/data-residency labels (opt-in, fail-closed; ADR 0011). A request
+    # carrying a placement requirement (x-broker-placement header or
+    # BROKER_DEFAULT_PLACEMENT) is only served by models/pool members that carry
+    # ALL required labels; otherwise 403 placement_denied (never spills). e.g.:
+    placement: [local, trusted]        # this fake model runs in-process = local/trusted
 
   # ---- Ollama (external daemon, native lazy loading via keep_alive) ---------
   # base_url is injected from the environment so no host IP is committed. Point

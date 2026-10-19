@@ -22,9 +22,9 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 | 4 | Retries w/ exponential backoff + member cooldowns | ✅ done | [0009](adr/0009-routing-reliability-and-scale.md) |
 | 5 | Optional Redis shared state (multi-replica) | ✅ done | [0009](adr/0009-routing-reliability-and-scale.md) |
 | 6 | Prefix/cache-aware pool routing + load-aware scoring | 📋 planned | [0010](adr/0010-cache-aware-pool-routing.md) |
-| 7 | Cascade mode for `auto` (cheap→escalate) | 📋 planned | [0011](adr/0011-auto-router-evolution.md) |
-| 8 | Latency-budget fallback + privacy/placement pinning | 📋 planned | [0011](adr/0011-auto-router-evolution.md) |
-| 9 | Router eval harness (CPT/APGR) | 📋 planned | [0011](adr/0011-auto-router-evolution.md) |
+| 7 | Cascade mode for `auto` (cheap→escalate) | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
+| 8 | Latency-budget fallback + privacy/placement pinning | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
+| 9 | Router eval harness (CPT/APGR) | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
 
 ## P2 — ops & experience
 

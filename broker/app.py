@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -84,6 +85,54 @@ def _session_key(request: Request, body: dict) -> str:
     )
 
 
+# Placement label charset (mirrors broker/registry.py) for header validation.
+_PLACEMENT_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+
+
+def _placement_requirement(request: Request, settings: Settings) -> frozenset[str]:
+    """Required placement labels = BROKER_DEFAULT_PLACEMENT ∪ x-broker-placement.
+
+    The header is a comma-separated list; the requirement is set server-side (a
+    trusted caller/gateway), never downgradable by an end client below the config
+    default. Invalid labels are rejected (400) before any routing (ADR 0011).
+    """
+    labels = set(settings.default_placement)
+    raw = request.headers.get("x-broker-placement")
+    if raw:
+        for part in raw.split(","):
+            label = part.strip()
+            if not label:
+                continue
+            if not _PLACEMENT_LABEL_RE.match(label):
+                raise ValidationError(
+                    f"invalid x-broker-placement label {label!r}",
+                    remediation="use letters/digits/'.'/'-'/'_'/':' (e.g. 'local', 'region:eu')",
+                )
+            labels.add(label)
+    return frozenset(labels)
+
+
+def _latency_budget_ms(request: Request) -> float | None:
+    """Per-request latency budget from the x-broker-latency-budget-ms header.
+
+    Returns ``None`` when absent so the router applies the registry
+    ``router.latency_budget_ms`` then ``BROKER_ROUTER_LATENCY_BUDGET_MS`` default.
+    """
+    raw = request.headers.get("x-broker-latency-budget-ms")
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except ValueError as exc:
+        raise ValidationError(
+            f"invalid x-broker-latency-budget-ms {raw!r}",
+            remediation="send a positive number of milliseconds",
+        ) from exc
+    if v <= 0:
+        raise ValidationError("x-broker-latency-budget-ms must be > 0")
+    return v
+
+
 def _setup_logging(settings: Settings) -> None:
     level = getattr(logging, settings.log_level.upper(), logging.INFO)
     handler = logging.StreamHandler()
@@ -124,6 +173,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     usage_path = settings.usage_log_path or f"{settings.cache_dir.rstrip('/')}/usage.sqlite3"
     usage = UsageLog(usage_path, enabled=settings.usage_log_enabled)
+    # Give the manager/router access to the usage log for latency estimates and for
+    # recording intermediate cascade hops (ADR 0011).
+    manager.usage = usage
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -283,6 +335,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Reject request-supplied flag-like/unsafe tokens in the model selector.
         reject_request_flags(req.model, "model")
 
+        # Placement requirement + latency budget (ADR 0011). Parsed/validated up
+        # front so a bad header or a placement denial fails before any routing.
+        placement = _placement_requirement(request, settings)
+        budget = _latency_budget_ms(request)
+
         alias = req.model
         payload = req.model_dump(exclude_none=True)
         payload["messages"] = [m.model_dump(exclude_none=True) for m in req.messages]
@@ -300,13 +357,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         start = time.monotonic()
         if req.stream:
+            # Resolve the (possibly auto) route to one concrete model before streaming
+            # so the route is known for the header and placement is enforced up front.
+            concrete, route_path = await manager.resolve_stream(
+                alias, payload, required_placement=placement, latency_budget_ms=budget
+            )
 
             async def gen():
                 INFLIGHT.inc()
                 stream_status = "ok"
                 try:
                     async for chunk in manager.stream_chat(
-                        alias, payload, request_id, route_key=session_key
+                        concrete,
+                        payload,
+                        request_id,
+                        route_key=session_key,
+                        required_placement=placement,
                     ):
                         yield chunk
                     REQUESTS.labels("chat_stream", alias, "ok").inc()
@@ -323,7 +389,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     usage.record(
                         endpoint="chat_stream",
                         requested=alias,
-                        model=alias,
+                        model=concrete,
                         request_id=request_id,
                         api_key_id=key_id,
                         latency_ms=(time.monotonic() - start) * 1000,
@@ -334,12 +400,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return StreamingResponse(
                 gen(),
                 media_type="text/event-stream",
-                headers={"x-request-id": request_id, "cache-control": "no-cache"},
+                headers={
+                    "x-request-id": request_id,
+                    "cache-control": "no-cache",
+                    "x-broker-route": route_path,
+                },
             )
 
         INFLIGHT.inc()
         try:
-            result = await manager.chat(alias, payload, request_id, route_key=session_key)
+            result = await manager.chat(
+                alias,
+                payload,
+                request_id,
+                route_key=session_key,
+                required_placement=placement,
+                latency_budget_ms=budget,
+            )
+            route_path = result.pop("_broker_route", result.get("model", alias))
             REQUESTS.labels("chat", alias, "ok").inc()
             u = result.get("usage") or {}
             usage.record(
@@ -354,7 +432,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 latency_ms=(time.monotonic() - start) * 1000,
                 status="ok",
             )
-            return JSONResponse(content=result, headers={"x-request-id": request_id})
+            return JSONResponse(
+                content=result,
+                headers={"x-request-id": request_id, "x-broker-route": route_path},
+            )
         finally:
             INFLIGHT.dec()
             REQUEST_LATENCY.labels("chat", alias).observe(time.monotonic() - start)
@@ -391,6 +472,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not model or not isinstance(model, str):
             raise ValidationError("`model` is required")
         reject_request_flags(model, "model")
+        placement = _placement_requirement(request, settings)
+        budget = _latency_budget_ms(request)
         stream = bool(body.get("stream"))
         chat_payload = {k: v for k, v in body.items() if k != "prompt"}
         chat_payload["model"] = model
@@ -399,13 +482,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         start = time.monotonic()
 
         if stream:
+            concrete, route_path = await manager.resolve_stream(
+                model, chat_payload, required_placement=placement, latency_budget_ms=budget
+            )
 
             async def gen():
                 INFLIGHT.inc()
                 st = "ok"
                 try:
                     aiter = manager.stream_chat(
-                        model, chat_payload, request_id, route_key=session_key
+                        concrete,
+                        chat_payload,
+                        request_id,
+                        route_key=session_key,
+                        required_placement=placement,
                     )
                     async for out in chat_sse_to_text_sse(aiter, model):
                         yield out
@@ -425,7 +515,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     usage.record(
                         endpoint="completions_stream",
                         requested=model,
-                        model=model,
+                        model=concrete,
                         request_id=request_id,
                         api_key_id=key_id,
                         latency_ms=(time.monotonic() - start) * 1000,
@@ -436,12 +526,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return StreamingResponse(
                 gen(),
                 media_type="text/event-stream",
-                headers={"x-request-id": request_id, "cache-control": "no-cache"},
+                headers={
+                    "x-request-id": request_id,
+                    "cache-control": "no-cache",
+                    "x-broker-route": route_path,
+                },
             )
 
         INFLIGHT.inc()
         try:
-            result = await manager.chat(model, chat_payload, request_id, route_key=session_key)
+            result = await manager.chat(
+                model,
+                chat_payload,
+                request_id,
+                route_key=session_key,
+                required_placement=placement,
+                latency_budget_ms=budget,
+            )
+            route_path = result.pop("_broker_route", result.get("model", model))
             out = chat_to_text_completion(result, model)
             REQUESTS.labels("completions", model, "ok").inc()
             u = result.get("usage") or {}
@@ -457,7 +559,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 latency_ms=(time.monotonic() - start) * 1000,
                 status="ok",
             )
-            return JSONResponse(content=out, headers={"x-request-id": request_id})
+            return JSONResponse(
+                content=out,
+                headers={"x-request-id": request_id, "x-broker-route": route_path},
+            )
         finally:
             INFLIGHT.dec()
             REQUEST_LATENCY.labels("completions", model).observe(time.monotonic() - start)
@@ -483,6 +588,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not model or not isinstance(model, str):
             raise ValidationError("`model` is required")
         reject_request_flags(model, "model")
+        placement = _placement_requirement(request, settings)
+        budget = _latency_budget_ms(request)
         stream = bool(body.get("stream"))
         passthrough = {
             k: v for k, v in body.items() if k not in ("input", "instructions", "stream")
@@ -498,13 +605,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         start = time.monotonic()
 
         if stream:
+            concrete, route_path = await manager.resolve_stream(
+                model, chat_payload, required_placement=placement, latency_budget_ms=budget
+            )
 
             async def gen():
                 INFLIGHT.inc()
                 st = "ok"
                 try:
                     aiter = manager.stream_chat(
-                        model, chat_payload, request_id, route_key=session_key
+                        concrete,
+                        chat_payload,
+                        request_id,
+                        route_key=session_key,
+                        required_placement=placement,
                     )
                     async for out in chat_sse_to_responses_sse(aiter, model):
                         yield out
@@ -524,7 +638,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     usage.record(
                         endpoint="responses_stream",
                         requested=model,
-                        model=model,
+                        model=concrete,
                         request_id=request_id,
                         api_key_id=key_id,
                         latency_ms=(time.monotonic() - start) * 1000,
@@ -535,12 +649,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return StreamingResponse(
                 gen(),
                 media_type="text/event-stream",
-                headers={"x-request-id": request_id, "cache-control": "no-cache"},
+                headers={
+                    "x-request-id": request_id,
+                    "cache-control": "no-cache",
+                    "x-broker-route": route_path,
+                },
             )
 
         INFLIGHT.inc()
         try:
-            result = await manager.chat(model, chat_payload, request_id, route_key=session_key)
+            result = await manager.chat(
+                model,
+                chat_payload,
+                request_id,
+                route_key=session_key,
+                required_placement=placement,
+                latency_budget_ms=budget,
+            )
+            route_path = result.pop("_broker_route", result.get("model", model))
             out = chat_to_response(result, model)
             REQUESTS.labels("responses", model, "ok").inc()
             u = result.get("usage") or {}
@@ -556,7 +682,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 latency_ms=(time.monotonic() - start) * 1000,
                 status="ok",
             )
-            return JSONResponse(content=out, headers={"x-request-id": request_id})
+            return JSONResponse(
+                content=out,
+                headers={"x-request-id": request_id, "x-broker-route": route_path},
+            )
         finally:
             INFLIGHT.dec()
             REQUEST_LATENCY.labels("responses", model).observe(time.monotonic() - start)
@@ -582,6 +711,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not model or not isinstance(model, str):
             raise ValidationError("`model` is required")
         reject_request_flags(model, "model")
+        placement = _placement_requirement(request, settings)
         if body.get("input") is None:
             raise ValidationError("`input` is required (string or list of strings)")
         payload = {"input": body["input"]}
@@ -592,7 +722,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         start = time.monotonic()
         INFLIGHT.inc()
         try:
-            result = await manager.embeddings(model, payload, request_id, route_key=session_key)
+            result = await manager.embeddings(
+                model, payload, request_id, route_key=session_key, required_placement=placement
+            )
             REQUESTS.labels("embeddings", model, "ok").inc()
             u = result.get("usage") or {}
             usage.record(

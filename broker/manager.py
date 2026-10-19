@@ -52,6 +52,7 @@ import logging
 import random
 import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any
 
 from .adapters import make_adapter
@@ -61,17 +62,33 @@ from .errors import (
     ConcurrencyLimitError,
     ModelLoadError,
     ModelNotFoundError,
+    PlacementDeniedError,
     TimeoutError_,
 )
 from .lifecycle import LifecycleMachine, State
 from .registry import ModelEntry, Registry
-from .router import AutoRouter
+from .router import AutoRouter, should_escalate
 from .state import make_state_store
 
 log = logging.getLogger("broker.manager")
 
 #: Exceptions that make a pool member a failover candidate (try another member).
 _FAILOVER_ERRORS = (BackendUnavailableError, ModelLoadError, TimeoutError_)
+
+
+@dataclass
+class ResolvedRoute:
+    """The outcome of resolving a request's model selection (ADR 0011).
+
+    ``hops`` is the ordered list of concrete public model names to try: one entry
+    for a single-shot route, two for a cascade (``[primary, escalation]``).
+    """
+
+    hops: list[str]
+    public_name: str  # the name the caller requested (e.g. "auto" or a model id)
+    mode: str = "single"
+    cascade_cfg: Any = None  # CascadeConfig when mode == "cascade"
+    required_placement: frozenset[str] = field(default_factory=frozenset)
 
 
 class ManagedModel:
@@ -185,6 +202,9 @@ class ModelManager:
         self._router_lock = asyncio.Lock()
         if settings.router_enabled and settings.router_backend != "off":
             self.router = AutoRouter(self, settings, registry.router)
+        # Usage log (set by the app after construction); used for latency estimates
+        # and to record intermediate cascade hops (ADR 0007 / 0011). Optional.
+        self.usage: Any = None
         self._sweeper: asyncio.Task | None = None
         self._health_task: asyncio.Task | None = None
         self._stopping = False
@@ -209,33 +229,116 @@ class ModelManager:
     def public_names(self) -> set[str]:
         return set(self.pools)
 
-    def _members_for(self, name: str) -> list[ManagedModel]:
+    def _members_for(
+        self, name: str, required_placement: frozenset[str] | None = None
+    ) -> list[ManagedModel]:
         members = self.pools.get(name)
-        if members:
-            return members
-        if name in self.models:  # direct alias addressing of a non-pooled entry
-            return [self.models[name]]
-        raise ModelNotFoundError(
-            f"unknown model: {name!r}",
-            model=name,
-            remediation=f"choose one of: {', '.join(sorted(self.pools))}",
-        )
+        if not members:
+            if name in self.models:  # direct alias addressing of a non-pooled entry
+                members = [self.models[name]]
+            else:
+                raise ModelNotFoundError(
+                    f"unknown model: {name!r}",
+                    model=name,
+                    remediation=f"choose one of: {', '.join(sorted(self.pools))}",
+                )
+        if required_placement:
+            # Fail-closed: keep only members carrying every required placement label.
+            kept = [m for m in members if required_placement <= m.entry.placement_set]
+            if not kept:
+                raise PlacementDeniedError(
+                    f"model {name!r} does not satisfy placement requirement "
+                    f"{sorted(required_placement)}",
+                    model=name,
+                    remediation="request a model carrying the required placement "
+                    "labels, or relax x-broker-placement / BROKER_DEFAULT_PLACEMENT",
+                )
+            return kept
+        return members
 
     def loaded_count(self) -> int:
         return sum(1 for m in self.models.values() if m.machine.is_active())
 
-    async def _resolve_auto(self, name: str, payload: dict) -> str:
-        """Resolve the ``auto`` alias to a concrete public model via the router.
+    async def _resolve_route(
+        self,
+        name: str,
+        payload: dict,
+        required_placement: frozenset[str],
+        latency_budget_ms: float | None,
+    ) -> ResolvedRoute:
+        """Resolve a request's model selection into an ordered list of hops.
 
-        Classification is serialized (and offloaded to a thread so an in-process
-        LLM classifier never blocks the event loop) and returns a normal public
-        model name, which then flows through standard pool routing + failover.
+        For the ``auto`` alias this runs the router (serialized, off-thread) and may
+        return a two-hop cascade plan. For an explicit model/pool it validates the
+        placement requirement fail-closed (before any load) and returns one hop.
         """
+        req = frozenset(required_placement or ())
         if self.router is not None and name == self.settings.router_alias:
             async with self._router_lock:
-                decision = await asyncio.to_thread(self.router.route, payload)
-            return decision.chosen
-        return name
+                decision = await asyncio.to_thread(
+                    self.router.route, payload, req, latency_budget_ms
+                )
+            if decision.cascade and len(decision.cascade) > 1:
+                return ResolvedRoute(
+                    hops=list(decision.cascade),
+                    public_name=name,
+                    mode="cascade",
+                    cascade_cfg=self.router.cfg.cascade,
+                    required_placement=req,
+                )
+            return ResolvedRoute(hops=[decision.chosen], public_name=name, required_placement=req)
+        # Explicit model/pool: enforce placement now so denial precedes any load.
+        self._members_for(name, req)
+        return ResolvedRoute(hops=[name], public_name=name, required_placement=req)
+
+    async def resolve_stream(
+        self,
+        name: str,
+        payload: dict,
+        required_placement: frozenset[str] | None = None,
+        latency_budget_ms: float | None = None,
+    ) -> tuple[str, str]:
+        """Resolve a streaming request to a single concrete model + route label.
+
+        Streaming cannot cheaply re-score a live stream, so a cascade route falls
+        back to the single strong pick (documented). Returns ``(name, route_path)``.
+        """
+        req = frozenset(required_placement or ())
+        if self.router is not None and name == self.settings.router_alias:
+            async with self._router_lock:
+                decision = await asyncio.to_thread(
+                    self.router.route, payload, req, latency_budget_ms
+                )
+            if decision.cascade and len(decision.cascade) > 1:
+                strong = decision.cascade[-1]
+                self.router.record_cascade(
+                    decision.cascade[0], strong, False, "stream_fallback_single"
+                )
+                return strong, f"{strong} (cascade->single: streaming)"
+            return decision.chosen, decision.chosen
+        self._members_for(name, req)  # fail-closed placement for explicit models
+        return name, name
+
+    def _record_hop(
+        self, endpoint: str, requested: str, result: dict, request_id: str, status: str
+    ) -> None:
+        """Record an intermediate cascade hop in the usage log (best-effort)."""
+        if self.usage is None or not isinstance(result, dict):
+            return
+        try:
+            u = result.get("usage") or {}
+            self.usage.record(
+                endpoint=endpoint,
+                requested=requested,
+                model=result.get("model"),
+                request_id=request_id,
+                prompt_tokens=u.get("prompt_tokens", 0),
+                completion_tokens=u.get("completion_tokens", 0),
+                total_tokens=u.get("total_tokens", 0),
+                status=status,
+            )
+        except Exception as exc:  # noqa: BLE001 - logging must never break a request
+            log.warning("cascade hop usage record failed: %s", exc)
 
     # --- eviction --------------------------------------------------------
     async def _maybe_evict(self, keep_alias: str) -> None:
@@ -456,16 +559,74 @@ class ModelManager:
         )
 
     async def chat(
-        self, name: str, payload: dict, request_id: str, route_key: str | None = None
+        self,
+        name: str,
+        payload: dict,
+        request_id: str,
+        route_key: str | None = None,
+        required_placement: frozenset[str] | None = None,
+        latency_budget_ms: float | None = None,
     ) -> dict:
-        name = await self._resolve_auto(name, payload)
-        members = self._members_for(name)
+        req = frozenset(required_placement or ())
+        resolved = await self._resolve_route(name, payload, req, latency_budget_ms)
+        if resolved.mode == "cascade" and len(resolved.hops) > 1:
+            return await self._serve_cascade(resolved, payload, request_id, route_key)
+        result = await self._serve_one(resolved.hops[0], payload, request_id, route_key, req)
+        if isinstance(result, dict):
+            result["_broker_route"] = result.get("model", resolved.hops[0])
+        return result
+
+    async def _serve_one(
+        self,
+        name: str,
+        payload: dict,
+        request_id: str,
+        route_key: str | None,
+        required_placement: frozenset[str],
+    ) -> dict:
+        """Serve one concrete model/pool with member selection, retries + failover.
+
+        Delegates to the shared ``_route_and_serve`` driver so cascade hops and
+        single-model requests get identical ADR 0009 retries/cooldowns and the
+        ADR 0010 pool-selection strategy. Placement is enforced fail-closed when
+        resolving the pool members.
+        """
+        members = self._members_for(name, required_placement)
         return await self._route_and_serve(
             name,
             members,
             route_key,
             lambda m: self._serve_chat(m, name, payload, request_id),
         )
+
+    async def _serve_cascade(
+        self, resolved: ResolvedRoute, payload: dict, request_id: str, route_key: str | None
+    ) -> dict:
+        """Serve the cheapest-capable hop; escalate once on a quality signal.
+
+        Both hops are recorded (decision log + usage); the result carries the
+        ``_broker_route`` path (``primary`` or ``primary->escalation``).
+        """
+        primary, escalation = resolved.hops[0], resolved.hops[1]
+        req = resolved.required_placement
+        result = await self._serve_one(primary, payload, request_id, route_key, req)
+        escalate, reason = should_escalate(result, resolved.cascade_cfg)
+        primary_served = result.get("model", primary) if isinstance(result, dict) else primary
+        if not escalate:
+            if self.router is not None:
+                self.router.record_cascade(primary_served, escalation, False, "")
+            if isinstance(result, dict):
+                result["_broker_route"] = primary_served
+            return result
+        # Escalate: record the primary hop, then serve the stronger model.
+        self._record_hop("chat_cascade", resolved.public_name, result, request_id, "escalated")
+        result2 = await self._serve_one(escalation, payload, request_id, route_key, req)
+        served = result2.get("model", escalation) if isinstance(result2, dict) else escalation
+        if self.router is not None:
+            self.router.record_cascade(primary_served, served, True, reason)
+        if isinstance(result2, dict):
+            result2["_broker_route"] = f"{primary_served}->{served}"
+        return result2
 
     async def _serve_chat(
         self, m: ManagedModel, public_name: str, payload: dict, request_id: str
@@ -500,10 +661,17 @@ class ModelManager:
                 m.machine.to(State.READY)
 
     async def stream_chat(
-        self, name: str, payload: dict, request_id: str, route_key: str | None = None
+        self,
+        name: str,
+        payload: dict,
+        request_id: str,
+        route_key: str | None = None,
+        required_placement: frozenset[str] | None = None,
     ) -> AsyncIterator[bytes]:
-        name = await self._resolve_auto(name, payload)
-        members = self._members_for(name)
+        req = frozenset(required_placement or ())
+        # ``name`` is already a concrete model (the API resolves streaming routes via
+        # resolve_stream); placement is re-validated here when selecting members.
+        members = self._members_for(name, req)
         exclude: set[str] = set()
         last: Exception | None = None
         chosen: ManagedModel | None = None
@@ -571,15 +739,22 @@ class ModelManager:
             self.global_sem.release()
 
     async def embeddings(
-        self, name: str, payload: dict, request_id: str, route_key: str | None = None
+        self,
+        name: str,
+        payload: dict,
+        request_id: str,
+        route_key: str | None = None,
+        required_placement: frozenset[str] | None = None,
     ) -> dict:
         """Route an embeddings request through pool selection + failover.
 
         Unlike chat, ``auto`` does not apply (there is nothing to classify); the
         request is routed to the named model/pool. Shares the same member
-        selection, concurrency gating, lazy-load, and failover as chat.
+        selection, concurrency gating, lazy-load, and failover as chat. Placement
+        pinning is enforced fail-closed on the named model/pool.
         """
-        members = self._members_for(name)
+        req = frozenset(required_placement or ())
+        members = self._members_for(name, req)
         return await self._route_and_serve(
             name,
             members,

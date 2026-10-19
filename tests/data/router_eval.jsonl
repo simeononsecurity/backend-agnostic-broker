@@ -1,0 +1,45 @@
+{"prompt": "hello, how are you today?", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "what's the capital of France?", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "tell me a fun fact about otters", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "good morning!", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "what time zone is Tokyo in?", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "suggest a name for a pet cat", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "what does HTTP stand for?", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "say a short greeting in Spanish", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "write a python function to reverse a linked list", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "debug this stack trace from my java program", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "refactor this typescript function to be async", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "write a regex to match an email address", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "explain this rust borrow checker error and fix the code", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "write a sql query to join two tables on id", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "implement binary search in golang", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "find the bug in this c++ function that segfaults", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "prove that the square root of 2 is irrational, step by step", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 4, "task": "reasoning"}
+{"prompt": "calculate the integral of x squared from 0 to 3", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 4, "task": "math"}
+{"prompt": "solve this algebra equation and show your reasoning", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 4, "task": "math"}
+{"prompt": "deduce the next number in the sequence and explain the logic", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 4, "task": "reasoning"}
+{"prompt": "what is the derivative of sin(x) times cos(x)?", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 4, "task": "math"}
+{"prompt": "analyze this logical argument for fallacies step by step", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 4, "task": "reasoning"}
+{"prompt": "describe what is in this image", "flags": {"has_images": true}, "acceptable": ["vizard"], "cheapest_capable": "vizard", "quality_tier": 3, "task": "vision"}
+{"prompt": "what objects do you see in this photo?", "flags": {"has_images": true}, "acceptable": ["vizard"], "cheapest_capable": "vizard", "quality_tier": 3, "task": "vision"}
+{"prompt": "read the text in this screenshot", "flags": {"has_images": true}, "acceptable": ["vizard"], "cheapest_capable": "vizard", "quality_tier": 3, "task": "vision"}
+{"prompt": "is this chart trending up or down?", "flags": {"has_images": true}, "acceptable": ["vizard"], "cheapest_capable": "vizard", "quality_tier": 3, "task": "vision"}
+{"prompt": "caption this picture for social media", "flags": {"has_images": true}, "acceptable": ["vizard"], "cheapest_capable": "vizard", "quality_tier": 3, "task": "vision"}
+{"prompt": "summarize this entire document for me", "flags": {"max_tokens": 60000}, "acceptable": ["longboi"], "cheapest_capable": "longboi", "quality_tier": 4, "task": "long-context"}
+{"prompt": "summarize the whole transcript below", "flags": {"max_tokens": 50000}, "acceptable": ["longboi"], "cheapest_capable": "longboi", "quality_tier": 4, "task": "long-context"}
+{"prompt": "give me the key points from this long report", "flags": {"max_tokens": 80000}, "acceptable": ["longboi"], "cheapest_capable": "longboi", "quality_tier": 4, "task": "long-context"}
+{"prompt": "condense this entire book chapter into bullets", "flags": {"max_tokens": 120000}, "acceptable": ["longboi"], "cheapest_capable": "longboi", "quality_tier": 4, "task": "long-context"}
+{"prompt": "call the weather tool for Paris", "flags": {"has_tools": true}, "acceptable": ["tooly", "coder"], "cheapest_capable": "tooly", "quality_tier": 2, "task": "tools"}
+{"prompt": "use the function to look up the stock price", "flags": {"has_tools": true}, "acceptable": ["tooly", "coder"], "cheapest_capable": "tooly", "quality_tier": 2, "task": "tools"}
+{"prompt": "call the calendar api to create an event", "flags": {"has_tools": true}, "acceptable": ["tooly", "coder"], "cheapest_capable": "tooly", "quality_tier": 2, "task": "tools"}
+{"prompt": "invoke the search tool for recent news", "flags": {"has_tools": true}, "acceptable": ["tooly", "coder"], "cheapest_capable": "tooly", "quality_tier": 2, "task": "tools"}
+{"prompt": "return the result as json", "flags": {"needs_json": true}, "acceptable": ["tooly"], "cheapest_capable": "tooly", "quality_tier": 2, "task": "json"}
+{"prompt": "give me a structured output matching this schema", "flags": {"needs_json": true}, "acceptable": ["tooly"], "cheapest_capable": "tooly", "quality_tier": 2, "task": "json"}
+{"prompt": "respond strictly in json format", "flags": {"needs_json": true}, "acceptable": ["tooly"], "cheapest_capable": "tooly", "quality_tier": 2, "task": "json"}
+{"prompt": "output a json object with name and age fields", "flags": {"needs_json": true}, "acceptable": ["tooly"], "cheapest_capable": "tooly", "quality_tier": 2, "task": "json"}
+{"prompt": "write a haiku about the ocean", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "creative"}
+{"prompt": "tell me a short bedtime story", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "creative"}
+{"prompt": "what's 2 plus 2?", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "recommend a good book to read", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "write a python script and explain the algorithm's complexity", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "compile this snippet mentally and tell me the output", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}

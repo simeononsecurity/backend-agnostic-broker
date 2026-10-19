@@ -23,6 +23,18 @@ from typing import Any
 
 log = logging.getLogger("broker.usage")
 
+
+def _percentile(sorted_vals: list[float], q: float) -> float:
+    """Nearest-rank percentile of a pre-sorted, non-empty list (q in [0,1])."""
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    idx = int(round(q * (len(sorted_vals) - 1)))
+    idx = max(0, min(idx, len(sorted_vals) - 1))
+    return sorted_vals[idx]
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS usage (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,6 +165,50 @@ class UsageLog:
                 for (ts, e, rq, m, tt, lm, st, sr) in recent
             ],
         }
+
+    def latency_percentiles(
+        self, window_seconds: float = 3600.0, endpoints: tuple[str, ...] | None = None
+    ) -> dict[str, dict[str, float]]:
+        """Per-served-model latency p50/p90 (ms) over a recent window.
+
+        Used by the auto-router's latency-budget feature (ADR 0011). Best-effort:
+        returns an empty dict if the log is disabled or a query fails, so it can
+        never break routing. ``endpoints`` optionally restricts the rows
+        considered (e.g. non-streaming chat only).
+        """
+        if not self.enabled or self._conn is None:
+            return {}
+        cutoff = time.time() - max(0.0, float(window_seconds))
+        try:
+            with self._lock:
+                cur = self._conn.cursor()
+                sql = (
+                    "SELECT model, latency_ms FROM usage "
+                    "WHERE ts >= ? AND latency_ms IS NOT NULL AND model IS NOT NULL"
+                )
+                params: list[Any] = [cutoff]
+                if endpoints:
+                    placeholders = ",".join("?" for _ in endpoints)
+                    sql += f" AND endpoint IN ({placeholders})"
+                    params.extend(endpoints)
+                rows = cur.execute(sql, params).fetchall()
+        except Exception as exc:  # noqa: BLE001 - never break routing on the log
+            log.warning("usage latency query failed: %s", exc)
+            return {}
+        buckets: dict[str, list[float]] = {}
+        for model, lm in rows:
+            if lm is None:
+                continue
+            buckets.setdefault(model, []).append(float(lm))
+        out: dict[str, dict[str, float]] = {}
+        for model, vals in buckets.items():
+            vals.sort()
+            out[model] = {
+                "p50": _percentile(vals, 0.50),
+                "p90": _percentile(vals, 0.90),
+                "count": float(len(vals)),
+            }
+        return out
 
     def close(self) -> None:
         if self._conn is not None:

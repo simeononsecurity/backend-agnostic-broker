@@ -149,9 +149,24 @@ next request reloads/reroutes. Surfaced at `GET /healthz/backends` and in
 | `BROKER_ROUTER_CACHE_SIZE` | int | `512` | Decision cache entries (LRU). |
 | `BROKER_ROUTER_TIMEOUT_SECONDS` | float | `10` | Per-classification timeout. |
 | `BROKER_ROUTER_DEFAULT_MODEL` | str? | _(unset)_ | Fallback model id (overrides registry `router.default`). |
+| `BROKER_ROUTER_LATENCY_BUDGET_MS` | float? | _(unset)_ | Default per-request latency budget (ms); the `x-broker-latency-budget-ms` header then registry `router.latency_budget_ms` win first. See [auto-router.md](auto-router.md). |
+| `BROKER_ROUTER_LATENCY_WINDOW_SECONDS` | float | `3600` | Rolling window of the usage log used to estimate per-model latency (p90). |
+| `BROKER_ROUTER_COLD_START_MS` | float | `1500` | Estimated extra latency added for a not-currently-resident model (cold start). |
 
-Policy, per-model `tags`/`priority`/`cost_tier`, and hard overrides live in the
-registry. See [auto-router.md](auto-router.md).
+Policy, per-model `tags`/`priority`/`cost_tier`, cascade mode, and hard overrides
+live in the registry. See [auto-router.md](auto-router.md).
+
+## Placement / data-residency pinning (fail-closed)
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_DEFAULT_PLACEMENT` | list[str] | `[]` | Baseline placement labels required of **every** request (unioned with the `x-broker-placement` header). Empty = no baseline. |
+
+Per-model `placement` labels live in the registry. A request carrying a placement
+requirement (header and/or default) is only served by models/pool members that
+carry **all** required labels; if none qualify the broker returns
+`403 placement_denied` and never spills to a non-compliant model. See
+[auto-router.md](auto-router.md) and [security-model.md](security-model.md).
 
 ## Limits
 

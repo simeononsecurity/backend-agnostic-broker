@@ -37,8 +37,8 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
-from .errors import ConfigError, ValidationError
-from .registry import RouterConfig, RouterWeights
+from .errors import ConfigError, PlacementDeniedError, ValidationError
+from .registry import CascadeConfig, RouterConfig, RouterWeights
 
 log = logging.getLogger("broker.router")
 
@@ -68,15 +68,51 @@ class Candidate:
     loaded: bool
     priority: int
     cost_tier: int
+    placement: frozenset[str] = frozenset()
 
 
 @dataclass
 class RouteDecision:
     chosen: str
-    via: str  # "override" | "llm" | "heuristic" | "fallback" | "cache"
+    via: str  # "override" | "llm" | "heuristic" | "fallback" | "cache" | "latency_budget"
     flags: RequestFlags
     candidates: list[str]
     latency_ms: float = 0.0
+    # --- ADR 0011 ---
+    mode: str = "single"  # "single" | "cascade"
+    cascade: list[str] | None = None  # ordered hops [primary, escalation] in cascade
+    placement: tuple[str, ...] = ()  # the placement requirement applied, if any
+    latency_budget_ms: float | None = None
+    latency_estimate_ms: float | None = None  # estimate for the chosen model
+
+
+def should_escalate(result: dict, cfg: CascadeConfig) -> tuple[bool, str]:
+    """Decide whether a cascade's first-hop response warrants escalation.
+
+    Pure and data-driven: inspects the *actual* OpenAI chat-completion result
+    against the configured signals and returns ``(escalate, reason)``. The
+    reason is a short machine-friendly tag for the decision/usage log.
+    """
+    choices = result.get("choices") or []
+    if not choices:
+        # No choices at all is as bad as empty output.
+        return (cfg.escalate_on_empty, "empty_response" if cfg.escalate_on_empty else "")
+    ch = choices[0] or {}
+    finish = ch.get("finish_reason")
+    content = (ch.get("message") or {}).get("content")
+    text = content.strip() if isinstance(content, str) else ""
+    if cfg.escalate_on_length and finish == "length":
+        return (True, "finish_reason=length")
+    if cfg.escalate_on_empty and len(text) < max(1, cfg.min_chars):
+        return (True, "too_short")
+    if cfg.escalate_on_refusal:
+        for pat in cfg.refusal_patterns:
+            try:
+                if re.search(pat, text):
+                    return (True, "refusal")
+            except re.error:  # pragma: no cover - validated at load time
+                continue
+    return (False, "")
 
 
 def _content_text(content: Any) -> str:
@@ -386,13 +422,20 @@ class AutoRouter:
         return HeuristicRouterBackend()
 
     # --- candidate building (Stage-1 capability filter) ------------------
-    def build_candidates(self, flags: RequestFlags) -> list[Candidate]:
+    def build_candidates(
+        self, flags: RequestFlags, required_placement: frozenset[str] | None = None
+    ) -> list[Candidate]:
+        req = required_placement or frozenset()
         out: list[Candidate] = []
         for name, members in self.manager.pools.items():
             if name == self.settings.router_alias:
                 continue
             entries = [m.entry for m in members]
             if not all(e.router_eligible for e in entries):
+                continue
+            # Placement filter (fail-closed): a pool is eligible only if EVERY
+            # member carries all required labels (routing may pick any member).
+            if req and not all(req <= e.placement_set for e in entries):
                 continue
             vision = all(e.supports_vision for e in entries)
             tools = all(e.supports_tools for e in entries)
@@ -407,6 +450,11 @@ class AutoRouter:
                 continue
             tags = tuple(sorted({t for e in entries for t in e.tags}))
             description = next((e.description for e in entries if e.description), "") or ""
+            placement = (
+                frozenset.intersection(*(e.placement_set for e in entries))
+                if entries
+                else frozenset()
+            )
             out.append(
                 Candidate(
                     id=name,
@@ -419,6 +467,7 @@ class AutoRouter:
                     loaded=any(m.machine.is_active() for m in members),
                     priority=max(e.priority for e in entries),
                     cost_tier=min(e.cost_tier for e in entries),
+                    placement=placement,
                 )
             )
         return out
@@ -448,48 +497,197 @@ class AutoRouter:
         return HeuristicRouterBackend().choose(flags, message, candidates, self.cfg)
 
     # --- main ------------------------------------------------------------
-    def route(self, payload: dict) -> RouteDecision:
+    def route(
+        self,
+        payload: dict,
+        required_placement: frozenset[str] | None = None,
+        latency_budget_ms: float | None = None,
+    ) -> RouteDecision:
         t0 = time.monotonic()
+        req_place = frozenset(required_placement or ())
         flags, message = extract_flags(payload, self.settings.router_max_input_chars)
-        candidates = self.build_candidates(flags)
+        candidates = self.build_candidates(flags, req_place)
         if not candidates:
+            # Fail-closed placement: distinguish "denied" from "nothing capable".
+            if req_place and self.build_candidates(flags):
+                raise PlacementDeniedError(
+                    f"no model satisfies placement requirement {sorted(req_place)}",
+                    remediation="register a model carrying all required placement "
+                    "labels, or relax x-broker-placement / BROKER_DEFAULT_PLACEMENT",
+                )
             raise ValidationError(
                 "no registered model can satisfy this request",
                 remediation="check required capabilities (images/tools/context) "
                 "against your registry, or add a capable model",
             )
         cand_ids = [c.id for c in candidates]
+        budget = latency_budget_ms
+        if budget is None:
+            budget = self.cfg.latency_budget_ms
+        if budget is None:
+            budget = self.settings.router_latency_budget_ms
 
-        cache_key = (flags, tuple(sorted(cand_ids)), message[:256])
+        cache_key = (
+            flags,
+            tuple(sorted(cand_ids)),
+            message[:256],
+            tuple(sorted(req_place)),
+            budget,
+        )
         if cache_key in self._cache:
-            chosen = self._cache[cache_key]
+            pick = self._cache[cache_key]
             self._cache.move_to_end(cache_key)
-            return self._record(chosen, "cache", flags, cand_ids, t0, cached=True)
+            return self._finish(
+                pick, "cache", flags, message, cand_ids, candidates, t0, req_place, budget, None
+            )
 
         # Hard overrides (data) bypass the classifier when their target is capable.
+        pick: str | None = None
+        via = ""
         for ov in self.cfg.overrides:
             if self._override_matches(ov.when, flags, message) and ov.use in cand_ids:
-                chosen = ov.use
-                self._store(cache_key, chosen)
-                return self._record(chosen, "override", flags, cand_ids, t0)
+                pick = ov.use
+                via = "override"
+                break
 
-        via = self.backend.name
-        try:
-            chosen = self.backend.choose(flags, message, candidates, self.cfg)
-        except RouterUnavailable as exc:
-            log.warning("router backend unavailable (%s); using heuristic", exc)
-            chosen = HeuristicRouterBackend().choose(flags, message, candidates, self.cfg)
-            via = "heuristic"
-        except Exception as exc:  # noqa: BLE001
-            log.warning("router backend error (%s); using fallback default", exc)
-            chosen = ""
+        if pick is None:
+            via = self.backend.name
+            try:
+                pick = self.backend.choose(flags, message, candidates, self.cfg)
+            except RouterUnavailable as exc:
+                log.warning("router backend unavailable (%s); using heuristic", exc)
+                pick = HeuristicRouterBackend().choose(flags, message, candidates, self.cfg)
+                via = "heuristic"
+            except Exception as exc:  # noqa: BLE001
+                log.warning("router backend error (%s); using fallback default", exc)
+                pick = ""
+            if pick not in cand_ids:
+                pick = self._default(candidates, flags, message)
+                via = "fallback"
 
-        if chosen not in cand_ids:
-            chosen = self._default(candidates, flags, message)
-            via = "fallback"
+        # Latency budget: if the pick is estimated too slow, prefer a faster capable
+        # candidate (never below the capability/placement filters).
+        est: float | None = None
+        if budget is not None:
+            pick, via, est = self._apply_latency_budget(pick, via, candidates, budget)
 
-        self._store(cache_key, chosen)
-        return self._record(chosen, via, flags, cand_ids, t0)
+        self._store(cache_key, pick)
+        return self._finish(
+            pick, via, flags, message, cand_ids, candidates, t0, req_place, budget, est
+        )
+
+    def _finish(
+        self,
+        pick: str,
+        via: str,
+        flags: RequestFlags,
+        message: str,
+        cand_ids: list[str],
+        candidates: list[Candidate],
+        t0: float,
+        req_place: frozenset[str],
+        budget: float | None,
+        est: float | None,
+    ) -> RouteDecision:
+        """Derive the cascade plan (if any) from the single-shot pick and record."""
+        cascade: list[str] | None = None
+        chosen = pick
+        if self.cfg.mode == "cascade":
+            cascade = self._cascade_plan(candidates, flags, message, pick)
+            chosen = cascade[0]
+        return self._record(
+            chosen,
+            via,
+            flags,
+            cand_ids,
+            t0,
+            cached=(via == "cache"),
+            mode=self.cfg.mode,
+            cascade=cascade,
+            placement=tuple(sorted(req_place)),
+            budget=budget,
+            est=est,
+        )
+
+    # --- cascade / latency helpers (ADR 0011) ----------------------------
+    def _cascade_plan(
+        self, candidates: list[Candidate], flags: RequestFlags, message: str, strong_pick: str
+    ) -> list[str]:
+        """Two-hop plan: cheapest-capable primary, then one stronger capable model.
+
+        The escalation target is the single-shot pick (classifier/override) when it
+        is stronger than the primary, else the strongest distinct candidate.
+        """
+        if len(candidates) <= 1:
+            return [candidates[0].id] if candidates else [strong_pick]
+        cmap = {c.id: c for c in candidates}
+        h = HeuristicRouterBackend()
+
+        def score(c: Candidate) -> float:
+            return h.score(flags, message, c, self.cfg.weights)
+
+        primary = min(candidates, key=lambda c: (c.cost_tier, -score(c), c.id)).id
+        strong = strong_pick if strong_pick in cmap else None
+        if strong is None or strong == primary:
+            others = [c for c in candidates if c.id != primary]
+            strong = max(others, key=lambda c: (c.cost_tier, score(c), c.id)).id
+        if strong == primary:
+            return [primary]
+        return [primary, strong]
+
+    def _latency_estimates(self, candidates: list[Candidate]) -> dict[str, float | None]:
+        """Per-candidate estimated latency (ms): usage-log p90 + cold-start penalty.
+
+        ``None`` means no data yet for that model (so the budget can't rank it).
+        """
+        stats: dict[str, dict[str, float]] = {}
+        usage = getattr(self.manager, "usage", None)
+        if usage is not None:
+            try:
+                stats = usage.latency_percentiles(self.settings.router_latency_window_seconds)
+            except Exception as exc:  # noqa: BLE001 - never break routing on the log
+                log.warning("latency estimate unavailable: %s", exc)
+                stats = {}
+        out: dict[str, float | None] = {}
+        for c in candidates:
+            s = stats.get(c.id)
+            if not s or not s.get("count"):
+                out[c.id] = None
+                continue
+            est = s["p90"]
+            if not c.loaded:
+                est += self.settings.router_cold_start_ms
+            out[c.id] = est
+        return out
+
+    def _apply_latency_budget(
+        self, chosen: str, via: str, candidates: list[Candidate], budget: float
+    ) -> tuple[str, str, float | None]:
+        ests = self._latency_estimates(candidates)
+        chosen_est = ests.get(chosen)
+        if chosen_est is None or chosen_est <= budget:
+            return chosen, via, chosen_est
+        known = [(e, c) for c in candidates if (e := ests.get(c.id)) is not None]
+        under = [(e, c) for (e, c) in known if e <= budget]
+        pool = under or known
+        if not pool:
+            return chosen, via, chosen_est  # no data to improve on; keep the pick
+        best = min(pool, key=lambda t: (t[0], t[1].cost_tier, t[1].id))
+        return best[1].id, "latency_budget", best[0]
+
+    def record_cascade(self, primary: str, escalation: str, escalated: bool, reason: str) -> None:
+        """Append a cascade execution outcome to the decision log (for /status)."""
+        self.decisions.append(
+            {
+                "cascade": {
+                    "primary": primary,
+                    "escalation": escalation,
+                    "escalated": escalated,
+                    "reason": reason,
+                    "path": f"{primary}->{escalation}" if escalated else primary,
+                }
+            }
+        )
 
     # --- bookkeeping -----------------------------------------------------
     def _store(self, key: tuple, chosen: str) -> None:
@@ -507,6 +705,11 @@ class AutoRouter:
         cand_ids: list[str],
         t0: float,
         cached: bool = False,
+        mode: str = "single",
+        cascade: list[str] | None = None,
+        placement: tuple[str, ...] = (),
+        budget: float | None = None,
+        est: float | None = None,
     ) -> RouteDecision:
         latency = (time.monotonic() - t0) * 1000.0
         entry = {
@@ -516,13 +719,31 @@ class AutoRouter:
             "candidates": cand_ids,
             "latency_ms": round(latency, 2),
             "cached": cached,
+            "mode": mode,
         }
+        if cascade:
+            entry["cascade_plan"] = cascade
+        if placement:
+            entry["placement"] = list(placement)
+        if budget is not None:
+            entry["latency_budget_ms"] = budget
+        if est is not None:
+            entry["latency_estimate_ms"] = round(est, 2)
         self.decisions.append(entry)
         log.info(
             "router: auto -> %s via %s (%d cands, %.1fms)", chosen, via, len(cand_ids), latency
         )
         return RouteDecision(
-            chosen=chosen, via=via, flags=flags, candidates=cand_ids, latency_ms=latency
+            chosen=chosen,
+            via=via,
+            flags=flags,
+            candidates=cand_ids,
+            latency_ms=latency,
+            mode=mode,
+            cascade=cascade,
+            placement=placement,
+            latency_budget_ms=budget,
+            latency_estimate_ms=est,
         )
 
     def status(self) -> dict:
@@ -530,6 +751,7 @@ class AutoRouter:
             "enabled": True,
             "alias": self.settings.router_alias,
             "backend": self.backend.name,
+            "mode": self.cfg.mode,
             "cache_size": len(self._cache),
             "recent_decisions": list(self.decisions)[-10:],
         }
@@ -546,4 +768,5 @@ __all__ = [
     "RouterBackend",
     "RouterUnavailable",
     "extract_flags",
+    "should_escalate",
 ]

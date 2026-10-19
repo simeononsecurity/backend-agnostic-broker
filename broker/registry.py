@@ -29,6 +29,9 @@ from .errors import ConfigError
 # comments or keys — so documentation comments may safely mention ``${VAR}``.
 _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
+# Allowed characters for a placement label (e.g. "local", "region:eu", "gpu-a").
+_PLACEMENT_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+
 
 def _expand_env_str(text: str) -> str:
     """Expand ``${VAR}`` / ``${VAR:-default}`` references against ``os.environ``.
@@ -174,12 +177,41 @@ class ModelEntry(BaseModel):
     # prefers the cheapest model that still satisfies the request.
     cost_tier: int = 2
 
+    # --- Placement / data-residency labels (ADR 0011, fail-closed) ---
+    # Free-form labels describing where this model may process data, e.g.
+    # "local", "trusted", "region:eu". A request that carries a placement
+    # requirement (x-broker-placement header or BROKER_DEFAULT_PLACEMENT) is only
+    # served by models/pool members that carry EVERY required label; if none
+    # qualify the broker returns 403 placement_denied and NEVER spills to a
+    # non-compliant model. Empty => the model carries no placement labels and so
+    # satisfies only the empty (no-constraint) requirement.
+    placement: list[str] = Field(default_factory=list)
+
     @field_validator("cost_tier")
     @classmethod
     def _cost_tier(cls, v: int) -> int:
         if not (1 <= v <= 5):
             raise ValueError("cost_tier must be between 1 and 5")
         return v
+
+    @field_validator("placement")
+    @classmethod
+    def _placement(cls, v: list[str]) -> list[str]:
+        out = []
+        for label in v:
+            label = str(label).strip()
+            if not label or not _PLACEMENT_LABEL_RE.match(label):
+                raise ValueError(
+                    f"invalid placement label {label!r}: use letters, digits, "
+                    "'.', '-', '_', ':' (e.g. 'local', 'region:eu')"
+                )
+            out.append(label)
+        return out
+
+    @property
+    def placement_set(self) -> frozenset[str]:
+        """Labels this model carries, as a set (for subset/superset checks)."""
+        return frozenset(self.placement)
 
     @field_validator("alias", "runtime_model_id")
     @classmethod
@@ -252,6 +284,44 @@ class RouterWeights(BaseModel):
     priority: float = 1.0
 
 
+class CascadeConfig(BaseModel):
+    """Escalation signals for ``router.mode: cascade`` (ADR 0011).
+
+    All signals are data-driven and pluggable; each is checked against the
+    cheapest-capable model's *actual* response and, if any fires, the request
+    escalates once to a stronger capable model.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    # Escalate when the first hop was truncated (OpenAI finish_reason == "length").
+    escalate_on_length: bool = True
+    # Escalate when the first hop produced an empty / too-short answer.
+    escalate_on_empty: bool = True
+    # The minimum acceptable answer length (characters, stripped); shorter => escalate.
+    min_chars: int = 1
+    # Escalate when the first hop looks like a refusal (any regex matches, searched
+    # case-insensitively via the pattern) against the answer text.
+    escalate_on_refusal: bool = True
+    refusal_patterns: list[str] = Field(
+        default_factory=lambda: [
+            r"(?i)\bI\s+(?:cannot|can't|can not|am unable to|won'?t)\b",
+            r"(?i)\bI'?m sorry,? but\b",
+            r"(?i)\bas an AI\b",
+        ]
+    )
+
+    @field_validator("refusal_patterns")
+    @classmethod
+    def _patterns(cls, v: list[str]) -> list[str]:
+        for pat in v:
+            try:
+                re.compile(pat)
+            except re.error as exc:
+                raise ValueError(f"invalid refusal regex {pat!r}: {exc}") from exc
+        return v
+
+
 class RouterConfig(BaseModel):
     """Data-driven policy for the ``auto`` alias (all knobs are config, not code)."""
 
@@ -265,6 +335,29 @@ class RouterConfig(BaseModel):
     # Hard overrides, evaluated in order; the first match bypasses the LLM.
     overrides: list[RouterOverride] = Field(default_factory=list)
     weights: RouterWeights = Field(default_factory=RouterWeights)
+
+    # --- ADR 0011 ---
+    # "single" (default): one-shot classification, unchanged v0.4.0 behavior.
+    # "cascade": serve the cheapest capable model first, escalate once on a signal.
+    mode: str = "single"
+    cascade: CascadeConfig = Field(default_factory=CascadeConfig)
+    # Default per-request latency budget (ms) for latency-aware routing; a request
+    # header (x-broker-latency-budget-ms) or BROKER_ROUTER_LATENCY_BUDGET_MS wins.
+    latency_budget_ms: float | None = None
+
+    @field_validator("mode")
+    @classmethod
+    def _mode(cls, v: str) -> str:
+        if v not in ("single", "cascade"):
+            raise ValueError("router.mode must be 'single' or 'cascade'")
+        return v
+
+    @field_validator("latency_budget_ms")
+    @classmethod
+    def _budget(cls, v: float | None) -> float | None:
+        if v is not None and v <= 0:
+            raise ValueError("router.latency_budget_ms must be > 0")
+        return v
 
 
 class Registry(BaseModel):
