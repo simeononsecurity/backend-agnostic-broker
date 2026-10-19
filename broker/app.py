@@ -7,6 +7,7 @@ Routes
 * ``POST /v1/completions``       — legacy text completions (translated to chat)
 * ``POST /v1/responses``         — OpenAI Responses API (translated to chat)
 * ``POST /v1/embeddings``        — embeddings (routed to an embedding backend)
+* ``POST /v1/rerank``            — rerank (Cohere/Jina-compatible; ADR 0013)
 * ``GET  /healthz``              — liveness (always 200 if process is up)
 * ``GET  /readyz``               — readiness (config + registry loaded)
 * ``GET  /status``               — per-model lifecycle + GPU allocation
@@ -92,6 +93,30 @@ def _session_key(request: Request, body: dict) -> str:
         or (request.client.host if request.client else None)
         or "anon"
     )
+
+
+def _normalize_rerank_documents(documents: Any) -> list[str]:
+    """Validate + normalize ``/v1/rerank`` documents to a list of text strings.
+
+    Accepts a non-empty list whose items are strings or ``{"text": <str>}``
+    objects (Cohere/Jina both allow the object form). Raises ValidationError
+    (400) on anything else.
+    """
+    if not isinstance(documents, list) or len(documents) == 0:
+        raise ValidationError(
+            "`documents` is required and must be a non-empty list of strings or {text} objects"
+        )
+    out: list[str] = []
+    for i, d in enumerate(documents):
+        if isinstance(d, str):
+            out.append(d)
+        elif isinstance(d, dict) and isinstance(d.get("text"), str):
+            out.append(d["text"])
+        else:
+            raise ValidationError(
+                f"documents[{i}] must be a string or an object with a 'text' string"
+            )
+    return out
 
 
 # Placement label charset (mirrors broker/registry.py) for header validation.
@@ -1061,6 +1086,118 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             INFLIGHT.dec()
             REQUEST_LATENCY.labels("embeddings", model).observe(time.monotonic() - start)
+            await governor.reconcile(
+                principal,
+                admission.reservation,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=0,
+                model=served_model,
+            )
+
+    @app.post("/v1/rerank")
+    async def rerank(
+        request: Request,
+        authorization: str | None = Header(None),
+        x_api_key: str | None = Header(None),
+    ):
+        """Cohere/Jina-compatible rerank — routed to a rerank-capable model (ADR 0013).
+
+        Required: `model`, `query` (non-empty string), `documents` (non-empty list
+        of strings or {text} objects). Optional: `top_n`, `return_documents`
+        (default false). No `auto` (nothing to classify); a non-rerank model
+        returns 400, an unknown model 404.
+        """
+        principal = authed(authorization, x_api_key)
+        key_id = principal.usage_id
+        request_id = request.state.request_id
+        raw = await request.body()
+        if len(raw) > settings.max_request_bytes:
+            raise RequestTooLargeError(f"request body exceeds {settings.max_request_bytes} bytes")
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValidationError(f"invalid JSON body: {exc}") from exc
+        model = body.get("model")
+        if not model or not isinstance(model, str):
+            raise ValidationError("`model` is required")
+        reject_request_flags(model, "model")
+        placement = _placement_requirement(request, settings)
+        _precheck_model(principal, model)
+        allowed = _allowed_models(principal)
+        query = body.get("query")
+        if not query or not isinstance(query, str):
+            raise ValidationError("`query` is required and must be a non-empty string")
+        docs = _normalize_rerank_documents(body.get("documents"))
+        if len(docs) > settings.rerank_max_documents:
+            raise ValidationError(
+                f"too many documents: {len(docs)} > BROKER_RERANK_MAX_DOCUMENTS "
+                f"({settings.rerank_max_documents})"
+            )
+        payload: dict = {"query": query, "documents": docs}
+        top_n = body.get("top_n")
+        if top_n is not None:
+            if not isinstance(top_n, int) or isinstance(top_n, bool) or top_n < 0:
+                raise ValidationError("`top_n` must be a non-negative integer")
+            payload["top_n"] = top_n
+        payload["return_documents"] = bool(body.get("return_documents", False))
+        for k in ("max_tokens_per_doc", "max_chunks_per_doc"):
+            if k in body:
+                payload[k] = body[k]
+        session_key = _session_key(request, body)
+        est_tokens = _estimate_tokens([query, *docs], None)
+        admission = await governor.admit(principal, est_tokens)
+        start = time.monotonic()
+        INFLIGHT.inc()
+        prompt_tokens = 0
+        served_model = model
+        try:
+
+            async def _serve(name: str) -> dict:
+                return await manager.rerank(
+                    name,
+                    payload,
+                    request_id,
+                    route_key=session_key,
+                    required_placement=placement,
+                    allowed_models=allowed,
+                )
+
+            result, cache_state = await _cached_serve(
+                request=request,
+                key_scope=_cache_scope(key_id, placement),
+                endpoint="rerank",
+                alias=model,
+                keyed_payload=payload,
+                serve=_serve,
+                always_deterministic=True,
+            )
+            REQUESTS.labels("rerank", model, "ok").inc()
+            u = result.get("usage") or {}
+            prompt_tokens = u.get("total_tokens", u.get("prompt_tokens", 0))
+            served_model = result.get("model", model)
+            usage.record(
+                endpoint="rerank",
+                requested=model,
+                model=served_model,
+                request_id=request_id,
+                api_key_id=key_id,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=0,
+                total_tokens=u.get("total_tokens", u.get("prompt_tokens", 0)),
+                latency_ms=(time.monotonic() - start) * 1000,
+                status="ok",
+            )
+            return JSONResponse(
+                content=result,
+                headers={
+                    "x-request-id": request_id,
+                    "x-broker-cache": cache_state,
+                    **admission.headers,
+                },
+            )
+        finally:
+            INFLIGHT.dec()
+            REQUEST_LATENCY.labels("rerank", model).observe(time.monotonic() - start)
             await governor.reconcile(
                 principal,
                 admission.reservation,

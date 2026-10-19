@@ -67,6 +67,9 @@ class HTTPBackendAdapter(BackendAdapter):
     chat_path = "/v1/chat/completions"
     #: Path the runtime serves embeddings on (OpenAI-compatible).
     embeddings_path = "/v1/embeddings"
+    #: Path the runtime serves reranking on (Cohere/Jina-compatible; vLLM +
+    #: llama.cpp both expose this).
+    rerank_path = "/v1/rerank"
 
     def __init__(self, entry, settings) -> None:
         super().__init__(entry, settings)
@@ -329,6 +332,83 @@ class HTTPBackendAdapter(BackendAdapter):
         if isinstance(data, dict):
             data["model"] = self.entry.alias
         return data
+
+    async def rerank(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        """Proxy to the runtime's Cohere/Jina-compatible ``/v1/rerank``.
+
+        vLLM and llama.cpp both serve a Cohere/Jina-compatible rerank route, so we
+        pin the upstream model id and forward ``query``/``documents``/``top_n``.
+        The response is re-normalized by the broker (sort desc, honor ``top_n``,
+        attach ``document`` from the request only when ``return_documents``) so
+        every backend yields one consistent shape — the backend's own document
+        echo is intentionally ignored.
+        """
+        from ..openai_compat import build_rerank_response
+
+        query = payload.get("query")
+        documents = [str(d) for d in (payload.get("documents") or [])]
+        top_n = payload.get("top_n")
+        return_documents = bool(payload.get("return_documents", False))
+        body: dict[str, Any] = {
+            "model": self.entry.runtime_model_id,
+            "query": query,
+            "documents": documents,
+            # The broker attaches documents itself from the request list.
+            "return_documents": False,
+        }
+        if top_n is not None:
+            body["top_n"] = top_n
+        for k in ("max_tokens_per_doc", "max_chunks_per_doc", "truncate"):
+            if k in payload:
+                body[k] = payload[k]
+        url = self._validated_url(self.rerank_path)
+        client = self._client_or_new()
+        try:
+            resp = await client.post(url, json=body)
+        except httpx.HTTPError as exc:
+            raise BackendUnavailableError(
+                f"backend request failed: {exc}",
+                backend=self.name,
+                model=self.entry.alias,
+                remediation="check the runtime process/endpoint",
+            ) from exc
+        if resp.status_code >= 400:
+            raise BackendUnavailableError(
+                f"backend returned {resp.status_code}: {resp.text[:200]}",
+                backend=self.name,
+                model=self.entry.alias,
+            )
+        data = resp.json()
+        raw = data.get("results") if isinstance(data, dict) else None
+        if raw is None and isinstance(data, dict) and isinstance(data.get("data"), list):
+            raw = data["data"]
+        if not isinstance(raw, list):
+            raise BackendUnavailableError(
+                "rerank backend returned no results array",
+                backend=self.name,
+                model=self.entry.alias,
+            )
+        scored: list[dict[str, Any]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            idx = item.get("index")
+            score = item.get("relevance_score", item.get("score"))
+            if idx is None or score is None:
+                continue
+            scored.append({"index": idx, "relevance_score": score})
+        usage = data.get("usage") if isinstance(data, dict) else None
+        if not isinstance(usage, dict):
+            usage = None
+        return build_rerank_response(
+            scored=scored,
+            documents=documents,
+            model=self.entry.alias,
+            request_id=str(data.get("id") or request_id),
+            top_n=top_n,
+            return_documents=return_documents,
+            usage=usage,
+        )
 
     async def collect_load(self) -> float | None:
         """Scrape ``vllm:num_requests_waiting`` from the runtime's /metrics.

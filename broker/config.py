@@ -198,6 +198,10 @@ class Settings(BaseSettings):
 
     # --- Limits ---
     max_request_bytes: int = 2_000_000
+    # Max number of documents accepted by POST /v1/rerank (ADR 0013). Bounds the
+    # per-request fan-out to the reranker; Cohere recommends <=1,000. The body is
+    # still independently bounded by max_request_bytes.
+    rerank_max_documents: int = 1000
 
     # --- Response cache (ADR 0012) ---
     # Exact-match response cache, default OFF (defaults reproduce v0.4.0). When
@@ -368,6 +372,8 @@ class Settings(BaseSettings):
                     "BROKER_TRACING_ENABLED=true but the 'opentelemetry' package is not installed",
                     remediation="pip install 'backend-agnostic-broker[otel]'",
                 ) from exc
+        if self.rerank_max_documents < 1:
+            raise ConfigError("BROKER_RERANK_MAX_DOCUMENTS must be >= 1")
         if not Path(self.registry_path).exists():
             raise ConfigError(
                 f"registry not found: {self.registry_path!r}",

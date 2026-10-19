@@ -255,3 +255,50 @@ async def chat_sse_to_responses_sse(
     }
     yield f"data: {json.dumps(final)}\n\n".encode()
     yield b"data: [DONE]\n\n"
+
+
+# --- rerank normalization (ADR 0013) -----------------------------------------
+
+
+def build_rerank_response(
+    *,
+    scored: list[dict[str, Any]],
+    documents: list[str],
+    model: str,
+    request_id: str,
+    top_n: Any = None,
+    return_documents: bool = False,
+    usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble a Cohere/Jina-compatible rerank response from scored results.
+
+    ``scored`` is a list of ``{"index": int, "relevance_score": float}`` (any
+    order). The broker is the normalization authority: results are sorted by
+    ``relevance_score`` descending (``index`` ascending as a stable tie-break),
+    ``top_n`` caps the count, and ``document`` (``{"text": ...}`` from the
+    *request* ``documents``) is attached only when ``return_documents`` is true —
+    omitted entirely (never ``null``) otherwise, matching Cohere v2 / LiteLLM.
+    ``index`` is always the original document ordinal.
+    """
+    norm: list[dict[str, Any]] = []
+    for item in scored:
+        idx = item.get("index")
+        score = item.get("relevance_score")
+        if idx is None or score is None:
+            continue
+        norm.append({"index": int(idx), "relevance_score": float(score)})
+    norm.sort(key=lambda r: (-r["relevance_score"], r["index"]))
+    if isinstance(top_n, int) and not isinstance(top_n, bool) and top_n >= 0:
+        norm = norm[:top_n]
+    if return_documents:
+        for r in norm:
+            i = r["index"]
+            if 0 <= i < len(documents):
+                r["document"] = {"text": documents[i]}
+    return {
+        "id": f"rerank-{request_id}",
+        "object": "rerank",
+        "model": model,
+        "results": norm,
+        "usage": usage or {"total_tokens": 0},
+    }

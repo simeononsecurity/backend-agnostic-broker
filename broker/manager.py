@@ -67,6 +67,7 @@ from .errors import (
     ModelNotFoundError,
     PlacementDeniedError,
     TimeoutError_,
+    ValidationError,
 )
 from .lifecycle import LifecycleMachine, State
 from .registry import ModelEntry, Registry, load_registry
@@ -956,6 +957,71 @@ class ModelManager:
         for m in self._members_for(name):
             await m.adapter.cancel(request_id)
 
+    async def rerank(
+        self,
+        name: str,
+        payload: dict,
+        request_id: str,
+        route_key: str | None = None,
+        required_placement: frozenset[str] | None = None,
+        allowed_models: set[str] | None = None,
+    ) -> dict:
+        """Route a rerank request through pool selection + failover (ADR 0013).
+
+        Like embeddings, ``auto`` does not apply (nothing to classify); the request
+        is routed to the named model/pool through the same member selection,
+        concurrency gating, lazy-load, and failover as chat. Placement pinning and
+        per-key scoping are enforced fail-closed on the named model/pool. A
+        fail-closed capability gate rejects a model/pool whose members are not all
+        ``supports_rerank`` with 400 before any load.
+        """
+        req = frozenset(required_placement or ())
+        self._check_allowed(name, allowed_models)
+        members = self._members_for(name, req)
+        if not all(m.entry.supports_rerank for m in members):
+            raise ValidationError(
+                f"model {name!r} does not support rerank",
+                model=name,
+                code="model_not_capable",
+                remediation="request a rerank-capable model (supports_rerank: true)",
+            )
+        return await self._route_and_serve(
+            name,
+            members,
+            route_key,
+            lambda m: self._serve_rerank(m, name, payload, request_id),
+        )
+
+    async def _serve_rerank(
+        self, m: ManagedModel, public_name: str, payload: dict, request_id: str
+    ) -> dict:
+        try:
+            await self._maybe_evict(m.entry.alias)
+            await m.ensure_ready()
+            async with self.global_sem:
+                if m.sem.locked() and self.settings.load_concurrency_policy == "reject":
+                    raise ConcurrencyLimitError(
+                        f"per-model concurrency limit for {m.entry.alias}",
+                        model=m.entry.alias,
+                        remediation="retry later or raise per-model concurrency",
+                    )
+                async with m.sem:
+                    if m.machine.state == State.READY:
+                        m.machine.to(State.BUSY)
+                    result = await asyncio.wait_for(
+                        m.adapter.rerank(payload, request_id),
+                        timeout=m.entry.request_timeout_seconds,
+                    )
+                    m.healthy = True
+                    if isinstance(result, dict):
+                        result["model"] = public_name
+                    return result
+        finally:
+            m.machine.inflight -= 1
+            m.machine.touch()
+            if m.machine.inflight == 0 and m.machine.state == State.BUSY:
+                m.machine.to(State.READY)
+
     # --- admin runtime control (ADR 0012) --------------------------------
     async def _drain(self, m: ManagedModel, timeout: float | None = None) -> bool:
         """Wait for a member's in-flight requests to reach zero (bounded).
@@ -1331,6 +1397,7 @@ class ModelManager:
                         "streaming": all(mm.entry.supports_streaming for mm in members),
                         "tools": all(mm.entry.supports_tools for mm in members),
                         "vision": all(mm.entry.supports_vision for mm in members),
+                        "rerank": all(mm.entry.supports_rerank for mm in members),
                     },
                     "pool": name,
                     "pool_size": len(members),
@@ -1365,6 +1432,7 @@ class ModelManager:
                 "streaming": any(m.entry.supports_streaming for m in flat),
                 "tools": any(m.entry.supports_tools for m in flat),
                 "vision": any(m.entry.supports_vision for m in flat),
+                "rerank": any(m.entry.supports_rerank for m in flat),
             },
             "router_candidates": sorted(
                 {

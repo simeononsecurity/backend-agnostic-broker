@@ -160,6 +160,22 @@ class OllamaAdapter(HTTPBackendAdapter):
             "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens},
         }
 
+    async def rerank(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        """Ollama has no native rerank endpoint (ADR 0013).
+
+        Ollama exposes only the embedding layer, not a cross-encoder's
+        classification head, so the only ways to "rerank" on Ollama are
+        embedding-magnitude / yes-no-logprob hacks that are a silent quality
+        substitute. We refuse them and return a clear 400 instead.
+        """
+        raise ValidationError(
+            "backend 'ollama' does not support rerank: Ollama has no native "
+            f"/api/rerank endpoint (model {self.entry.alias!r})",
+            backend=self.name,
+            model=self.entry.alias,
+            remediation="use a vLLM or llama.cpp reranker model for /v1/rerank",
+        )
+
     async def ps(self) -> dict[str, Any]:
         """Return Ollama's ``/api/ps`` — models currently resident in memory.
 
