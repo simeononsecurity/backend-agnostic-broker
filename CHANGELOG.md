@@ -27,11 +27,38 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   optional extra (`pip install 'backend-agnostic-broker[redis]'`), import-guarded
   → `ConfigError` if enabled-but-missing. The manager's sticky map is migrated
   onto `StateStore`.
+- **Exact response cache** (ADR 0012, default off): `BROKER_RESPONSE_CACHE_ENABLED`
+  with TTL / `MAX_ENTRIES` / `MAX_BYTES` / `DETERMINISTIC_ONLY`. Identical requests
+  to the same model are served from a StateStore-backed cache (in-process or
+  Redis), skipping inference. Key = hash of (API-key/tenant scope, public model
+  **after `auto` resolution**, normalized messages/prompt/input + sampling +
+  tools + `response_format`), so a cached answer **never crosses a key/tenant
+  boundary**. Deterministic requests only by default (`temperature == 0` or an
+  explicit `seed`); embeddings always. Errors/partials never cached; streaming
+  bypasses. Bypass via `Cache-Control: no-cache`/`no-store` or
+  `x-broker-cache: bypass`; every response carries `x-broker-cache: hit|miss|bypass`.
+  Covers `/v1/chat/completions`, `/v1/completions`, `/v1/responses` (non-stream),
+  `/v1/embeddings`. Semantic cache deferred.
+- **Admin runtime control** (ADR 0012, `BROKER_ADMIN_ENABLED`, default off): behind
+  a dedicated `BROKER_ADMIN_API_KEYS` gate (`require_admin`). `GET /admin/models`
+  (state, inflight, last-used), `POST /admin/models/{alias}/unload` (refuse on
+  in-flight, or `?drain=true` to drain first), `POST /admin/models/{alias}/load`
+  (explicit preload — the only non-request load path), `POST /admin/registry/reload`
+  (transactional hot-reload: validate-before-apply, drain changed/removed models,
+  invalid registry → no change + structured error). Admin actions are audit-logged.
+- **OpenTelemetry tracing** (ADR 0012, `BROKER_TRACING_ENABLED`, default off):
+  optional `otel` extra (`pip install 'backend-agnostic-broker[otel]'`). Spans
+  (`auto_route`→`load_model`→`inference`→`cache_lookup`) carry `gen_ai.*`
+  attributes per the GenAI semantic conventions; **no prompt/response content**.
+  OTLP exporter configured via standard `OTEL_*` env vars. No-op + zero overhead
+  when disabled; `ConfigError` if enabled but the package is missing.
+- **Web UI/playground**: `BROKER_UI_ENABLED` reserved; the UI itself is **deferred**
+  (ADR 0012, roadmap item 12).
 
 ### Changed
 
 - `GET /status` now reports `state_backend`, `retry_max_attempts`,
-  `cooldowns_enabled`, and (when cooldowns are on) per-model `cooldown`.
+  `cooldowns_enabled`, `tracing_enabled`, and a `response_cache` stats block.
 - `GET /healthz/backends` entries now include a per-member `cooldown` object.
 
 ## [0.4.0] - 2026-10-18

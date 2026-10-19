@@ -3,7 +3,7 @@
 Run the suite:
 
 ```bash
-make test                 # pytest -q  (191 tests)
+make test                 # pytest -q  (231 tests)
 make cov                  # with coverage
 python -m pytest -q tests/test_security.py   # one file
 ```
@@ -13,7 +13,7 @@ so they exercise the real request path, lifecycle, locking, and security
 boundaries without any external runtime. The suite is CPU-only; optional GPU
 tests (if added) should be marked and excluded from CI.
 
-## Coverage map (191 tests)
+## Coverage map (231 tests)
 
 | File | Tests | Covers |
 |------|-------|--------|
@@ -37,6 +37,9 @@ tests (if added) should be marked and excluded from CI.
 | `tests/test_unload.py` | 4 | Idle unload sweep; unload while idle; not while serving. |
 | `tests/test_security.py` | 17 | SSRF guard, path traversal, executable allow-list, flag/shell-injection rejection, no-shell argv. |
 | `tests/test_docs_examples.py` | 4 | Documentation/API examples run against the real API. |
+| `tests/test_cache.py` | 18 | Response cache (ADR 0012): key stability + scope/model/endpoint isolation, sampling/tools/format in key, deterministic-only default, hit/miss/bypass headers, per-key isolation, errors-not-cached, embeddings cached, disabled pass-through, StateStore-backed roundtrip + TTL + LRU eviction + max-bytes. |
+| `tests/test_admin.py` | 13 | Admin runtime control (ADR 0012): disabled blocks, admin-key required, model list, load/unload, refuse/drain/timeout on in-flight, draining member skipped, registry reload add/remove, unchanged-instance kept, invalid-registry rollback. |
+| `tests/test_tracing.py` | 4 | Tracing (ADR 0012): no-op when disabled, app serves with tracing off, `ConfigError` when enabled without otel (skipped if installed), `gen_ai.*` spans asserted via in-memory exporter with **no content captured** (skipped without the SDK). |
 
 ## Writing new tests
 

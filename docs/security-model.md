@@ -59,6 +59,30 @@ logged or committed.
 An unknown model alias raises `ModelNotFoundError` (404). The broker never
 substitutes a different model.
 
+## Admin control plane (ADR 0012)
+
+The runtime-control surface (`GET /admin/models`, model unload/load, registry
+reload) is **off by default** (`BROKER_ADMIN_ENABLED=false`) and, when enabled, is
+gated by a **dedicated** key list (`BROKER_ADMIN_API_KEYS`) checked by
+`require_admin`/`check_admin` in `broker/auth.py` — deliberately separate from the
+data-plane `BROKER_API_KEYS`, so a leaked user key cannot unload models or reload
+the registry. Admin keys are compared in constant time and never logged (actions
+are audited by key *fingerprint* only). This single gate is the swap point for
+ADR 0008's virtual-key admin scope. The admin surface cannot introduce a new
+backend, executable, or path: registry reload re-runs the same executable/
+model-path allow-list validation as startup, and an invalid registry makes no
+change.
+
+## Response-cache isolation (ADR 0012)
+
+The exact response cache (off by default) keys every entry on the caller's
+API-key/tenant scope as the **first** hashed component, so a cached answer can
+never be served across a key or tenant boundary. Only successful, non-streaming,
+deterministic-by-default responses are stored; errors and partial streams are
+never cached. The cache stores response bodies in the StateStore (in-process or
+Redis) — treat that store with the same confidentiality as the responses
+themselves, and scope `BROKER_REDIS_PREFIX` per deployment when sharing one Redis.
+
 ## Container hardening
 
 The image (`Dockerfile`) and Compose files apply defense in depth:

@@ -30,9 +30,9 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 
 | # | Item | Status | ADR |
 |---|------|--------|-----|
-| 10 | Response caching (exact, then optional semantic) | 📋 planned | [0012](adr/0012-caching-runtime-control-observability.md) |
-| 11 | Runtime control: manual unload + registry hot-reload | 📋 planned | [0012](adr/0012-caching-runtime-control-observability.md) |
-| 12 | OpenTelemetry tracing + optional web UI/playground | 📋 planned | [0012](adr/0012-caching-runtime-control-observability.md) |
+| 10 | Response caching (exact, then optional semantic) | ✅ done — exact cache; semantic deferred | [0012](adr/0012-caching-runtime-control-observability.md) |
+| 11 | Runtime control: manual unload + registry hot-reload | ✅ done — unload/load + transactional reload | [0012](adr/0012-caching-runtime-control-observability.md) |
+| 12 | OpenTelemetry tracing + optional web UI/playground | ✅ done — tracing; web UI deferred | [0012](adr/0012-caching-runtime-control-observability.md) |
 
 ## Notes
 

@@ -87,6 +87,48 @@ never in committed files.
 
 - `BROKER_LOG_FORMAT=json` (default) emits structured logs (`ts`, `level`,
   `logger`, `msg`); `text` for human-readable. Set `BROKER_LOG_LEVEL` as needed.
+- Admin actions (ADR 0012) are logged by the `broker.admin` logger with the
+  action, target, and the actor's non-reversible key fingerprint.
+
+## Response cache (ADR 0012)
+
+Off by default. Enable with `BROKER_RESPONSE_CACHE_ENABLED=true` to serve
+identical requests from cache (StateStore-backed; shared across replicas when
+`BROKER_REDIS_URL` is set). Tune `BROKER_RESPONSE_CACHE_TTL_SECONDS`,
+`_MAX_ENTRIES`, and `_MAX_BYTES`. Watch effectiveness in `GET /status` →
+`response_cache` (`hits`, `misses`, `hit_rate`, `live_entries`). To force a fresh
+answer for one request, send `Cache-Control: no-cache` or `x-broker-cache: bypass`
+and check the `x-broker-cache` response header. By default only deterministic
+(`temperature == 0`/seeded) requests are cached; set
+`BROKER_RESPONSE_CACHE_DETERMINISTIC_ONLY=false` to cache all (accepting that a
+sampled answer will be replayed).
+
+## Runtime control (ADR 0012)
+
+Enable with `BROKER_ADMIN_ENABLED=true` and set `BROKER_ADMIN_API_KEYS` (a
+dedicated admin key list, distinct from `BROKER_API_KEYS`). Then:
+
+- **Free VRAM now:** `POST /admin/models/{alias}/unload` (add `?drain=true` to let
+  in-flight requests finish first, bounded by `BROKER_ADMIN_DRAIN_TIMEOUT_SECONDS`;
+  a bare unload is refused with `409 model_busy` while serving).
+- **Hide cold-start:** `POST /admin/models/{alias}/load` to preload a model before
+  traffic (the only non-request load path; startup still loads nothing).
+- **Edit the registry without a restart:** change `registry.yaml`, then
+  `POST /admin/registry/reload`. It validates the whole file first — an invalid
+  registry changes nothing and returns a structured error. Added/removed/changed
+  models are reported; changed and removed models are drained before replacement;
+  unchanged models keep serving. Confirm with `GET /admin/models`.
+
+## Tracing (ADR 0012)
+
+Off by default with zero overhead. To enable: install the extra
+(`pip install 'backend-agnostic-broker[otel]'`), set `BROKER_TRACING_ENABLED=true`,
+and point the OTLP exporter at your collector with the standard env vars, e.g.
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector>:4318`. Spans
+(`auto_route`→`load_model`→`inference`→`cache_lookup`) carry `gen_ai.*` metadata
+only — **never prompt or response content**. If tracing is enabled but the
+`opentelemetry` package is missing, the broker fails fast at startup. Prometheus
+`/metrics` is unaffected.
 
 ## Security operations
 
