@@ -149,8 +149,9 @@ link-local/metadata addresses. See `docs/security-model.md` and
   seconds, last error, live `healthy`/`last_health`, and `cooldown` when enabled)
   plus adapter status (endpoint, GPU allocation), the `pools` map,
   `route_strategy` / `sticky_sessions`, `state_backend` (`in_process`|`redis`),
-  `retry_max_attempts`, `cooldowns_enabled`, `tracing_enabled`, and a
-  `response_cache` stats block (ADR 0012).
+  `retry_max_attempts`, `cooldowns_enabled`, a `reliability` block (ejection cap,
+  cooldown growth, half-open, Retry-After, Redis sticky bound — ADR 0017),
+  `tracing_enabled`, and a `response_cache` stats block (ADR 0012).
 - `GET /healthz/backends` — live, non-loading per-backend liveness (`ok`/`degraded`), with per-member `cooldown`.
 - `GET /api/ps` — Ollama residency passthrough (what is actually in memory).
 - `GET /metrics` — Prometheus exposition (when `metrics_enabled`).
@@ -208,14 +209,20 @@ dicts; across replicas it is Redis. The `ModelManager` owns one `StateStore`
 |-------|---------|---------|
 | Sticky map | `sticky_get(pool, session)`, `sticky_set(pool, session, member)`, `sticky_len()` | manager sticky routing (ADR 0003/0009) |
 | Counters | `incr(key, amount, ttl)`, `get_counter(key)`, `window_incr(key, window_s, …)`, `window_count(key, window_s, …)` | **ADR 0008** per-key rate limits (rpm/tpm sliding window) |
-| Cooldowns | `record_failure(key, *, threshold, cooldown_seconds)`, `record_success(key)`, `get_cooldown(key)` → `CooldownRecord`, `try_half_open(key, ttl_seconds)` | manager member cooldowns (ADR 0009) |
+| Cooldowns | `record_failure(key, *, threshold, cooldown_seconds, multiplier, max_cooldown_seconds)`, `record_success(key, decay_seconds)`, `get_cooldown(key)` → `CooldownRecord`, `try_half_open(key, ttl_seconds)` | manager member cooldowns (ADR 0009) + ejection growth / single-trial half-open (ADR 0017) |
 | Generic KV | `kv_get/kv_set` (bytes + TTL), `kv_get_json/kv_set_json`, `kv_delete` | **ADR 0010** prefix→member index, **ADR 0012** response cache |
 | Lifecycle | `close()` | shutdown |
 
-`CooldownRecord` carries `failures`, `until`, and `now`, with derived
-`in_cooldown`, `seconds_remaining`, and `to_dict()` (what `/status` and
-`/healthz/backends` render). The sliding-window counter follows the Redis
-sorted-set "sliding window log" pattern; TTL keys back sticky/cooldown/cache
-expiry. The API is intentionally broader than the manager uses today — it is the
-shared-state platform the P1/P2 ADRs build on, so 0008/0010/0012 add consumers,
-not new stores.
+`CooldownRecord` carries `failures`, `until`, `now`, and `ejections` (ADR 0017),
+with derived `in_cooldown`, `recovering`, `seconds_remaining`, and `to_dict()`
+(what `/status` and `/healthz/backends` render). The exponential ejection count
+and last-ejection timestamp are stored separately from the `(failures, until)`
+record so repeated failures within one open window are a single ejection episode.
+ADR 0017 uses `try_half_open` to gate single-trial probing, and `record_failure`'s
+`multiplier`/`max_cooldown_seconds` to grow the window on repeated ejections
+(decaying via `record_success(decay_seconds=…)`). Redis sticky additionally keeps
+an optional sorted-set LRU index (`BROKER_REDIS_STICKY_MAX_ENTRIES`). The sliding-
+window counter follows the Redis sorted-set "sliding window log" pattern; TTL keys
+back sticky/cooldown/cache expiry. The API is intentionally broader than the
+manager uses today — it is the shared-state platform the P1/P2 ADRs build on, so
+0008/0010/0012/0017 add consumers, not new stores.

@@ -1,0 +1,19 @@
+# Example registry for the ADR 0017 reliability-v2 demo.
+#
+# A single public model "chat" backed by THREE fake members so you can watch
+# retries, cooldowns, the ejection cap, and exponential ejection growth without
+# any GPU or network. The fake backend injects failures via class-level knobs
+# (see the README). No real host details are committed.
+models:
+  - alias: chat-node-1
+    backend: fake
+    runtime_model_id: shared-chat
+    pool: chat
+  - alias: chat-node-2
+    backend: fake
+    runtime_model_id: shared-chat
+    pool: chat
+  - alias: chat-node-3
+    backend: fake
+    runtime_model_id: shared-chat
+    pool: chat

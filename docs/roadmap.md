@@ -19,8 +19,8 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 | # | Item | Status | ADR |
 |---|------|--------|-----|
 | 3 | Per-key rate limits (rpm/tpm) + virtual keys + budgets | ✅ done | [0008](adr/0008-per-key-governance.md) |
-| 4 | Retries w/ exponential backoff + member cooldowns | ✅ done | [0009](adr/0009-routing-reliability-and-scale.md) |
-| 5 | Optional Redis shared state (multi-replica) | ✅ done | [0009](adr/0009-routing-reliability-and-scale.md) |
+| 4 | Retries w/ exponential backoff + member cooldowns | ✅ done | [0009](adr/0009-routing-reliability-and-scale.md), [0017](adr/0017-reliability-v2.md) |
+| 5 | Optional Redis shared state (multi-replica) | ✅ done | [0009](adr/0009-routing-reliability-and-scale.md), [0017](adr/0017-reliability-v2.md) |
 | 6 | Prefix/cache-aware pool routing + load-aware scoring | ✅ done | [0010](adr/0010-cache-aware-pool-routing.md) |
 | 7 | Cascade mode for `auto` (cheap→escalate) | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
 | 8 | Latency-budget fallback + privacy/placement pinning | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
@@ -36,6 +36,13 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 
 ## Notes
 
+- **Reliability v2 (ADR 0017)** resolves every item ADR 0009 deferred under roadmap
+  items 4 & 5 — none remains open:
+  - ✅ `max_ejection_percent` ejection cap (never-strand) — item 4
+  - ✅ Exponential ejection-time growth + decay — item 4
+  - ✅ Single-trial half-open probe — item 4
+  - ✅ Per-error retry/cooldown policies (4xx never retried; upstream Retry-After) — item 4
+  - ✅ Redis sticky global LRU bound — item 5
 - Proposed ADRs are **drafts** (direction recorded, not yet built); promote to
   `Accepted` when implementation starts, and add a `## Confirmation` section.
 - Invariants that constrain every item: lazy load, **no silent cross-model

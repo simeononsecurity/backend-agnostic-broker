@@ -28,6 +28,9 @@ Errors are structured (`broker/errors.py`) and carry a `remediation` hint and a
 | Startup aborts: "BROKER_REDIS_URL is set but the 'redis' package is not installed" | `config_error` (500) | Redis shared state enabled without the optional dep | `pip install 'backend-agnostic-broker[redis]'`, or unset `BROKER_REDIS_URL` to use in-process state. |
 | A pool member stops receiving traffic | — (works, logged) | Cooldowns are on (`BROKER_COOLDOWN_FAILURES>0`) and the member hit the failure threshold | Check `GET /healthz/backends` → `cooldown.in_cooldown`/`seconds_remaining`; it half-opens automatically after `BROKER_COOLDOWN_SECONDS`. Fix the backend, or disable with `BROKER_COOLDOWN_FAILURES=0`. |
 | Requests slower under load after enabling retries | — (expected) | Backoff sleeps between retry attempts | Lower `BROKER_RETRY_BACKOFF_BASE_MS`/`MAX_MS` or `BROKER_RETRY_MAX_ATTEMPTS`; retrying is bounded by `BROKER_REQUEST_TIMEOUT_SECONDS`. |
+| A benched member still gets a little traffic | — (works, by design) | `BROKER_MAX_EJECTION_PERCENT>0` reinstated it because too much of the pool was benched (never-strand) | Expected under a correlated outage; `cooldown.in_cooldown=true` with traffic means the ejection cap kept it eligible. Fix the backend, or raise the cap. |
+| A flapping member is benched for longer and longer | — (works, by design) | Exponential ejection growth (`BROKER_COOLDOWN_BACKOFF_MULTIPLIER>1`) | Watch `cooldown.ejections`/`seconds_remaining` in `GET /status`; it decays after `BROKER_COOLDOWN_DECAY_SECONDS` of success. Lower the multiplier or set `BROKER_COOLDOWN_MAX_SECONDS`. |
+| A 429/4xx was not retried or didn't bench a member | — (by design) | 4xx client errors are never retried/counted; 429 backpressure is not retried unless opted in | For a 429, set `BROKER_RETRY_ON_BACKPRESSURE=true` (and `BROKER_COOLDOWN_ON_BACKPRESSURE=true`); 4xx is intentionally never retried. See per-error policy in configuration.md. |
 | `cache_aware`: low prefix hit rate | — (works, suboptimal) | Prompts shorter than one block, little shared prefix, `block_chars` too large (coarse), or the index TTL/size too small so entries expire before reuse | Check `GET /status.cache_aware.hit_rate`/`index_size`; lower `BROKER_CACHE_AWARE_BLOCK_CHARS` for finer matching, raise `BROKER_CACHE_AWARE_TTL_SECONDS`/`MAX_ENTRIES`, and confirm the workload actually shares prefixes. Short prompts correctly fall back to `least_busy`. |
 | `cache_aware`: one member hot-spots (uneven load) | — (works, imbalanced) | `BROKER_CACHE_AWARE_BETA` too low, so prefix affinity dominates the load term | Raise `BROKER_CACHE_AWARE_BETA` (e.g. default `0.25`→`0.5`/`1.0`) to spread harder; compare per-member `inflight` in `GET /status`; optionally enable `BROKER_CACHE_AWARE_USE_METRICS` for a real queue-depth signal. See the `beta` table in routing-and-health.md. |
 
@@ -35,11 +38,13 @@ Errors are structured (`broker/errors.py`) and carry a `remediation` hint and a
 
 - `GET /status` shows each model's state, pid, inflight, idle seconds, and
   `last_error`, plus `state_backend` (`in_process`/`redis`), `retry_max_attempts`,
-  `cooldowns_enabled`, and per-model `cooldown` when cooldowns are on. The
+  `cooldowns_enabled`, a `reliability` block (ejection cap, cooldown growth,
+  half-open, Retry-After, Redis sticky bound — ADR 0017), and per-model `cooldown`
+  (incl. `ejections`) when cooldowns are on. The
   `router` block shows the active backend (`llm`/`heuristic`), cache size, and
   recent `auto` decisions (`chosen`, `via`, `latency_ms`).
 - `GET /healthz/backends` shows per-member liveness and `cooldown`
-  (`failures`, `in_cooldown`, `seconds_remaining`).
+  (`failures`, `in_cooldown`, `seconds_remaining`, `ejections`).
 - `GET /metrics` shows request/latency/in-flight/loaded gauges.
 - Logs: set `BROKER_LOG_LEVEL=DEBUG` for verbose output.
 - Reproduce the full local check suite via `docs/EVIDENCE.md`.

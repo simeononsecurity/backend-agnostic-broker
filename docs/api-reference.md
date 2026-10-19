@@ -122,7 +122,8 @@ only while their process is already running — an unloaded managed model report
 `not_loaded` (not a failure, and never a spawn). Returns `200` with an overall
 `status` of `ok` or `degraded`. When member cooldowns are enabled (ADR 0009),
 each backend entry also carries a `cooldown` object
-(`{failures, in_cooldown, until, seconds_remaining}`).
+(`{failures, in_cooldown, until, seconds_remaining, ejections}`; `ejections` is
+the consecutive-ejection count driving exponential growth — ADR 0017).
 
 ```bash
 curl -s -H "Authorization: Bearer my-key" http://127.0.0.1:8080/healthz/backends
@@ -146,7 +147,8 @@ Per-model snapshot (state, inflight, pid, idle seconds, last error, live
 adapter status (endpoint, GPU allocation), plus a `pools` map (public name →
 member aliases), loaded/limit counts, and routing info: `route_strategy`,
 `sticky_sessions`, `state_backend` (`in_process`|`redis`), `retry_max_attempts`,
-`cooldowns_enabled`.
+`cooldowns_enabled`, and a `reliability` block (ejection cap, cooldown
+growth/decay, single-trial half-open, Retry-After, Redis sticky bound — ADR 0017).
 
 ```bash
 curl -s -H "Authorization: Bearer my-key" http://127.0.0.1:8080/status

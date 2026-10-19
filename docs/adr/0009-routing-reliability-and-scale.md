@@ -3,6 +3,8 @@
 - Status: Accepted
 - Date: 2026-10-18
 - Supersedes: none
+- Extended by: ADR 0017 (reliability v2 — ejection cap, exponential ejection,
+  single-trial half-open, per-error policies, Redis sticky LRU)
 - Related: ADR 0003 (pools/sticky/health); `docs/routing-and-health.md`,
   `docs/architecture.md`; research: `docs/research/adr-0009-routing-reliability-and-scale.md`;
   enables ADR 0008 (per-key counters), ADR 0010 (prefix→member index), ADR 0012

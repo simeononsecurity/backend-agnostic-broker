@@ -124,7 +124,35 @@ A per-member circuit breaker keeps a flapping backend out of rotation:
 - `BROKER_COOLDOWN_FAILURES=0` (default) disables cooldowns entirely.
 
 Cooldown state is visible per member in `GET /status` and `GET /healthz/backends`
-(`cooldown: {failures, in_cooldown, until, seconds_remaining}`).
+(`cooldown: {failures, in_cooldown, until, seconds_remaining, ejections}`).
+
+### Reliability v2: ejection cap, exponential growth, single-trial half-open, per-error policies (ADR 0017)
+
+Four refinements on the circuit breaker above, all opt-in (defaults = v0.5.0):
+
+- **Ejection cap** (`BROKER_MAX_EJECTION_PERCENT`, Envoy `max_ejection_percent`).
+  Caps the fraction of a pool that may be benched at once so a correlated failure
+  can't eject everyone. When more members are benched than the cap allows, the
+  **soonest-to-recover** ones are kept eligible — the pool is **never stranded**.
+  `0` = no cap (the existing all-benched fall-through still applies).
+- **Exponential ejection growth** (`BROKER_COOLDOWN_BACKOFF_MULTIPLIER`, capped by
+  `BROKER_COOLDOWN_MAX_SECONDS`). A member ejected N times in a row is benched for
+  `COOLDOWN_SECONDS * multiplier**(N-1)` — longer and longer if it keeps failing.
+  The multiplier decays after `BROKER_COOLDOWN_DECAY_SECONDS` of sustained success
+  (`0` = reset on any success). `multiplier = 1.0` = fixed window. The current
+  ejection count shows as `cooldown.ejections`.
+- **Single-trial half-open** (`BROKER_COOLDOWN_HALF_OPEN_SINGLE_TRIAL`). When on, a
+  recovering member admits exactly ONE probe (via the StateStore half-open lock);
+  concurrent requests skip it until the trial resolves. Default off keeps the ADR
+  0009 behavior (any post-expiry request may probe).
+- **Per-error policies.** Each failure is classified — `timeout`, `connection`,
+  `server_error`, `backpressure` (429), `client_error` (4xx) — and per-class
+  settings decide whether it is retried and whether it counts toward cooldown.
+  **A 4xx client error is never retried or benched.** An upstream `Retry-After`
+  (RFC 9110) on a retried error is honored within the request-timeout budget. See
+  [configuration.md](configuration.md#per-error-retry--cooldown-policies-adr-0017).
+
+A runnable demo lives in [`examples/reliability/`](../examples/reliability/).
 
 ### Shared state across replicas (ADR 0009)
 
@@ -133,7 +161,9 @@ single broker is fully self-contained. To run several broker replicas behind a
 load balancer with one consistent view, set `BROKER_REDIS_URL` and the state moves
 to Redis (sticky pins, cooldowns, and counters are then shared). `redis` is an
 optional extra (`pip install 'backend-agnostic-broker[redis]'`); absent the URL
-nothing changes and no new dependency is required. See
+nothing changes and no new dependency is required. Redis sticky entries are
+TTL-bounded by default; set `BROKER_REDIS_STICKY_MAX_ENTRIES` for a global LRU
+bound across replicas (ADR 0017). See
 [architecture.md](architecture.md) for the `StateStore` API and
 [operations-runbook.md](operations-runbook.md) for the multi-replica runbook.
 
@@ -318,7 +348,7 @@ Live, on-demand liveness of every backend member:
   "backends": [
     {"alias": "chat-node-1", "model": "chat", "backend": "ollama",
      "state": "ready", "status": "ok", "detail": "tags 200", "inflight": 1,
-     "cooldown": {"failures": 0, "in_cooldown": false, "until": null, "seconds_remaining": 0.0}},
+     "cooldown": {"failures": 0, "in_cooldown": false, "until": null, "seconds_remaining": 0.0, "ejections": 0}},
     {"alias": "qwen-llamacpp", "model": "qwen-llamacpp", "backend": "llamacpp",
      "state": "unloaded", "status": "not_loaded", "detail": "model not loaded"}
   ]
@@ -376,9 +406,20 @@ never touch a member that is mid-request.
 | `BROKER_RETRY_BACKOFF_MAX_MS` | `2000` | backoff cap |
 | `BROKER_COOLDOWN_FAILURES` | `0` | consecutive failures before benching a member (`0` = off) |
 | `BROKER_COOLDOWN_SECONDS` | `30` | bench window before a half-open trial |
+| `BROKER_MAX_EJECTION_PERCENT` | `0` | max % of a pool benched at once (`0` = no cap; never strands) |
+| `BROKER_COOLDOWN_BACKOFF_MULTIPLIER` | `1.0` | grow the window per consecutive ejection (`1.0` = fixed) |
+| `BROKER_COOLDOWN_MAX_SECONDS` | `0` | cap on the grown window (`0` = no cap) |
+| `BROKER_COOLDOWN_DECAY_SECONDS` | `0` | sustained-success window before the multiplier resets (`0` = any success) |
+| `BROKER_COOLDOWN_HALF_OPEN_SINGLE_TRIAL` | `false` | admit exactly one probe to a recovering member |
+| `BROKER_COOLDOWN_HALF_OPEN_TTL_SECONDS` | `0` | trial-lock lifetime (`0` = derive from request timeout) |
+| `BROKER_RETRY_ON_{TIMEOUT,CONNECTION,SERVER_ERROR,BACKPRESSURE}` | `true`/`true`/`true`/`false` | per-class retry toggles (4xx never retried) |
+| `BROKER_COOLDOWN_ON_{TIMEOUT,CONNECTION,SERVER_ERROR,BACKPRESSURE}` | `true`/`true`/`true`/`false` | per-class cooldown-counting toggles (4xx never counted) |
+| `BROKER_RETRY_RESPECT_RETRY_AFTER` | `true` | honor an upstream `Retry-After` on a retried error (within budget) |
+| `BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS` | `{}` | optional JSON per-class attempt cap |
 | `BROKER_REDIS_URL` | _(unset)_ | share routing state across replicas (optional `[redis]` extra) |
 | `BROKER_REDIS_PREFIX` | `broker` | Redis key namespace |
 | `BROKER_ROUTE_STICKY_TTL_SECONDS` | `0` | TTL for Redis sticky keys (`0` = none) |
+| `BROKER_REDIS_STICKY_MAX_ENTRIES` | `0` | global LRU bound on Redis sticky entries (`0` = TTL-only) |
 | `BROKER_HEALTH_PROBE_ENABLED` | `true` | enable the background liveness probe |
 | `BROKER_HEALTH_PROBE_INTERVAL_SECONDS` | `30` | seconds between probe sweeps |
 | `BROKER_HEALTH_PROBE_TIMEOUT_SECONDS` | `5` | per-probe timeout |

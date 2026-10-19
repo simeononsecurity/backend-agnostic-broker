@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Reliability v2** (ADR 0017) — resolves every item ADR 0009 deferred. All knobs
+  are opt-in and default to v0.5.0 behavior (the v0.5.0 test suite passes unchanged).
+  - **Ejection cap** `BROKER_MAX_EJECTION_PERCENT` (Envoy `max_ejection_percent`):
+    caps the fraction of a pool that may be benched at once; when exceeded, the
+    soonest-to-recover members are kept eligible so a correlated failure can **never
+    strand** the pool. `0` = no cap.
+  - **Exponential ejection growth + decay** `BROKER_COOLDOWN_BACKOFF_MULTIPLIER`,
+    `BROKER_COOLDOWN_MAX_SECONDS`, `BROKER_COOLDOWN_DECAY_SECONDS`: a member ejected
+    N times in a row is benched for `cooldown_seconds * multiplier**(N-1)` (capped),
+    decaying after sustained success. `multiplier=1.0` = fixed window. The ejection
+    count is surfaced as `cooldown.ejections`.
+  - **Single-trial half-open** `BROKER_COOLDOWN_HALF_OPEN_SINGLE_TRIAL`
+    (+ `BROKER_COOLDOWN_HALF_OPEN_TTL_SECONDS`): admits exactly one probe to a
+    recovering member via the StateStore half-open lock; concurrent requests skip it
+    until the trial resolves. Default off.
+  - **Per-error retry/cooldown policies** (`broker/reliability.py`): each failure is
+    classified (`timeout`/`connection`/`server_error`/`backpressure`/`client_error`)
+    and `BROKER_RETRY_ON_*` / `BROKER_COOLDOWN_ON_*` decide retry/cooldown per class.
+    **4xx client errors are never retried or counted.** An upstream `Retry-After`
+    (RFC 9110) on a retried error is honored within the request-timeout budget
+    (`BROKER_RETRY_RESPECT_RETRY_AFTER`); `BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS` sets
+    per-class attempt caps. Defaults reproduce ADR 0009's failover set.
+  - **Redis sticky global LRU bound** `BROKER_REDIS_STICKY_MAX_ENTRIES`: a
+    sorted-set index scored by last pin caps total sticky entries per Redis prefix,
+    evicting least-recently-pinned on overflow (`ZPOPMIN`). `0` = TTL-only.
+  - `GET /status` gains a `reliability` block; `CooldownRecord`/`cooldown` JSON gains
+    `ejections`.
+  - `examples/reliability/` — a runnable, GPU-free demo (multi-member fake pool +
+    tuned settings + README showing how to observe cooldowns in `/status` and
+    `/healthz/backends`).
+
 ## [0.5.0] - 2026-10-19
 
 ### Added

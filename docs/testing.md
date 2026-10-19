@@ -3,7 +3,7 @@
 Run the suite:
 
 ```bash
-make test                 # pytest -q  (368 collected: 342 passed, 26 skipped)
+make test                 # pytest -q  (436 collected: 396 passed, 40 skipped)
 make cov                  # with coverage
 python -m pytest -q tests/test_security.py   # one file
 ```
@@ -13,17 +13,18 @@ so they exercise the real request path, lifecycle, locking, and security
 boundaries without any external runtime. The suite is CPU-only; optional GPU
 tests (if added) should be marked and excluded from CI.
 
-In the default CPU venv, 342 pass and 26 skip — the skips are the Redis-backed
-`StateStore` paths (counters, prefix index, response cache) and the OpenTelemetry
-span path, which need the optional `redis`/`otel` extras. In a venv with
-`pip install -e '.[dev,redis,otel]'` those run too: **366 passed, 2 skipped**
-(the remaining 2 are import-guard paths that only fire when a package is *absent*).
+In the default CPU venv, 396 pass and 40 skip — the skips are the Redis-backed
+`StateStore` paths (counters, prefix index, response cache, cooldown/half-open,
+sticky LRU) and the OpenTelemetry span path, which need the optional
+`redis`/`otel` extras. In a venv with `pip install -e '.[dev,redis,otel]'` those
+run too: **434 passed, 2 skipped** (the remaining 2 are import-guard paths that
+only fire when a package is *absent*).
 
-## Coverage map (368 collected)
+## Coverage map (436 collected)
 
 | File | Tests | Covers |
 |------|-------|--------|
-| `tests/test_config.py` | 21 | Typed config + fail-fast `validate_runtime` (auth without keys, auth satisfied by a keys file, bad port, missing registry, bad rate-limit window, policy/log-format/route-strategy validation, retry/cooldown/cache-aware bounds, admin credentials required vs satisfied by a keys file, legacy defaults). |
+| `tests/test_config.py` | 32 | Typed config + fail-fast `validate_runtime` (auth without keys, auth satisfied by a keys file, bad port, missing registry, bad rate-limit window, policy/log-format/route-strategy validation, retry/cooldown/cache-aware bounds, admin credentials required vs satisfied by a keys file, legacy defaults, **ADR 0017 reliability knobs: defaults preserve v0.5.0 + invalid ejection/multiplier/decay/sticky-bound values + per-class retry map validation**). |
 | `tests/test_registry.py` | 12 | Registry parsing/validation, unknown-field rejection, duplicate-alias detection, backend filtering, pool + router config, `pricing` block (ADR 0008) parse + negative rejection. |
 | `tests/test_lifecycle.py` | 5 | State machine legal/illegal transitions, idle timing, snapshots. |
 | `tests/test_adapters.py` | 5 | Adapter contract conformance + fake backend behavior. |
@@ -32,6 +33,12 @@ span path, which need the optional `redis`/`otel` extras. In a venv with
 | `tests/test_sticky.py` | 9 | Sticky session routing: pin by header/`user`/IP, distinct-session spread, re-pin on failure, LRU bound, `/status`. |
 | `tests/test_retry.py` | 8 | Retries + full-jitter backoff (ADR 0009): backoff bounds, default single-pass-no-sleep, retries stay within the pool (never cross-model), attempt cap, transient recovery, no retry mid-stream. |
 | `tests/test_cooldown.py` | 5 | Member cooldowns (ADR 0009): bench after N failures + selection skip, half-open trial after expiry, success resets, `/status` + `/healthz/backends` visibility, default-off. |
+| `tests/test_ejection_cap.py` | 7 | Ejection cap (ADR 0017, Envoy `max_ejection_percent`): the cap function keeps soonest-to-recover eligible, selection honors it, **never-strand** when a whole pool is benched, and `0` falls through to the ADR 0009 self-heal. |
+| `tests/test_cooldown_backoff.py` | 15 | Exponential ejection growth + decay (ADR 0017): window grows per consecutive ejection, `max_seconds` cap, `multiplier=1.0` fixed, repeated-failure-within-window is one ejection, decay on any success vs sustained-success, `ejections` surfaced — parametrized over in-process + fakeredis, plus an end-to-end manager check. |
+| `tests/test_half_open.py` | 10 | Single-trial half-open (ADR 0017): `try_half_open` single-winner under 20 concurrent claims + release-on-success (both stores); manager gating routes concurrent probes away from the held member, success closes / failure re-benches, default-off allows multiple probes. |
+| `tests/test_error_policy.py` | 16 | Per-error retry/cooldown policy (ADR 0017): classification matrix + HTTP-status fallback, `Retry-After` parsing (seconds/HTTP-date/absent/invalid), policy defaults = ADR 0009, 4xx never retried/counted even if configured, backpressure opt-in, per-class attempt caps; manager integration (4xx not retried, 429 retried only when opted in, cooldown counts only configured classes, upstream `Retry-After` honored, per-class cap stops retrying). |
+| `tests/test_redis_sticky_lru.py` | 4 | Redis sticky global LRU bound (ADR 0017, fakeredis): evicts least-recently-pinned on overflow, re-pin refreshes position, unbounded keeps everything, bounded `sticky_len` uses the index. |
+| `tests/test_example_reliability.py` | 5 | The `examples/reliability` demo: example registry + settings load/validate, pooled `chat` serves, `/status.reliability` exposed, injected failure surfaces cooldown in `/status` + `/healthz/backends`, 4xx not retried/benched. |
 | `tests/test_cache_routing.py` | 26 | Cache-aware routing (ADR 0010): prompt normalization + chained block hashing, longest-prefix match, LRU/TTL index eviction, hit-rate stats, vLLM `/metrics` parse; manager routing (warm-member reuse, no-match→least_busy, load flips choice, beta=0 affinity, 3-member longest-prefix); invariants (unhealthy/cooldown excluded, failover, single-member, sticky map untouched, default builds no router, embeddings); StateStore index in-process + Redis (fakeredis); bench smoke run. |
 | `tests/test_bench_routing.py` | 5 | Cache-aware **default-β regression** (ADR 0010 follow-up): drives `scripts/bench_routing.py` seeded scenarios through the real manager and pins that the config default β (0.25) beats `sticky` on hit rate *and* TTFT p95 for `cache_pressure` + `cross_session`, roughly doubles the cache-pressure hit rate, and respects the low-pressure load-balance bound the default was selected by. |
 | `tests/test_state.py` | 31 | `StateStore` contract parametrized over in-process + Redis (fakeredis, skips if absent): sticky/LRU, counters + sliding window, cooldown transitions, half-open claim, bytes/JSON KV, factory fail-fast. |

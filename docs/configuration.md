@@ -164,6 +164,43 @@ authoritative benching signal; if every member is benched the pool falls through
 so it can still self-heal. Cooldown state is shown in `GET /status` (per model)
 and `GET /healthz/backends`. **Default-off preserves v0.4.0.**
 
+## Ejection cap, exponential growth & single-trial half-open (ADR 0017)
+
+These refine the circuit breaker above; every default reproduces v0.5.0.
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_MAX_EJECTION_PERCENT` | int | `0` | Max % of a pool that may be benched at once (Envoy `max_ejection_percent`). `0` = no cap. When exceeded, the soonest-to-recover members are kept eligible so the pool is **never stranded**. |
+| `BROKER_COOLDOWN_BACKOFF_MULTIPLIER` | float | `1.0` | Grow the window on repeated ejections: the Nth consecutive ejection benches for `COOLDOWN_SECONDS * multiplier**(N-1)`. `1.0` = fixed window. |
+| `BROKER_COOLDOWN_MAX_SECONDS` | float | `0` | Cap on the grown window (Envoy `max_ejection_time`). `0` = no cap beyond the multiplier. |
+| `BROKER_COOLDOWN_DECAY_SECONDS` | float | `0` | A successful serve resets the ejection multiplier only after the member has been healthy this long. `0` = reset on any success. |
+| `BROKER_COOLDOWN_HALF_OPEN_SINGLE_TRIAL` | bool | `false` | Admit exactly ONE probe to a recovering member (via the StateStore half-open lock); concurrent requests skip it until the trial resolves. `false` = ADR 0009 post-expiry re-eligibility. |
+| `BROKER_COOLDOWN_HALF_OPEN_TTL_SECONDS` | float | `0` | Trial-lock lifetime. `0` = derive from `BROKER_REQUEST_TIMEOUT_SECONDS`. |
+
+The ejection count per member is surfaced as `cooldown.ejections` in `/status` and
+`/healthz/backends`; a `reliability` block in `/status` summarizes the knobs above.
+
+## Per-error retry / cooldown policies (ADR 0017)
+
+Every failure is classified — `timeout`, `connection`, `server_error`,
+`backpressure` (429), `client_error` (4xx), `other` — and handled per class.
+**4xx client errors are never retried or counted, regardless of configuration.**
+Defaults reproduce ADR 0009 (timeout + connection + server_error are retried and
+count toward cooldown; backpressure and client/other are not).
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_RETRY_ON_TIMEOUT` | bool | `true` | Retry a timeout failure. |
+| `BROKER_RETRY_ON_CONNECTION` | bool | `true` | Retry a connection failure. |
+| `BROKER_RETRY_ON_SERVER_ERROR` | bool | `true` | Retry a 5xx / model-load failure. |
+| `BROKER_RETRY_ON_BACKPRESSURE` | bool | `false` | Retry a 429 backpressure failure. |
+| `BROKER_COOLDOWN_ON_TIMEOUT` | bool | `true` | Count timeouts toward cooldown. |
+| `BROKER_COOLDOWN_ON_CONNECTION` | bool | `true` | Count connection failures toward cooldown. |
+| `BROKER_COOLDOWN_ON_SERVER_ERROR` | bool | `true` | Count 5xx toward cooldown. |
+| `BROKER_COOLDOWN_ON_BACKPRESSURE` | bool | `false` | Count 429 toward cooldown. |
+| `BROKER_RETRY_RESPECT_RETRY_AFTER` | bool | `true` | On a retried error carrying `Retry-After` (RFC 9110; delay-seconds or HTTP-date), wait that long instead of the jittered backoff, clamped to the request-timeout deadline. |
+| `BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS` | JSON dict | `{}` | Per-class attempt cap, e.g. `{"timeout": 5, "server_error": 2}`. A listed class caps attempts for its failures; unlisted classes use `BROKER_RETRY_MAX_ATTEMPTS`. |
+
 ## Shared state / Redis (ADR 0009)
 
 | Env var | Type | Default | Description |
@@ -171,6 +208,7 @@ and `GET /healthz/backends`. **Default-off preserves v0.4.0.**
 | `BROKER_REDIS_URL` | str? | _(unset)_ | When set, the sticky map, cooldowns, counters, and cached values live in Redis so multiple broker replicas share one view. Unset = in-process (no new dependency). |
 | `BROKER_REDIS_PREFIX` | str | `broker` | Key namespace, so one Redis can host several brokers. |
 | `BROKER_ROUTE_STICKY_TTL_SECONDS` | float | `0` | TTL for Redis sticky keys (`0` = no expiry). In-process sticky uses `BROKER_ROUTE_STICKY_MAX_ENTRIES` (LRU) instead. |
+| `BROKER_REDIS_STICKY_MAX_ENTRIES` | int | `0` | Global LRU bound on Redis sticky entries (ADR 0017), shared across replicas via a sorted-set index scored by last pin. `0` = TTL-only. `>0` evicts the least-recently-pinned entries (`ZPOPMIN`) on overflow. |
 
 `redis` is an **optional** dependency: `pip install
 'backend-agnostic-broker[redis]'`. If `BROKER_REDIS_URL` is set but the package is

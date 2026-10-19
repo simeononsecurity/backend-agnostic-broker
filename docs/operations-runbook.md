@@ -63,6 +63,33 @@
   member is benched the pool falls through so it can still self-heal. Disable with
   `BROKER_COOLDOWN_FAILURES=0`.
 
+### Reliability v2 tuning (ADR 0017)
+
+All opt-in; defaults reproduce v0.5.0. Read live state from `GET /status`
+(`.reliability` block + per-model `.cooldown` including `ejections`) and
+`GET /healthz/backends` (per-member `cooldown`).
+
+- **Ejection cap** (`BROKER_MAX_EJECTION_PERCENT`): keep a correlated outage from
+  benching the whole pool. Set e.g. `50` to always keep half the members serving;
+  the soonest-to-recover members are reinstated first, so the pool is never
+  stranded. A member showing `cooldown.in_cooldown=true` while still receiving
+  traffic has been reinstated by the cap.
+- **Exponential ejection** (`BROKER_COOLDOWN_BACKOFF_MULTIPLIER`,
+  `BROKER_COOLDOWN_MAX_SECONDS`, `BROKER_COOLDOWN_DECAY_SECONDS`): a flapping
+  member's `cooldown.ejections` rises and its `seconds_remaining` grows
+  geometrically (capped). If a recovered member is still being penalized, lower the
+  multiplier or the decay window.
+- **Single-trial half-open** (`BROKER_COOLDOWN_HALF_OPEN_SINGLE_TRIAL=true`): under
+  bursty load this stops a thundering herd from hammering a just-recovered member —
+  only one probe goes through per recovery window.
+- **Per-error policy** (`BROKER_RETRY_ON_*` / `BROKER_COOLDOWN_ON_*`,
+  `BROKER_RETRY_RESPECT_RETRY_AFTER`, `BROKER_RETRY_MAX_ATTEMPTS_BY_CLASS`): decide
+  retry/cooldown per failure class. A 4xx is never retried or benched. To respect an
+  upstream rate limiter, set `BROKER_RETRY_ON_BACKPRESSURE=true` and keep
+  `BROKER_RETRY_RESPECT_RETRY_AFTER=true` so the broker waits the advertised
+  `Retry-After` (within the request-timeout budget).
+- See the runnable [`examples/reliability/`](../examples/reliability/) demo.
+
 ## Multi-replica / shared state (ADR 0009)
 
 By default each broker keeps routing state (sticky map, cooldowns, counters)
