@@ -63,7 +63,7 @@ or `reject`; `route_strategy` must be `sticky`, `least_busy`, or `round_robin`;
 
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
-| `BROKER_ROUTE_STRATEGY` | str | `sticky` | `sticky`, `least_busy`, or `round_robin` (see below). |
+| `BROKER_ROUTE_STRATEGY` | str | `sticky` | `sticky`, `least_busy`, `round_robin`, or `cache_aware` (see below). |
 | `BROKER_ROUTE_STICKY_MAX_ENTRIES` | int | `10000` | Max remembered session→member pairings (LRU-evicted); bounds sticky memory. |
 
 - **`sticky`** (default) — pin each **session** to one pool member and keep using
@@ -74,8 +74,29 @@ or `reject`; `route_strategy` must be `sticky`, `least_busy`, or `round_robin`;
 - **`least_busy`** — route every request to the member with the fewest in-flight
   requests (round-robin tie-break).
 - **`round_robin`** — rotate members every request.
+- **`cache_aware`** — prefix-affinity + load-aware scoring (ADR 0010); opt-in.
+  Configured by the settings below.
 
 See [routing-and-health.md](routing-and-health.md).
+
+## Cache-aware routing (ADR 0010)
+
+Only active when `BROKER_ROUTE_STRATEGY=cache_aware`; otherwise these settings have
+no effect and the broker behaves exactly as v0.4.0.
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_CACHE_AWARE_BETA` | float | `1.0` | Load-penalty weight in `score = matched_fraction - beta*relative_load`. `0` = pure prefix affinity; higher spreads load harder. |
+| `BROKER_CACHE_AWARE_BLOCK_CHARS` | int | `128` | Characters per prefix block (~4 chars/token). Larger = smaller index, coarser matching. Only full blocks are hashed. |
+| `BROKER_CACHE_AWARE_MAX_ENTRIES` | int | `10000` | Prefix-index LRU bound per replica. `0` = unbounded (TTL still applies). |
+| `BROKER_CACHE_AWARE_TTL_SECONDS` | float | `1800` | TTL on prefix-index entries, approximating KV-cache residency. `0` = no expiry. |
+| `BROKER_CACHE_AWARE_USE_METRICS` | bool | `false` | Let the non-loading health probe scrape vLLM `/metrics` (`vllm:num_requests_waiting`) for a real load signal; falls back to in-flight counts. Never loads a model. |
+
+Routes each request to the pool member that already holds its prompt **prefix**
+(warm KV cache), backing off to a less-loaded member once the warm one saturates.
+The prefix→member index lives on the `StateStore` (shared via Redis when
+`BROKER_REDIS_URL` is set). See [routing-and-health.md](routing-and-health.md) for
+the algorithm, `beta` tuning, and the benchmark.
 
 ## Retries & backoff (ADR 0009)
 

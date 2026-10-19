@@ -8,6 +8,20 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Cache-aware pool routing** (ADR 0010): opt-in `BROKER_ROUTE_STRATEGY=cache_aware`
+  routes each request to the pool member that already holds its prompt **prefix**
+  (warm KV cache), scoring `score = matched_fraction - beta·relative_load` and
+  falling back to `least_busy` when no member holds any prefix. Prompts are
+  normalized and sliced into fixed-size **chained** character blocks
+  (`BROKER_CACHE_AWARE_BLOCK_CHARS`); the prefix→member index lives on the
+  `StateStore` (shared via Redis when configured), LRU-bounded
+  (`BROKER_CACHE_AWARE_MAX_ENTRIES`) with a TTL (`BROKER_CACHE_AWARE_TTL_SECONDS`).
+  `BROKER_CACHE_AWARE_BETA` is the single cache-vs-load knob;
+  `BROKER_CACHE_AWARE_USE_METRICS` lets the **non-loading** health probe scrape
+  vLLM `/metrics` (`vllm:num_requests_waiting`) for a real load signal (falls back
+  to in-flight counts). Default (`sticky`) behavior is unchanged.
+  `scripts/bench_routing.py` compares strategies on a simulated shared-prefix
+  workload.
 - **Retries with full-jitter backoff** (ADR 0009): `BROKER_RETRY_MAX_ATTEMPTS`,
   `BROKER_RETRY_BACKOFF_BASE_MS`, `BROKER_RETRY_BACKOFF_MAX_MS`. Retries re-select
   a member **within the requested model's pool only** (never a different model),
@@ -31,7 +45,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - `GET /status` now reports `state_backend`, `retry_max_attempts`,
-  `cooldowns_enabled`, and (when cooldowns are on) per-model `cooldown`.
+  `cooldowns_enabled`, a `cache_aware` block (`enabled`, and when active
+  `index_size`/`lookups`/`hits`/`hit_rate`/`block_chars`/`beta`), and (when
+  cooldowns are on) per-model `cooldown`.
 - `GET /healthz/backends` entries now include a per-member `cooldown` object.
 
 ## [0.4.0] - 2026-10-18

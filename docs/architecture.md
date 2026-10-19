@@ -11,8 +11,9 @@ tensor/layer split, and caching are all configurable.
 | Module | Responsibility |
 |--------|----------------|
 | `broker/app.py` | FastAPI app: OpenAI + ops routes, auth, request-size limit, request IDs, structured errors, streaming. |
-| `broker/manager.py` | `ModelManager` / `ManagedModel`: lazy loading, per-model load lock, global + per-model concurrency, idle sweep, LRU eviction, **pool routing (sticky/least-busy/round-robin) with failover, retries + full-jitter backoff, and member cooldowns**, **non-loading health probe**, graceful shutdown, status aggregation. |
+| `broker/manager.py` | `ModelManager` / `ManagedModel`: lazy loading, per-model load lock, global + per-model concurrency, idle sweep, LRU eviction, **pool routing (sticky/least-busy/round-robin/cache-aware) with failover, retries + full-jitter backoff, and member cooldowns**, **non-loading health probe**, graceful shutdown, status aggregation. |
 | `broker/state.py` | `StateStore`: async abstraction over routing/runtime state — sticky map, counters (+ sliding-window), cooldown records, generic bytes/JSON KV. `InProcessStateStore` (default) and optional `RedisStateStore` (multi-replica). See [StateStore](#statestore-shared-routingruntime-state-adr-0009). |
+| `broker/cache_routing.py` | Cache-aware routing (ADR 0010): prompt normalization, chained character-block hashing, and the `CacheRouter` prefix→member index (on the `StateStore`) + affinity scoring inputs for `cache_aware`. |
 | `broker/router.py` | `AutoRouter` for the `auto` alias: flag extraction, Stage-1 capability filter, data-driven overrides, heuristic + llama.cpp (GBNF-constrained) classifier backends, decision cache + fallback. |
 | `broker/lifecycle.py` | Pure state machine (`unloaded → loading → ready → busy → unloading → failed → stopping`) with explicit legal transitions. |
 | `broker/adapters/` | Backend adapter contract (`base.py`), shared HTTP adapter (`httpbase.py`), and one adapter per backend (`fake`, `ollama`, `vllm`, `llamacpp`, `strata`). |
@@ -55,7 +56,10 @@ transitions.
    `route_strategy`: **`sticky`** (default) pins a session — `X-Session-Id`
    header, else OpenAI `user`, else client IP — to one member and reuses it,
    assigning new sessions the least-busy member; `least_busy` and `round_robin`
-   pick per request. It reserves the member's in-flight slot under a route lock.
+   pick per request; **`cache_aware`** (ADR 0010, opt-in) scores members by
+   prompt-prefix affinity minus relative load (`broker/cache_routing.py`),
+   falling back to `least_busy` on no match. It reserves the member's in-flight
+   slot under a route lock.
 4. **Acquire the member**:
    - `_maybe_evict(alias)` unloads the LRU idle model if `max_loaded_models` is
      reached (raises `ConcurrencyLimitError` if nothing can be evicted).

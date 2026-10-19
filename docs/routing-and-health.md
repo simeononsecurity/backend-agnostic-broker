@@ -63,6 +63,10 @@ models:
   round-robin). The in-flight slot is reserved at selection time, so N concurrent
   callers spread across hosts.
 - **`round_robin`** — rotate members every request regardless of load.
+- **`cache_aware`** — prefix-affinity + load-aware scoring (ADR 0010); route to
+  the member that already holds the request's prompt prefix (warm KV cache),
+  backing off to a less-loaded member once the warm one saturates. Opt-in; see
+  [Cache-aware routing](#cache-aware-routing-adr-0010) below.
 
 Each member keeps its **own** independent lifecycle, load lock, per-model
 concurrency, and idle timer. `BROKER_MAX_LOADED_MODELS` and
@@ -133,6 +137,113 @@ nothing changes and no new dependency is required. See
 [architecture.md](architecture.md) for the `StateStore` API and
 [operations-runbook.md](operations-runbook.md) for the multi-replica runbook.
 
+## Cache-aware routing (ADR 0010)
+
+> Design rationale, prior art, and alternatives:
+> [ADR 0010](adr/0010-cache-aware-pool-routing.md) and the cited research note
+> [docs/research/adr-0010-cache-aware-pool-routing.md](research/adr-0010-cache-aware-pool-routing.md).
+
+`sticky` pins a *session* to a member — a coarse proxy for KV-cache locality.
+`cache_aware` (`BROKER_ROUTE_STRATEGY=cache_aware`) routes on the actual prompt
+**prefix** instead, so requests that share a system prompt, few-shot preamble, RAG
+context, or conversation history land on the member that already has those KV
+blocks cached — reusing cache and skipping prefill — while a load term stops a
+popular prefix from hot-spotting one member. It is **opt-in**; the default stays
+`sticky` and behaves exactly as before.
+
+**How a member is chosen.** After the usual health/cooldown/capability filtering,
+the broker:
+
+1. **Normalizes** the prompt (chat `messages` as `role:content` in order;
+   completion `prompt`; responses/embeddings `input`) into one canonical string.
+2. **Blocks + chain-hashes** it: fixed-size character blocks
+   (`BROKER_CACHE_AWARE_BLOCK_CHARS`, default 128 ≈ 32 tokens), each hashed as
+   `h_i = sha256(h_{i-1} + block_i)`. Chaining means one block hash identifies the
+   whole prefix up to it, so the longest match is just the leading consecutive
+   blocks a member holds. Only full blocks are hashed.
+3. **Looks up** each candidate in the prefix→member index (kept on the ADR 0009
+   `StateStore`, so it is shared via Redis when `BROKER_REDIS_URL` is set) to get a
+   `matched_fraction` per member.
+4. **Scores and picks the argmax**:
+
+   ```
+   score(m) = matched_fraction(m) - beta * relative_load(m)
+   relative_load(m) = (load(m) - mean_load) / max(1, mean_load)
+   ```
+
+   `matched_fraction` is in [0,1] (so one `beta` works at any prompt length);
+   `relative_load` is normalized to the pool mean (so `beta` is
+   deployment-independent). Ties break deterministically: highest score, then
+   least load, then round-robin. **No member holds any prefix → fall back to
+   `least_busy`.** After a successful serve the chosen member's blocks are recorded
+   so the next matching request finds it warm.
+
+**Tuning `beta`** (`BROKER_CACHE_AWARE_BETA`, default `1.0`) — the single knob, the
+exchange rate between cache benefit and load:
+
+- `0.0` → **pure prefix affinity**: always the warm member; best hit rate, risks
+  hot-spotting.
+- `1.0` (default) → a member at **2× the fleet-average load** is docked one full
+  cache hit's worth of preference. Balances well.
+- higher → spreads harder, trading cache reuse for even load (approaches
+  `least_busy`).
+
+**Load signal.** `load` defaults to in-flight request count. Set
+`BROKER_CACHE_AWARE_USE_METRICS=true` to let the **non-loading** health probe
+scrape an exposed vLLM `/metrics` (`vllm:num_requests_waiting`) for a real
+queue-depth signal, falling back to in-flight counts when unavailable. The probe
+**never loads a model** to read metrics.
+
+**Index bounds.** The prefix index is LRU-bounded per replica
+(`BROKER_CACHE_AWARE_MAX_ENTRIES`, default 10000) with a TTL approximating
+KV-cache residency (`BROKER_CACHE_AWARE_TTL_SECONDS`, default 1800). Under Redis
+the TTL is the authoritative cross-replica bound; the LRU size bound is per
+replica.
+
+**Interplay with sticky.** `cache_aware` *replaces* sticky selection — the sticky
+session map is not used while it is active. Prefix affinity provides the locality
+that session pinning approximated (a conversation's growing prefix keeps hitting
+its warm member) **and** captures cross-session shared prefixes that sticky
+cannot. Failover, cooldowns, capability filtering, and the no-cross-model rule are
+unchanged.
+
+**Observability.** `GET /status` reports `route_strategy` and a `cache_aware`
+block: `{enabled, index_size, lookups, hits, hit_rate, block_chars, beta}`.
+
+### Benchmark
+
+`scripts/bench_routing.py` replays a shared-prefix, multi-session workload against
+the fake backend with a *simulated* per-member KV cache (a prefix hit lowers
+simulated TTFT), driving the **real** routing logic. Reproduce with
+`PYTHONPATH=. python scripts/bench_routing.py` (add `--smoke` for a tiny run).
+
+Representative run (4 members, 150 sessions, 600 requests, `block_chars=128`,
+`beta=1.0`; TTFT base 1000 ms, full-hit 200 ms):
+
+| strategy | prefix hit rate | TTFT p50 (ms) | TTFT p95 (ms) | load stdev | load spread |
+|---|---|---|---|---|---|
+| round_robin | 82.0% | 200 | 657 | 0.00 | 150-150 |
+| least_busy | 82.0% | 200 | 657 | 0.00 | 150-150 |
+| sticky | 89.1% | 200 | 600 | 4.58 | 145-157 |
+| cache_aware | 85.8% | 200 | 600 | 0.71 | 149-151 |
+
+`cache_aware` beats the naive load-balancers on hit rate at near-perfect load
+balance, and captures cross-session prefix reuse. `beta` moves it along the
+cache-vs-balance curve (same workload, varying `--beta`):
+
+| beta | prefix hit rate | TTFT p95 (ms) | load stdev | load spread |
+|---|---|---|---|---|
+| 0.0 | 91.2% | 543 | 38.09 | 95-200 |
+| 0.3 | 89.3% | 600 | 10.65 | 137-161 |
+| 1.0 | 85.8% | 600 | 0.71 | 149-151 |
+| 3.0 | 85.0% | 600 | 0.00 | 150-150 |
+
+At `beta=0` pure affinity maximizes hit rate (91.2%) but hot-spots (spread
+95-200); raising `beta` trades a little reuse for tighter balance. Sticky does well
+here because this workload reuses long-lived sessions; `cache_aware`'s edge grows
+with cross-session sharing (shared system prompts, many short sessions) that
+sticky cannot exploit.
+
 ## Health & liveness (never loads a model)
 
 Three surfaces, all non-loading:
@@ -192,8 +303,13 @@ never touch a member that is mid-request.
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `BROKER_ROUTE_STRATEGY` | `sticky` | `sticky`, `least_busy`, or `round_robin` |
+| `BROKER_ROUTE_STRATEGY` | `sticky` | `sticky`, `least_busy`, `round_robin`, or `cache_aware` |
 | `BROKER_ROUTE_STICKY_MAX_ENTRIES` | `10000` | max remembered session→member pairings (LRU, in-process) |
+| `BROKER_CACHE_AWARE_BETA` | `1.0` | cache-aware: load penalty weight (`0` = pure affinity) |
+| `BROKER_CACHE_AWARE_BLOCK_CHARS` | `128` | cache-aware: characters per prefix block (~4 chars/token) |
+| `BROKER_CACHE_AWARE_MAX_ENTRIES` | `10000` | cache-aware: prefix-index LRU bound per replica (`0` = unbounded) |
+| `BROKER_CACHE_AWARE_TTL_SECONDS` | `1800` | cache-aware: prefix-index entry TTL (`0` = no expiry) |
+| `BROKER_CACHE_AWARE_USE_METRICS` | `false` | cache-aware: scrape vLLM `/metrics` queue depth via the non-loading probe |
 | `BROKER_RETRY_MAX_ATTEMPTS` | `0` | serve attempts per request (`0` = one failover pass) |
 | `BROKER_RETRY_BACKOFF_BASE_MS` | `0` | full-jitter backoff base (`0` = no sleep) |
 | `BROKER_RETRY_BACKOFF_MAX_MS` | `2000` | backoff cap |
