@@ -19,7 +19,7 @@ CHAT = {"model": "echo-chat", "messages": [{"role": "user", "content": "hi"}], "
 def test_example_files_present():
     for name in (
         "README.md",
-        "registry.yaml",
+        "registry.example.yaml",
         "env.exact",
         "env.semantic",
         "curl.sh",
@@ -32,7 +32,7 @@ def _settings(**over) -> Settings:
     base = dict(
         auth_enabled=True,
         api_keys=[KEY],
-        registry_path=str(EX / "registry.yaml"),
+        registry_path=str(EX / "registry.example.yaml"),
         enabled_backends=["fake"],
         response_cache_enabled=True,
     )

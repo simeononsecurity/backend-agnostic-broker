@@ -6,12 +6,12 @@ streaming replay and the per-request cache controls.
 
 Everything here runs against the dependency-free **fake backend**, so you can try
 it with no GPU or model download. For a real deployment, swap `backend: fake` in
-`registry.yaml` for your Ollama / vLLM / llama.cpp / Strata models (keep one
+`registry.example.yaml` for your Ollama / vLLM / llama.cpp / Strata models (keep one
 embedding-capable model for the semantic cache).
 
 ## Files
 
-- `registry.yaml` — a chat model (`echo-chat`) and an embedding model (`echo-embed`).
+- `registry.example.yaml` — a chat model (`echo-chat`) and an embedding model (`echo-embed`).
 - `env.exact` — enable the exact cache only.
 - `env.semantic` — enable the exact **and** semantic caches.
 - `curl.sh` — curl snippets showing hit/miss headers and per-request controls.
@@ -22,7 +22,7 @@ embedding-capable model for the semantic cache).
 ```bash
 # exact cache
 set -a && . ./examples/caching/env.exact && set +a
-export BROKER_REGISTRY_PATH=examples/caching/registry.yaml
+export BROKER_REGISTRY_PATH=examples/caching/registry.example.yaml
 python -m uvicorn broker.app:create_app --factory --port 8080
 ```
 
