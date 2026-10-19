@@ -63,10 +63,40 @@ class Settings(BaseSettings):
     # "least_busy": route every request to the member with the fewest in-flight
     #   requests (round-robin tie-break).
     # "round_robin": rotate members every request regardless of load.
+    # "cache_aware": prefix-affinity + load-aware scoring (ADR 0010); route to the
+    #   member that already holds the request's prompt prefix (warm KV cache),
+    #   backing off to a less-loaded member once the warm one is saturated. Opt-in.
     route_strategy: str = "sticky"
     # Max remembered session->member pairings (LRU-evicted). Bounds memory for
     # sticky routing under many distinct sessions/clients.
     route_sticky_max_entries: int = 10000
+
+    # --- Cache-aware pool routing (ADR 0010; route_strategy="cache_aware") ---
+    # Approximate prefix-affinity routing: the broker hashes the request's prompt
+    # into fixed-size CHAINED blocks, keeps a bounded prefix-block -> member(s)
+    # index on the StateStore (Redis-shareable), and scores each member with
+    #   score = matched_fraction - beta * relative_load
+    #   relative_load = (load - mean_load) / max(1, mean_load)
+    # routing to the argmax (vLLM production-stack LoadAwareRouter). No prefix
+    # match for any member falls back to least_busy. All of this is opt-in and has
+    # no effect unless route_strategy="cache_aware".
+    #   beta: the single tunable exchange-rate between cache benefit and load.
+    #     1.0 = "a member at 2x fleet-average load is docked one full cache hit's
+    #     worth of preference". 0.0 = pure prefix affinity (ignore load).
+    cache_aware_beta: float = 1.0
+    # Characters per prefix block (approximate; ~4 chars/token). Larger = smaller
+    # index but coarser prefix matching. Only full blocks are hashed.
+    cache_aware_block_chars: int = 128
+    # Max prefix-block index entries kept per replica (LRU-evicted). 0 disables
+    # the size bound (TTL still applies).
+    cache_aware_max_entries: int = 10000
+    # TTL (seconds) on prefix-block index entries, approximating KV-cache
+    # residency so stale affinities self-expire. 0 = no expiry.
+    cache_aware_ttl_seconds: float = 1800.0
+    # When true, the NON-LOADING health probe scrapes an exposed vLLM /metrics
+    # endpoint (vllm:num_requests_waiting) for a real load signal; falls back to
+    # in-flight request counts when unavailable. Never loads a model.
+    cache_aware_use_metrics: bool = False
 
     # --- Background health probing (non-loading) ---
     # Periodically liveness-probe active models without loading any: Ollama via
@@ -187,8 +217,10 @@ class Settings(BaseSettings):
     @field_validator("route_strategy")
     @classmethod
     def _route(cls, v: str) -> str:
-        if v not in ("sticky", "least_busy", "round_robin"):
-            raise ValueError("route_strategy must be 'sticky', 'least_busy', or 'round_robin'")
+        if v not in ("sticky", "least_busy", "round_robin", "cache_aware"):
+            raise ValueError(
+                "route_strategy must be 'sticky', 'least_busy', 'round_robin', or 'cache_aware'"
+            )
         return v
 
     @field_validator("router_backend")
@@ -221,6 +253,14 @@ class Settings(BaseSettings):
             raise ConfigError("BROKER_COOLDOWN_FAILURES must be >= 0 (0 = disabled)")
         if self.cooldown_seconds < 0:
             raise ConfigError("BROKER_COOLDOWN_SECONDS must be >= 0")
+        if self.cache_aware_beta < 0:
+            raise ConfigError("BROKER_CACHE_AWARE_BETA must be >= 0 (0 = ignore load)")
+        if self.cache_aware_block_chars < 1:
+            raise ConfigError("BROKER_CACHE_AWARE_BLOCK_CHARS must be >= 1")
+        if self.cache_aware_max_entries < 0:
+            raise ConfigError("BROKER_CACHE_AWARE_MAX_ENTRIES must be >= 0 (0 = unbounded)")
+        if self.cache_aware_ttl_seconds < 0:
+            raise ConfigError("BROKER_CACHE_AWARE_TTL_SECONDS must be >= 0 (0 = no expiry)")
         if self.redis_url is not None and not self.redis_url:
             raise ConfigError("BROKER_REDIS_URL must be a non-empty URL when set")
         if not Path(self.registry_path).exists():

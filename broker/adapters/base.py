@@ -137,3 +137,13 @@ class BackendAdapter(abc.ABC):
     @abc.abstractmethod
     async def collect_status(self) -> dict[str, Any]:
         """Return a status dict (pid, gpu allocation, endpoint, etc.)."""
+
+    # --- load signal (optional; cache-aware routing, ADR 0010) -----------
+    async def collect_load(self) -> float | None:
+        """Return a real load signal for routing, or None when unavailable.
+
+        Default: no real signal (the manager falls back to in-flight counts).
+        HTTP backends may override to scrape the runtime's ``/metrics``. This must
+        NEVER load a model — only read from an already-running process.
+        """
+        return None

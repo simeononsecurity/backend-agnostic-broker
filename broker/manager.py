@@ -55,6 +55,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from .adapters import make_adapter
+from .cache_routing import CacheRouter
 from .config import Settings
 from .errors import (
     BackendUnavailableError,
@@ -87,6 +88,10 @@ class ManagedModel:
         self.healthy = True
         self._route_seq = 0
         self.last_health: dict[str, Any] | None = None
+        # Optional real load signal (vLLM /metrics num_requests_waiting) refreshed
+        # by the non-loading health probe when cache-aware routing wants it; None
+        # falls back to in-flight counts. See ADR 0010.
+        self.last_load: float | None = None
 
     async def ensure_ready(self) -> None:
         """Start + ready the model if needed, exactly once, under the load lock."""
@@ -180,6 +185,17 @@ class ModelManager:
         # (public_name, session_key) -> member alias, LRU-ordered. None under
         # Redis (the shared store is authoritative there).
         self._sticky = getattr(self.state, "sticky", None)
+        # Cache-aware routing (ADR 0010): built only when selected, so the default
+        # path constructs nothing. Owns the prefix->member index + affinity scoring.
+        self.cache_router: CacheRouter | None = None
+        if settings.route_strategy == "cache_aware":
+            self.cache_router = CacheRouter(
+                self.state,
+                block_chars=settings.cache_aware_block_chars,
+                beta=settings.cache_aware_beta,
+                max_entries=settings.cache_aware_max_entries,
+                ttl_seconds=settings.cache_aware_ttl_seconds,
+            )
         # Auto-router ("auto" alias). Lazy-constructed; classification serialized.
         self.router: AutoRouter | None = None
         self._router_lock = asyncio.Lock()
@@ -272,6 +288,49 @@ class ModelManager:
         """
         return min(tier, key=lambda m: (m.machine.inflight, m._route_seq))
 
+    # --- cache-aware routing (ADR 0010) ----------------------------------
+    def _prefix_blocks(self, payload: dict) -> list[str] | None:
+        """Chained prefix-block hashes for a payload, or None when cache-aware
+        routing is off (so the hot path computes nothing)."""
+        if self.cache_router is None:
+            return None
+        return self.cache_router.prefix_blocks(payload)
+
+    def _member_load(self, m: ManagedModel) -> float:
+        """Load signal for scoring: the scraped vLLM metric when enabled and
+        available, else the in-flight request count (ADR 0010)."""
+        if self.settings.cache_aware_use_metrics and m.last_load is not None:
+            return float(m.last_load)
+        return float(m.machine.inflight)
+
+    async def _select_cache_aware(
+        self, name: str, tier: list[ManagedModel], prefix_blocks: list[str] | None
+    ) -> ManagedModel:
+        """Score members by prefix affinity minus relative load; argmax wins.
+
+        ``score = matched_fraction - beta * (load - mean) / max(1, mean)`` (vLLM
+        production-stack LoadAwareRouter). With no prefix match for any member we
+        fall back to ``least_busy`` (the no-cache-holder case). Tie-breaks are
+        deterministic: highest score, then least load, then round-robin.
+        """
+        assert self.cache_router is not None
+        if len(tier) == 1 or not prefix_blocks:
+            return self._least_busy(tier)
+        aliases = [m.entry.alias for m in tier]
+        fractions = await self.cache_router.match_fractions(name, prefix_blocks, aliases)
+        if not fractions:
+            return self._least_busy(tier)  # no member holds any prefix
+        loads = {m.entry.alias: self._member_load(m) for m in tier}
+        mean = sum(loads.values()) / len(loads)
+        beta = self.settings.cache_aware_beta
+
+        def score(m: ManagedModel) -> float:
+            frac = fractions.get(m.entry.alias, 0.0)
+            rel = (loads[m.entry.alias] - mean) / max(1.0, mean)
+            return frac - beta * rel
+
+        return max(tier, key=lambda m: (score(m), -loads[m.entry.alias], -m._route_seq))
+
     def _attempt_budget(self, n_members: int) -> int:
         """How many serve attempts a request gets.
 
@@ -316,6 +375,7 @@ class ModelManager:
         members: list[ManagedModel],
         exclude: set[str],
         route_key: str | None = None,
+        prefix_blocks: list[str] | None = None,
     ) -> ManagedModel | None:
         """Pick a pool member and reserve an in-flight slot, atomically.
 
@@ -376,6 +436,8 @@ class ModelManager:
                 if chosen is None:  # new session, or pinned member unavailable
                     chosen = self._assign_member(tier)
                 await self.state.sticky_set(name, route_key, chosen.entry.alias)
+            elif strategy == "cache_aware":
+                chosen = await self._select_cache_aware(name, tier, prefix_blocks)
             elif strategy == "round_robin":
                 chosen = min(tier, key=lambda m: (m._route_seq,))
             else:  # least_busy
@@ -399,6 +461,7 @@ class ModelManager:
         members: list[ManagedModel],
         route_key: str | None,
         serve,
+        prefix_blocks: list[str] | None = None,
     ) -> dict:
         """Select a pool member, serve, and retry within the pool on failure.
 
@@ -424,19 +487,21 @@ class ModelManager:
                 delay = self._backoff_delay_s(attempt - 1)
                 if delay > 0:
                     await asyncio.sleep(delay)
-            m = await self._select_member(name, members, exclude, route_key)
+            m = await self._select_member(name, members, exclude, route_key, prefix_blocks)
             if m is None:
                 # Exhausted distinct members. With retries enabled, clear the
                 # exclusion set and try members again (within the same pool).
                 if self.settings.retry_max_attempts > 0 and exclude:
                     exclude = set()
-                    m = await self._select_member(name, members, exclude, route_key)
+                    m = await self._select_member(name, members, exclude, route_key, prefix_blocks)
                 if m is None:
                     break
             attempt += 1
             try:
                 result = await serve(m)
                 await self._note_success(m)
+                if self.cache_router is not None and prefix_blocks:
+                    await self.cache_router.record(name, prefix_blocks, m.entry.alias)
                 return result
             except _FAILOVER_ERRORS as exc:  # member unavailable → retry/failover
                 m.healthy = False
@@ -465,6 +530,7 @@ class ModelManager:
             members,
             route_key,
             lambda m: self._serve_chat(m, name, payload, request_id),
+            prefix_blocks=self._prefix_blocks(payload),
         )
 
     async def _serve_chat(
@@ -504,6 +570,7 @@ class ModelManager:
     ) -> AsyncIterator[bytes]:
         name = await self._resolve_auto(name, payload)
         members = self._members_for(name)
+        prefix_blocks = self._prefix_blocks(payload)
         exclude: set[str] = set()
         last: Exception | None = None
         chosen: ManagedModel | None = None
@@ -522,11 +589,11 @@ class ModelManager:
                 delay = self._backoff_delay_s(attempt - 1)
                 if delay > 0:
                     await asyncio.sleep(delay)
-            m = await self._select_member(name, members, exclude, route_key)
+            m = await self._select_member(name, members, exclude, route_key, prefix_blocks)
             if m is None:
                 if self.settings.retry_max_attempts > 0 and exclude:
                     exclude = set()
-                    m = await self._select_member(name, members, exclude, route_key)
+                    m = await self._select_member(name, members, exclude, route_key, prefix_blocks)
                 if m is None:
                     break
             attempt += 1
@@ -562,6 +629,8 @@ class ModelManager:
             async for chunk in m.adapter.stream_chat(payload, request_id):
                 yield chunk
             await self._note_success(m)  # stream completed cleanly → reset cooldown
+            if self.cache_router is not None and prefix_blocks:
+                await self.cache_router.record(name, prefix_blocks, m.entry.alias)
         finally:
             m.machine.inflight -= 1
             m.machine.touch()
@@ -585,6 +654,7 @@ class ModelManager:
             members,
             route_key,
             lambda m: self._serve_embeddings(m, name, payload, request_id),
+            prefix_blocks=self._prefix_blocks(payload),
         )
 
     async def _serve_embeddings(
@@ -689,6 +759,20 @@ class ModelManager:
         elif external:
             # Daemon liveness (independent of broker lifecycle) drives the flag.
             m.healthy = healthy
+        # Optional real load signal for cache-aware routing (ADR 0010): scrape an
+        # exposed vLLM /metrics endpoint WITHOUT loading a model (adapters return
+        # None when their process is not running). Falls back to in-flight counts.
+        if (
+            self.settings.route_strategy == "cache_aware"
+            and self.settings.cache_aware_use_metrics
+            and (external or active)
+        ):
+            try:
+                load = await m.adapter.collect_load()
+                if load is not None:
+                    m.last_load = load
+            except Exception:  # noqa: BLE001 - best effort; never fail a probe
+                pass
         return m.last_health
 
     async def _health_probe_once(self) -> None:
@@ -798,6 +882,11 @@ class ModelManager:
             "state_backend": self.state.backend,
             "retry_max_attempts": self.settings.retry_max_attempts,
             "cooldowns_enabled": cooldowns_on,
+            "cache_aware": (
+                {"enabled": True, **self.cache_router.stats()}
+                if self.cache_router is not None
+                else {"enabled": False}
+            ),
             "router": self.router.status() if self.router else {"enabled": False},
             "pools": {
                 name: [mm.entry.alias for mm in members] for name, members in self.pools.items()

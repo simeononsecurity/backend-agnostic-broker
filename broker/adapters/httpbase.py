@@ -37,6 +37,28 @@ from ..security import (
 from .base import BackendAdapter, HealthResult
 
 
+def _parse_waiting(metrics_text: str) -> float | None:
+    """Sum ``vllm:num_requests_waiting`` samples from Prometheus text, or None.
+
+    vLLM exposes queue depth as ``vllm:num_requests_waiting{...} <value>`` (one
+    series per model/engine). We sum the sample values across series and ignore
+    ``# HELP`` / ``# TYPE`` comment lines. Returns None when the metric is absent
+    so the caller can fall back to in-flight counts.
+    """
+    total: float | None = None
+    for line in metrics_text.splitlines():
+        if not line.startswith("vllm:num_requests_waiting"):
+            continue
+        if line.startswith("#"):
+            continue
+        try:
+            value = float(line.rsplit(" ", 1)[-1])
+        except (ValueError, IndexError):
+            continue
+        total = value if total is None else total + value
+    return total
+
+
 class HTTPBackendAdapter(BackendAdapter):
     """OpenAI-compatible HTTP backend with optional broker-managed process."""
 
@@ -307,6 +329,27 @@ class HTTPBackendAdapter(BackendAdapter):
         if isinstance(data, dict):
             data["model"] = self.entry.alias
         return data
+
+    async def collect_load(self) -> float | None:
+        """Scrape ``vllm:num_requests_waiting`` from the runtime's /metrics.
+
+        Returns None (fall back to in-flight counts) when the process is not
+        running, the endpoint is absent/erroring, or the metric is missing. Never
+        starts a process — a non-loading, best-effort read only.
+        """
+        if self._supervisor is not None and not self._supervisor.is_running():
+            return None
+        if not self.entry.base_url:
+            return None
+        try:
+            url = self._validated_url("/metrics")
+            client = self._client_or_new()
+            resp = await client.get(url, timeout=5)
+            if resp.status_code != 200:
+                return None
+            return _parse_waiting(resp.text)
+        except Exception:  # noqa: BLE001 - best effort; never raise into the probe
+            return None
 
     async def collect_status(self) -> dict[str, Any]:
         return {
