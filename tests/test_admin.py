@@ -297,9 +297,7 @@ def test_admin_scope_virtual_key_authorizes(vkey_admin_client):
     r = vkey_admin_client.get("/admin/models", headers={"X-Admin-Key": _ADMIN_VKEY})
     assert r.status_code == 200
     # Presented as a Bearer token too.
-    r2 = vkey_admin_client.get(
-        "/admin/models", headers={"Authorization": f"Bearer {_ADMIN_VKEY}"}
-    )
+    r2 = vkey_admin_client.get("/admin/models", headers={"Authorization": f"Bearer {_ADMIN_VKEY}"})
     assert r2.status_code == 200
 
 

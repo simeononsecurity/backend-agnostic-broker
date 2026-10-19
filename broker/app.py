@@ -588,6 +588,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         prompt_tokens = completion_tokens = 0
         served_model = alias
         try:
+
             async def _serve(name: str) -> dict:
                 return await manager.chat(
                     name,
@@ -755,6 +756,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         prompt_tokens = completion_tokens = 0
         served_model = model
         try:
+
             async def _serve(name: str) -> dict:
                 return await manager.chat(
                     name,
@@ -915,6 +917,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         prompt_tokens = completion_tokens = 0
         served_model = model
         try:
+
             async def _serve(name: str) -> dict:
                 return await manager.chat(
                     name,
@@ -1011,6 +1014,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         prompt_tokens = 0
         served_model = model
         try:
+
             async def _serve(name: str) -> dict:
                 return await manager.embeddings(
                     name,
