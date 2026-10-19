@@ -92,18 +92,21 @@ class Settings(BaseSettings):
     #   beta: the single tunable exchange-rate between cache benefit and load.
     #     1.0 = "a member at 2x fleet-average load is docked one full cache hit's
     #     worth of preference"; 0.0 = pure prefix affinity (ignore load). Default
-    #     0.25 was chosen from the scripts/bench_routing.py scenario x beta matrix
-    #     (see ADR 0010 / docs/routing-and-health.md): it is the smallest beta that
-    #     keeps the low-pressure pool balanced yet still concentrates prefixes
-    #     enough to roughly double hit rate under cache pressure. beta=1.0
-    #     over-penalized affinity (the approximate index makes the load term swamp
-    #     a real cache hit) and never beat sticky.
-    cache_aware_beta: float = 0.25
+    #     0.5 was chosen from the scripts/bench_routing.py scenario x beta matrix
+    #     under a QUEUEING model (ADR 0018): it is the smallest beta whose
+    #     low-pressure load spread stays within 1.25x AND that is no worse than
+    #     sticky on p95 TTFT in any scenario. ADR 0010 shipped 0.25 from a
+    #     balance-only heuristic because its harness modeled no queueing; once
+    #     load imbalance is priced as latency, 0.25 hot-spots (long_lived spread
+    #     1.35x) and 0.5 is the balanced choice (and matches llm-d/KServe's ~2:1
+    #     prefix:load weighting). beta=1.0 over-spreads and gives up cache reuse.
+    cache_aware_beta: float = 0.5
     # Characters per prefix block (approximate; ~4 chars/token). Larger = smaller
     # index but coarser prefix matching. Only full blocks are hashed.
     cache_aware_block_chars: int = 128
-    # Max prefix-block index entries kept per replica (LRU-evicted). 0 disables
-    # the size bound (TTL still applies).
+    # Max prefix-block index entries kept (LRU-evicted via the StateStore sorted-set
+    # LRU). 0 disables the size bound (TTL still applies). Under Redis this bound is
+    # shared ACROSS replicas (ADR 0018); the TTL is a second, time-based bound.
     cache_aware_max_entries: int = 10000
     # TTL (seconds) on prefix-block index entries, approximating KV-cache
     # residency so stale affinities self-expire. 0 = no expiry.
