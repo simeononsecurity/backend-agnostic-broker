@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import textwrap
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -90,3 +91,41 @@ def test_readme_streaming_example(docs_client):
 def test_readme_health_examples(docs_client):
     assert docs_client.get("/healthz").json()["status"] == "ok"
     assert docs_client.get("/readyz").json()["status"] == "ready"
+
+
+def test_examples_rerank_registry_and_snippet(tmp_path):
+    """examples/rerank/ loads as a registry and its /v1/rerank snippet runs (ADR 0013)."""
+    repo_root = Path(__file__).resolve().parent.parent
+    reg_path = repo_root / "examples" / "rerank" / "registry.yaml"
+    assert reg_path.exists(), "examples/rerank/registry.yaml missing"
+    settings = Settings(
+        auth_enabled=False,
+        api_keys=[],
+        registry_path=str(reg_path),
+        enabled_backends=["fake"],
+    )
+    app = create_app(settings)
+    with TestClient(app) as c:
+        # The fake reranker is advertised as rerank-capable.
+        models = {m["id"]: m for m in c.get("/v1/models").json()["data"]}
+        assert models["rerank-fake"]["capabilities"]["rerank"] is True
+        # The documented request body (from rerank.sh / rerank.py) works.
+        r = c.post(
+            "/v1/rerank",
+            json={
+                "model": "rerank-fake",
+                "query": "What is the capital of France?",
+                "documents": [
+                    "The capital of France is Paris.",
+                    "Bananas are a yellow tropical fruit rich in potassium.",
+                    "Berlin is the capital and largest city of Germany.",
+                ],
+                "top_n": 2,
+                "return_documents": True,
+            },
+        )
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert len(results) == 2
+    assert results[0]["index"] == 0  # the Paris document ranks first
+    assert results[0]["document"]["text"].startswith("The capital of France")

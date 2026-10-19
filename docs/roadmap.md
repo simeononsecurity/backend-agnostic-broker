@@ -12,7 +12,7 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 | 1 | `/v1/completions` + `/v1/responses` (chat-translation shims) | ✅ done | [0006](adr/0006-openai-endpoint-surface.md) |
 | 2 | Usage/token + routing-decision log (`/usage`, SQLite) | ✅ done | [0007](adr/0007-usage-accounting-store.md) |
 | 2b | `/v1/embeddings` (Ollama native + OpenAI-compat passthrough) | ✅ done — verified live against Ollama (nomic-embed-text, 768-dim) | [0006](adr/0006-openai-endpoint-surface.md) |
-| 2c | `/v1/rerank` | 📋 planned | [0006](adr/0006-openai-endpoint-surface.md) |
+| 2c | `/v1/rerank` (Cohere/Jina-compatible; vLLM + llama.cpp passthrough + fake) | ✅ done — verified live against a local llama.cpp `bge-reranker-v2-m3` | [0013](adr/0013-rerank-endpoint.md) |
 
 ## P1 — governance, reliability, routing intelligence
 

@@ -75,6 +75,7 @@ class BackendAdapter(abc.ABC):
                 "streaming": e.supports_streaming,
                 "tools": e.supports_tools,
                 "vision": e.supports_vision,
+                "rerank": e.supports_rerank,
             },
             "gpu": e.gpu.model_dump(),
             "mtp": e.mtp.model_dump(),
@@ -131,6 +132,22 @@ class BackendAdapter(abc.ABC):
             f"backend {self.name!r} does not support embeddings for model {self.entry.alias!r}",
             model=self.entry.alias,
             remediation="request an embedding-capable model (e.g. Ollama nomic-embed-text)",
+        )
+
+    # --- rerank (optional capability; ADR 0013) --------------------------
+    async def rerank(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        """Return a Cohere/Jina-compatible rerank response for ``query`` + ``documents``.
+
+        Default: the backend/model does not support reranking. Backends that do
+        (OpenAI/Cohere-compatible HTTP runtimes: vLLM, llama.cpp) override this.
+        Kept non-abstract so chat-only backends need not implement it.
+        """
+        from ..errors import ValidationError
+
+        raise ValidationError(
+            f"backend {self.name!r} does not support rerank for model {self.entry.alias!r}",
+            model=self.entry.alias,
+            remediation="request a rerank-capable model (a vLLM or llama.cpp reranker)",
         )
 
     # --- status ----------------------------------------------------------

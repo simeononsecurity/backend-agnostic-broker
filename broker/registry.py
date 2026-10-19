@@ -156,6 +156,10 @@ class ModelEntry(BaseModel):
     supports_streaming: bool = True
     supports_tools: bool = False
     supports_vision: bool = False
+    # Whether this model can serve POST /v1/rerank (ADR 0013). A cross-encoder /
+    # reranker runtime (vLLM or llama.cpp with a reranker model) sets this true;
+    # requesting rerank on a model without it returns 400 (fail-closed).
+    supports_rerank: bool = False
 
     # Per-model override of the global keep-alive (ollama) behavior.
     keep_alive: str | None = None

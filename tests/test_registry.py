@@ -31,6 +31,19 @@ def test_backend_filter(fake_registry_file):
     assert reg.models == []
 
 
+def test_supports_rerank_defaults_false_and_parses(tmp_path):
+    p = tmp_path / "rr.yaml"
+    p.write_text(
+        "models:\n"
+        "  - alias: rr\n    backend: fake\n    runtime_model_id: x\n    supports_rerank: true\n"
+        "  - alias: plain\n    backend: fake\n    runtime_model_id: y\n"
+    )
+    reg = load_registry(str(p))
+    by = reg.by_alias()
+    assert by["rr"].supports_rerank is True
+    assert by["plain"].supports_rerank is False  # default
+
+
 def test_unknown_backend_rejected(tmp_path):
     p = tmp_path / "bad.yaml"
     p.write_text("models:\n  - alias: a\n    backend: nope\n    runtime_model_id: x\n")

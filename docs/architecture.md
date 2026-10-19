@@ -47,7 +47,7 @@ transitions.
 
 The data-plane pipeline composes every P1/P2 feature in one fixed order (the same
 order for `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, and — minus
-auto/cascade — `/v1/embeddings`):
+auto/cascade — `/v1/embeddings` and `/v1/rerank`):
 
 > **auth → key limits/budget (ADR 0008) → placement pinning (ADR 0011) → response
 > cache lookup (ADR 0012) → auto/cascade (ADR 0011) → pool selection (ADR 0010
@@ -74,7 +74,7 @@ auto/cascade — `/v1/embeddings`):
    models/pool members carrying **every** required label are eligible, else
    `403 placement_denied` (never spills to a non-compliant model).
 5. **Response cache lookup (ADR 0012)** — if the cache is enabled and the request
-   is cacheable (deterministic-by-default; embeddings always), a key over
+   is cacheable (deterministic-by-default; embeddings and rerank always), a key over
    *(API-key/tenant + placement scope, resolved public model, normalized
    payload + sampling + tools)* is looked up; a hit returns immediately with
    `x-broker-cache: hit` and no inference. Bypass via `Cache-Control: no-cache`/

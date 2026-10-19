@@ -42,6 +42,7 @@ and toggle backends via config. Duplicate aliases are rejected.
 | `supports_streaming` | bool | `true` | Advertised streaming capability. |
 | `supports_tools` | bool | `false` | Advertised tool-call capability. |
 | `supports_vision` | bool | `false` | Advertised vision capability. |
+| `supports_rerank` | bool | `false` | Can serve `POST /v1/rerank` (ADR 0013). A cross-encoder/reranker runtime (vLLM or llama.cpp) sets this true; requesting rerank on a model without it returns 400. Surfaced in `/v1/models` capabilities. |
 | `keep_alive` | str? | _(none)_ | Ollama keep-alive override (per model). |
 | `tags` | list[str] | `[]` | Auto-router class tags, e.g. `code`, `vision`, `reasoning`, `long-context`, `tools`, `json`. Main control surface for `auto`. |
 | `description` | str? | _(none)_ | One-line description shown in the router's candidate table. |

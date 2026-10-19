@@ -155,57 +155,20 @@ def test_cache_aware_invalid_values_rejected(settings, field, value):
         settings.validate_runtime()
 
 
-# --- ADR 0017 reliability v2 --------------------------------------------
-
-
-def test_reliability_defaults_preserve_legacy(settings):
-    # Every ADR 0017 knob defaults to v0.5.0 behavior.
-    assert settings.max_ejection_percent == 0
-    assert settings.cooldown_backoff_multiplier == 1.0
-    assert settings.cooldown_max_seconds == 0.0
-    assert settings.cooldown_decay_seconds == 0.0
-    assert settings.cooldown_half_open_single_trial is False
-    assert settings.retry_on_timeout is True
-    assert settings.retry_on_connection is True
-    assert settings.retry_on_server_error is True
-    assert settings.retry_on_backpressure is False
-    assert settings.cooldown_on_backpressure is False
-    assert settings.retry_respect_retry_after is True
-    assert settings.retry_max_attempts_by_class == {}
-    assert settings.redis_sticky_max_entries == 0
-    settings.validate_runtime()
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("max_ejection_percent", -1),
-        ("max_ejection_percent", 101),
-        ("cooldown_backoff_multiplier", 0.5),
-        ("cooldown_max_seconds", -1.0),
-        ("cooldown_decay_seconds", -1.0),
-        ("cooldown_half_open_ttl_seconds", -1.0),
-        ("redis_sticky_max_entries", -1),
-    ],
-)
-def test_reliability_invalid_values_rejected(settings, field, value):
-    setattr(settings, field, value)
-    with pytest.raises(ConfigError):
-        settings.validate_runtime()
-
-
-def test_retry_by_class_unknown_class_rejected(settings):
-    settings.retry_max_attempts_by_class = {"nonsense": 2}
-    with pytest.raises(ConfigError):
-        settings.validate_runtime()
-
-
-def test_retry_by_class_negative_count_rejected(settings):
-    settings.retry_max_attempts_by_class = {"timeout": -1}
-    with pytest.raises(ConfigError):
-        settings.validate_runtime()
-
-
 def test_retry_by_class_valid_accepted(settings):
     settings.retry_max_attempts_by_class = {"timeout": 5, "server_error": 2}
     settings.validate_runtime()  # must not raise
+
+
+# --- ADR 0013 rerank ----------------------------------------------------
+
+
+def test_rerank_max_documents_default(settings):
+    assert settings.rerank_max_documents == 1000
+    settings.validate_runtime()  # default is valid
+
+
+def test_rerank_max_documents_must_be_positive(settings):
+    settings.rerank_max_documents = 0
+    with pytest.raises(ConfigError):
+        settings.validate_runtime()

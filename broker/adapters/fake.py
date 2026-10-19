@@ -205,6 +205,49 @@ class FakeAdapter(BackendAdapter):
             "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
         }
 
+    async def rerank(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        if not self._ready:
+            raise BackendUnavailableError(
+                "model not ready", backend=self.name, model=self.entry.alias
+            )
+        query = payload.get("query")
+        documents = payload.get("documents")
+        if not query or not isinstance(query, str):
+            from ..errors import ValidationError
+
+            raise ValidationError(
+                "`query` is required and must be a non-empty string", model=self.entry.alias
+            )
+        if not documents or not isinstance(documents, list):
+            from ..errors import ValidationError
+
+            raise ValidationError(
+                "`documents` is required and must be a non-empty list", model=self.entry.alias
+            )
+        # Deterministic lexical-overlap (Jaccard) score so tests can assert
+        # ordering: the document sharing the most query terms ranks first.
+        q_tokens = set(query.lower().split())
+        scored: list[dict[str, Any]] = []
+        total_tokens = len(query.split())
+        for i, doc in enumerate(documents):
+            text = str(doc)
+            total_tokens += len(text.split())
+            d_tokens = set(text.lower().split())
+            union = q_tokens | d_tokens
+            score = (len(q_tokens & d_tokens) / len(union)) if union else 0.0
+            scored.append({"index": i, "relevance_score": score})
+        from ..openai_compat import build_rerank_response
+
+        return build_rerank_response(
+            scored=scored,
+            documents=[str(d) for d in documents],
+            model=self.entry.alias,
+            request_id=request_id,
+            top_n=payload.get("top_n"),
+            return_documents=bool(payload.get("return_documents", False)),
+            usage={"total_tokens": total_tokens},
+        )
+
     async def collect_load(self) -> float | None:
         return self.sim_load
 

@@ -126,6 +126,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     unjustified default change is reverted.
   - Example: `examples/auto-router/` (registry with tags/cost tiers + cascade +
     scorer + buffer + latency budget + placement, a README, and a tested pytest).
+- **`POST /v1/rerank`** (ADR 0013): a Cohere/Jina-compatible reranking endpoint.
+  Request `{model, query, documents (strings or {text} objects), top_n?,
+  return_documents?}`; response `{id, object:"rerank", model, results:[{index,
+  relevance_score, document?}], usage}` — sorted by score descending, `index` is
+  the original ordinal, `document` echoed (as `{text}`) only when
+  `return_documents` is true. Routed by model name (no `auto`) through the same
+  pool/lazy-load/concurrency/failover machinery as `/v1/embeddings`, with per-key
+  scoping, placement, usage logging, and response-cache eligibility
+  (always-deterministic). **vLLM** and **llama.cpp** reranker models are served by
+  an HTTP passthrough to their `/v1/rerank`; the **fake** backend scores by
+  deterministic lexical overlap so CI covers the endpoint. **Ollama and Strata
+  rerank return 400** (Ollama has no native rerank endpoint and the broker refuses
+  the embeddings-cosine substitute; Strata rerank is unverified).
+- **`supports_rerank`** registry capability (default `false`), surfaced in
+  `/v1/models` capabilities; requesting rerank on a model without it returns 400.
+- **`BROKER_RERANK_MAX_DOCUMENTS`** (default `1000`): caps the documents count on
+  `/v1/rerank` (Cohere recommends ≤1,000); the body is still bounded by
+  `BROKER_MAX_REQUEST_BYTES`.
 
 ### Changed
 
@@ -165,6 +183,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `BROKER_CACHE_AWARE_MAX_ENTRIES` bound, so N replicas sharing Redis keep one shared
   bound instead of N× it (the in-process backend is unchanged). The TTL remains a
   second, time-based bound.
+
+### Fixed
+
+- **`/v1/rerank` strict upstream validation** (ADR 0013 follow-up): a malformed
+  reply from a vLLM/llama.cpp reranker is now a `502` (`backend_unavailable`)
+  instead of being passed through (`200`) or crashing (`500`). The broker
+  requires every result to carry a non-bool integer `index` in
+  `[0, len(documents))` that is unique across the response, and a finite numeric
+  `relevance_score`; out-of-range/negative/duplicate/non-integer/boolean indices,
+  non-numeric or `NaN`/`Infinity` scores, non-JSON bodies, and missing/wrong
+  `results` arrays all fail closed. A malformed body is never partially emitted,
+  silently coerced, or written to the response cache, and it participates in pool
+  failover/cooldown. The response `id` is always broker-generated
+  (`rerank-<request_id>`); the upstream `id` is no longer echoed. A shared
+  non-JSON guard also hardens the chat and (non-stream) embeddings passthroughs
+  against the same latent `500`. Reconciled with ADR 0017: upstream HTTP errors on
+  `/v1/rerank` now raise the typed `UpstreamHTTPError` (classified by status) like
+  chat/embeddings, so a genuine upstream 4xx/429/503 follows the per-error policy.
 
 ### Notes
 
