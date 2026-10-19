@@ -535,10 +535,10 @@ class AutoRouter:
             budget,
         )
         if cache_key in self._cache:
-            pick = self._cache[cache_key]
+            cached = self._cache[cache_key]
             self._cache.move_to_end(cache_key)
             return self._finish(
-                pick, "cache", flags, message, cand_ids, candidates, t0, req_place, budget, None
+                cached, "cache", flags, message, cand_ids, candidates, t0, req_place, budget, None
             )
 
         # Hard overrides (data) bypass the classifier when their target is capable.

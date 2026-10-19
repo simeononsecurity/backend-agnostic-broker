@@ -375,7 +375,10 @@ class Settings(BaseSettings):
             )
 
     def _has_keys_file(self) -> bool:
-        return bool(self.keys_path) and Path(self.keys_path).exists()
+        p = self.keys_path
+        if not p:
+            return False
+        return Path(p).exists()
 
     def allowed_backend_bases(self, registry) -> list[str]:
         bases: list[str] = list(self.extra_allowed_backend_urls)

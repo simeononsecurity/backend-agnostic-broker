@@ -121,6 +121,18 @@ class Governor:
         return int(round(prompt_tokens * inp + completion_tokens * out))
 
     # --- admission -------------------------------------------------------
+    @staticmethod
+    def _uid(principal: Principal) -> str:
+        """Counter id for a LIMITED principal.
+
+        Only reached after the unlimited early-return, and every limited principal
+        is a virtual key with a stable id. Fail closed if that invariant is ever
+        broken rather than metering an anonymous ``None`` bucket shared by callers.
+        """
+        if principal.usage_id is None:
+            raise RuntimeError("limited principal has no usage_id; refusing to meter it")
+        return principal.usage_id
+
     async def admit(self, principal: Principal, est_tokens: int = 0) -> Admission:
         """Reserve capacity and check rpm/tpm/budgets BEFORE dispatch.
 
@@ -133,7 +145,7 @@ class Governor:
         if principal.unlimited or not lim.any_limit:
             return Admission(headers={}, reservation=None)
 
-        uid = principal.usage_id
+        uid = self._uid(principal)
         now = time.time()
         now_dt = _utc_now()
         reserved_concurrency = False
@@ -192,7 +204,7 @@ class Governor:
 
     async def _check_budgets(self, principal: Principal, now_dt: _dt.datetime) -> None:
         lim = principal.limits
-        uid = principal.usage_id
+        uid = self._uid(principal)
         if lim.daily_token_budget is not None:
             spent = await self.state.get_counter(self._tok_budget_key(uid, "d", now_dt))
             if spent >= lim.daily_token_budget:
@@ -248,7 +260,7 @@ class Governor:
         if reservation is None:
             return
         lim = reservation.limits
-        uid = principal.usage_id
+        uid = reservation.usage_id
         now = time.time()
         now_dt = _utc_now()
         total = max(0, int(prompt_tokens)) + max(0, int(completion_tokens))
@@ -312,7 +324,7 @@ class Governor:
         self, principal: Principal, now: float, now_dt: _dt.datetime
     ) -> dict[str, str]:
         lim = principal.limits
-        uid = principal.usage_id
+        uid = self._uid(principal)
         rpm_count = None
         tpm_count = None
         if lim.rpm is not None:
