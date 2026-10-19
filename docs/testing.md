@@ -13,13 +13,14 @@ so they exercise the real request path, lifecycle, locking, and security
 boundaries without any external runtime. The suite is CPU-only; optional GPU
 tests (if added) should be marked and excluded from CI.
 
-In the default CPU venv, 342 pass and 26 skip — the skips are the Redis-backed
-`StateStore` paths (counters, prefix index, response cache) and the OpenTelemetry
-span path, which need the optional `redis`/`otel` extras. In a venv with
-`pip install -e '.[dev,redis,otel]'` those run too: **366 passed, 2 skipped**
-(the remaining 2 are import-guard paths that only fire when a package is *absent*).
+In the default CPU venv, 362 pass and 28 skip — the skips are the Redis-backed
+`StateStore` paths (counters, prefix index, response cache, prefix-index sorted-set
+LRU) and the OpenTelemetry span path, which need the optional `redis`/`otel` extras.
+In a venv with `pip install -e '.[dev,redis,otel]'` those run too: **388 passed, 2
+skipped** (the remaining 2 are import-guard paths that only fire when a package is
+*absent*).
 
-## Coverage map (368 collected)
+## Coverage map (390 collected)
 
 | File | Tests | Covers |
 |------|-------|--------|
@@ -32,8 +33,8 @@ span path, which need the optional `redis`/`otel` extras. In a venv with
 | `tests/test_sticky.py` | 9 | Sticky session routing: pin by header/`user`/IP, distinct-session spread, re-pin on failure, LRU bound, `/status`. |
 | `tests/test_retry.py` | 8 | Retries + full-jitter backoff (ADR 0009): backoff bounds, default single-pass-no-sleep, retries stay within the pool (never cross-model), attempt cap, transient recovery, no retry mid-stream. |
 | `tests/test_cooldown.py` | 5 | Member cooldowns (ADR 0009): bench after N failures + selection skip, half-open trial after expiry, success resets, `/status` + `/healthz/backends` visibility, default-off. |
-| `tests/test_cache_routing.py` | 26 | Cache-aware routing (ADR 0010): prompt normalization + chained block hashing, longest-prefix match, LRU/TTL index eviction, hit-rate stats, vLLM `/metrics` parse; manager routing (warm-member reuse, no-match→least_busy, load flips choice, beta=0 affinity, 3-member longest-prefix); invariants (unhealthy/cooldown excluded, failover, single-member, sticky map untouched, default builds no router, embeddings); StateStore index in-process + Redis (fakeredis); bench smoke run. |
-| `tests/test_bench_routing.py` | 5 | Cache-aware **default-β regression** (ADR 0010 follow-up): drives `scripts/bench_routing.py` seeded scenarios through the real manager and pins that the config default β (0.25) beats `sticky` on hit rate *and* TTFT p95 for `cache_pressure` + `cross_session`, roughly doubles the cache-pressure hit rate, and respects the low-pressure load-balance bound the default was selected by. |
+| `tests/test_cache_routing.py` | 31 | Cache-aware routing (ADR 0010/0018): prompt normalization + chained block hashing, longest-prefix match, LRU/TTL index eviction, hit-rate stats, vLLM `/metrics` parse; manager routing (warm-member reuse, no-match→least_busy, load flips choice, beta=0 affinity, 3-member longest-prefix); invariants (unhealthy/cooldown excluded, failover, single-member, sticky map untouched, default builds no router, embeddings); StateStore index in-process + Redis (fakeredis); **sorted-set LRU size bound (ADR 0018) in-process + Redis + a cross-replica shared-bound test**; bench smoke run. |
+| `tests/test_bench_routing.py` | 19 | Queueing-model routing bench (ADR 0018): pins the re-validated config default β (`0.5`) beats `sticky` on hit rate *and* p95 TTFT (incl. queueing) for `cache_pressure`/`cross_session`, holds the 1.25× low-pressure balance bound while β=0.25 now breaks it; model correctness (percentile ordering, bounded utilization, throughput ≤ offered, uniform⇒symmetric queues, zero-cache⇒cache_aware≈least_busy, β monotonicity); β selection-rule unit tests + a real-matrix integration test; `--smoke` CLI. |
 | `tests/test_state.py` | 31 | `StateStore` contract parametrized over in-process + Redis (fakeredis, skips if absent): sticky/LRU, counters + sliding window, cooldown transitions, half-open claim, bytes/JSON KV, factory fail-fast. |
 | `tests/test_health_probe.py` | 8 | Non-loading health: `/healthz/backends`, periodic probe marks dead backends failed (never loads), `/api/ps` aggregation. |
 | `tests/test_router.py` | 29 | `auto` router: flag extraction, Stage-1 capability filter, overrides, heuristic task routing, fallback, cache, GBNF/prompt builders, manager + API end-to-end. |
@@ -51,6 +52,7 @@ span path, which need the optional `redis`/`otel` extras. In a venv with
 | `tests/test_unload.py` | 4 | Idle unload sweep; unload while idle; not while serving. |
 | `tests/test_security.py` | 17 | SSRF guard, path traversal, executable allow-list, flag/shell-injection rejection, no-shell argv. |
 | `tests/test_docs_examples.py` | 4 | Documentation/API examples run against the real API. |
+| `tests/test_examples_cache_aware.py` | 3 | `examples/cache-aware-routing/` is real (ADR 0018): the registry parses into the 3-member `chat` pool, `.env.example` encodes `cache_aware`/`β=0.5` matching the config default, and those settings drive cache-aware selection end-to-end on the fake backend (repeat prefix → warm member; `/status.cache_aware` stats populated). |
 | `tests/test_cache.py` | 18 | Response cache (ADR 0012): key stability + scope/model/endpoint isolation, sampling/tools/format in key, deterministic-only default, hit/miss/bypass headers, per-key isolation, errors-not-cached, embeddings cached, disabled pass-through, StateStore-backed roundtrip + TTL + LRU eviction + max-bytes. |
 | `tests/test_admin.py` | 19 | Admin runtime control (ADR 0012): disabled blocks, admin-key required, model list, load/unload, refuse/drain/timeout on in-flight, draining member skipped, registry reload add/remove, unchanged-instance kept, invalid-registry rollback; **admin scope reconciliation** — non-ASCII/over-long admin key → 401 (not 500) on every header, and an ADR 0008 admin-scope virtual key authorizes `/admin` while a user-scope key is denied. |
 | `tests/test_tracing.py` | 4 | Tracing (ADR 0012): no-op when disabled, app serves with tracing off, `ConfigError` when enabled without otel (skipped if installed), `gen_ai.*` spans asserted via in-memory exporter with **no content captured** (skipped without the SDK). |

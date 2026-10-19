@@ -4,6 +4,38 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Cache-aware routing: default `BROKER_CACHE_AWARE_BETA` changed `0.25` → `0.5`**
+  (ADR 0018). The ADR 0010 benchmark modeled no queueing, so its default was chosen
+  from a balance-only heuristic. `scripts/bench_routing.py` now runs a **discrete-event
+  queueing simulation** of continuous-batching pool members (per-member `nmax` slots,
+  `t_iter(n)=W+H·n`, prefill ∝ uncached prefix tokens, decode ∝ output tokens,
+  **TTFT = queue wait + prefill**), reporting TTFT **p50/p95/p99 incl. queueing**,
+  throughput, and per-member utilization. Re-measured against it, `β=0.25` breaks the
+  1.25× low-pressure balance bound (hot-spots) and leaves a real tail; `β=0.5` is the
+  smallest β that stays balanced and is no worse than `sticky` on p95 in every
+  scenario (and matches the llm-d/KServe ≈2:1 prefix:load weighting). `sticky` remains
+  the default *strategy*; this only affects deployments that opted into `cache_aware`
+  without setting β. New bench flags: `--select-beta`, `--load-signal`.
+- **Cache-aware prefix index size bound is now cross-replica under Redis** (ADR 0018):
+  a new `StateStore` sorted-set LRU (`zlru_touch`/`zlru_trim`/`zlru_size`) backs the
+  `BROKER_CACHE_AWARE_MAX_ENTRIES` bound, so N replicas sharing Redis keep one shared
+  bound instead of N× it (the in-process backend is unchanged). The TTL remains a
+  second, time-based bound.
+
+### Added
+
+- **ADR 0018** (`docs/adr/0018-cache-aware-v2.md`) + research note
+  (`docs/research/adr-0018-cache-aware-v2.md`): resolves every ADR 0010 deferral —
+  queueing-model bench + re-validated β (implemented), cross-replica Redis LRU
+  (implemented), and output-length/queue-aware load signal, token-ID hashing, precise
+  KV-event index, and Preble autoscaling (all **Rejected** with rationale/data).
+- **`examples/cache-aware-routing/`**: a runnable 3-member pool example (registry,
+  `.env`, README with bench + `/status` walkthrough), tested against the fake backend.
+
 ## [0.5.0] - 2026-10-19
 
 ### Added

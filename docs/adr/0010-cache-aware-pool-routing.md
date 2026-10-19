@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-19
 - Supersedes: none (extends ADR 0003 routing, builds on ADR 0009 StateStore)
+- Extended by: ADR 0018 (queueing-model bench, re-validated default β=0.5, cross-replica Redis LRU, ADR 0010 deferrals resolved)
 - Related: `docs/roadmap.md` item 6; `docs/routing-and-health.md`;
   `docs/research/adr-0010-cache-aware-pool-routing.md` (cited prior art); prior
   art: vLLM production-stack `LoadAwareRouter`, llm-d inference scheduler, SGLang
