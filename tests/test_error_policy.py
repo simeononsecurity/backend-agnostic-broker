@@ -208,16 +208,39 @@ async def test_client_error_not_retried_or_benched(tmp_path, monkeypatch):
     await mgr.shutdown()
 
 
-async def test_backpressure_not_retried_by_default(tmp_path, monkeypatch):
+async def test_backpressure_fails_over_to_healthy_member(tmp_path, monkeypatch):
+    # ADR 0017 (follow-up): upstream backpressure (429) always fails over to a
+    # healthy member — immediately and without opt-in — and never sleep-retries
+    # that member. node-a 429s, node-b serves.
     mgr = _mgr(tmp_path)
     monkeypatch.setattr(asyncio, "sleep", _noop_sleep)
     calls = _instrument(
         mgr, lambda a, n: ConcurrencyLimitError("busy", model=a) if a == "node-a" else None
     )
     await mgr.state.sticky_set("chat", "s", "node-a")
+    out = await mgr.chat("chat", _msg(), "r0", route_key="s")
+    assert out["choices"][0]["message"]["content"] == "echo: node-b"
+    assert calls["node-a"] == 1 and calls["node-b"] == 1
+    await mgr.shutdown()
+
+
+async def test_backpressure_lone_member_returns_429_no_sleep(tmp_path, monkeypatch):
+    # With no healthy member to fail over to, backpressure is NOT sleep-retried by
+    # default: the 429 is returned to the client (clients self-pace) and no sleep
+    # happens. Both members 429 here.
+    mgr = _mgr(tmp_path, retry_max_attempts=3, request_timeout_seconds=300)
+    slept: list[float] = []
+
+    async def fake_sleep(d):
+        slept.append(d)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    calls = _instrument(mgr, lambda a, n: ConcurrencyLimitError("busy", model=a))
     with pytest.raises(ConcurrencyLimitError):
-        await mgr.chat("chat", _msg(), "r0", route_key="s")
-    assert calls["node-a"] == 1 and calls["node-b"] == 0
+        await mgr.chat("chat", _msg(), "r0")
+    # One failover pass over the two members, then stop — no sleep-retry.
+    assert calls["node-a"] == 1 and calls["node-b"] == 1
+    assert slept == []
     await mgr.shutdown()
 
 
@@ -262,7 +285,35 @@ async def test_cooldown_counts_only_configured_classes(tmp_path, monkeypatch):
     await mgr.shutdown()
 
 
-async def test_upstream_retry_after_honored_within_budget(tmp_path, monkeypatch):
+async def test_upstream_retry_after_immediate_failover_no_sleep(tmp_path, monkeypatch):
+    # ADR 0017 (follow-up): when a healthy member is available, a Retry-After is
+    # NOT slept — the broker fails over immediately and benches the throttled one.
+    mgr = _mgr(tmp_path, cooldown_failures=1)
+    slept: list[float] = []
+
+    async def fake_sleep(d):
+        slept.append(d)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    def raiser(a, n):
+        if a == "node-a":
+            return ConcurrencyLimitError("slow down", model=a, headers={"Retry-After": "2"})
+        return None
+
+    _instrument(mgr, raiser)
+    await mgr.state.sticky_set("chat", "s", "node-a")
+    out = await mgr.chat("chat", _msg(), "r0", route_key="s")
+    assert out["choices"][0]["message"]["content"] == "echo: node-b"
+    assert slept == []  # immediate failover, no sleep
+    # The throttled member is benched for (clamped) Retry-After, not the client's.
+    assert (await mgr.state.get_cooldown("node-a")).in_cooldown
+    await mgr.shutdown()
+
+
+async def test_upstream_retry_after_sleeps_only_when_no_other_member(tmp_path, monkeypatch):
+    # With no healthy member available, a sleep-retryable backpressure waits the
+    # upstream Retry-After (clamped) before retrying — bounded, never unbounded.
     mgr = _mgr(
         tmp_path,
         retry_on_backpressure=True,
@@ -275,20 +326,16 @@ async def test_upstream_retry_after_honored_within_budget(tmp_path, monkeypatch)
         slept.append(d)
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-
-    # node-a returns a 429 carrying Retry-After: 2; node-b then serves.
-    def raiser(a, n):
-        if a == "node-a":
-            return ConcurrencyLimitError("slow down", model=a, headers={"Retry-After": "2"})
-        return None
-
-    _instrument(mgr, raiser)
-    await mgr.state.sticky_set("chat", "s", "node-a")
-    out = await mgr.chat("chat", _msg(), "r0", route_key="s")
-    assert out["choices"][0]["message"]["content"] == "echo: node-b"
-    # The single retry waited exactly the upstream-advertised 2s (not the jittered
-    # backoff, which would be 0 here since base_ms defaults to 0).
-    assert slept == [pytest.approx(2.0)]
+    # Both members 429 with Retry-After: 2 → one failover pass (no sleep), then a
+    # sleep-retry round that waits the advertised 2s.
+    _instrument(
+        mgr,
+        lambda a, n: ConcurrencyLimitError("slow down", model=a, headers={"Retry-After": "2"}),
+    )
+    with pytest.raises(ConcurrencyLimitError):
+        await mgr.chat("chat", _msg(), "r0")
+    assert slept  # at least one sleep happened
+    assert all(d == pytest.approx(2.0) for d in slept)  # each clamped to Retry-After
     await mgr.shutdown()
 
 
