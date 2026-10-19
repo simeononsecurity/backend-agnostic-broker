@@ -116,9 +116,10 @@ def _logprob_confidence(result: dict) -> float | None:
 def reliability_score(result: dict, cfg: CascadeConfig) -> tuple[float, dict]:
     """Calibrated reliability score in ``[0, 1]`` for a cascade first-hop answer.
 
-    Combines data-driven features (answer length adequacy, refusal match,
-    truncation, and — when available — mean token probability) into one weighted
-    score; higher means keep, lower means escalate. Pure and dependency-free.
+    Graded part (tunable): a weighted mean of answer-length adequacy and — when
+    the response carries token logprobs — mean token probability. Hard safety
+    gates: a refusal match or a truncation caps the score to 0 so it always
+    escalates (parity with the v0.5.0 booleans). Pure and dependency-free.
     Returns ``(score, features)`` where ``features`` is a breakdown for logging.
     """
     sc = cfg.scorer
@@ -129,25 +130,21 @@ def reliability_score(result: dict, cfg: CascadeConfig) -> tuple[float, dict]:
     text = content.strip() if isinstance(content, str) else ""
 
     f_length = min(1.0, len(text) / float(sc.target_chars))
-    refused = any(_safe_search(p, text) for p in cfg.refusal_patterns)
-    f_refusal = 0.0 if refused else 1.0
-    f_finish = 0.0 if finish == "length" else 1.0
     conf = _logprob_confidence(result)
-
-    feats: list[tuple[float, float]] = [
-        (sc.weight_length, f_length),
-        (sc.weight_refusal, f_refusal),
-        (sc.weight_finish, f_finish),
-    ]
+    graded: list[tuple[float, float]] = [(sc.weight_length, f_length)]
     if conf is not None:
-        feats.append((sc.weight_logprob, conf))
-    wsum = sum(w for w, _ in feats)
-    score = (sum(w * v for w, v in feats) / wsum) if wsum > 0 else 1.0
+        graded.append((sc.weight_logprob, conf))
+    wsum = sum(w for w, _ in graded)
+    graded_score = (sum(w * v for w, v in graded) / wsum) if wsum > 0 else 1.0
+
+    refused = sc.gate_refusal and any(_safe_search(p, text) for p in cfg.refusal_patterns)
+    truncated = sc.gate_truncation and finish == "length"
+    score = 0.0 if (refused or truncated) else graded_score
     breakdown = {
         "score": round(score, 4),
         "length": round(f_length, 4),
-        "refusal": f_refusal,
-        "finish": f_finish,
+        "refused": refused,
+        "truncated": truncated,
         "logprob": (round(conf, 4) if conf is not None else None),
     }
     return score, breakdown

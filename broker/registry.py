@@ -288,13 +288,19 @@ class ScorerConfig(BaseModel):
     """Calibrated reliability scorer for cascade escalation (ADR 0019, opt-in).
 
     When ``enabled``, the cheap hop's answer is reduced to a single reliability
-    score in ``[0, 1]`` (higher = keep) from data-driven features — answer length
-    adequacy, refusal match, truncation (``finish_reason == "length"``), and, when
-    the response carries token logprobs, the mean token probability. The hop
-    escalates when ``score < threshold``. This unifies the fixed boolean signals
-    into one tunable operating point (slide ``threshold`` up to demand more
-    certainty / escalate more). Default-off: the boolean signals remain the
-    default so v0.5.0 behavior is unchanged.
+    score in ``[0, 1]`` (higher = keep); the hop escalates when ``score <
+    threshold``. The score has two parts:
+
+    * **Graded features** (the tunable part): answer-length adequacy and, when the
+      response carries token logprobs, mean token probability — a weighted mean.
+    * **Hard safety gates** (parity with the boolean signals): a refusal match or
+      a truncation (``finish_reason == "length"``) caps the score to 0 so it
+      always escalates, exactly like v0.5.0's booleans. Each gate is toggleable.
+
+    This gives operators one calibrated threshold to slide (how short / how
+    unconfident is "too unreliable") instead of juggling several booleans, while
+    keeping the hard refusal/truncation safety behavior. Default-off: the boolean
+    signals remain the default, so v0.5.0 behavior is unchanged.
     """
 
     model_config = {"extra": "forbid"}
@@ -304,12 +310,12 @@ class ScorerConfig(BaseModel):
     threshold: float = 0.5
     # Answer length (chars, stripped) at which the length feature saturates to 1.
     target_chars: int = 200
-    # Non-negative feature weights; the score is their weighted mean over the
-    # features actually present (logprob is skipped when the response has none).
-    weight_length: float = 0.4
-    weight_refusal: float = 0.4
-    weight_finish: float = 0.2
+    # Non-negative weights for the graded features (length, logprob).
+    weight_length: float = 1.0
     weight_logprob: float = 0.0
+    # Hard safety gates that cap the score to 0 (always escalate) when they fire.
+    gate_refusal: bool = True
+    gate_truncation: bool = True
 
     @field_validator("threshold")
     @classmethod
@@ -325,7 +331,7 @@ class ScorerConfig(BaseModel):
             raise ValueError("cascade.scorer.target_chars must be >= 1")
         return v
 
-    @field_validator("weight_length", "weight_refusal", "weight_finish", "weight_logprob")
+    @field_validator("weight_length", "weight_logprob")
     @classmethod
     def _weight(cls, v: float) -> float:
         if v < 0:
