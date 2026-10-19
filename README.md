@@ -36,6 +36,26 @@ backend over the network, all with copy-paste examples.
   deterministic fallback. The LLM classifier ships self-contained in the **`-llm`**
   image; prioritize models via registry `tags` / `priority` / `cost_tier` /
   `overrides`. See [docs/auto-router.md](docs/auto-router.md).
+- **Per-key governance** (ADR 0008, opt-in): hashed **virtual keys** (`user`/`admin`
+  scope) with per-key rpm/tpm/concurrency limits, daily/monthly **token & cost
+  budgets**, and fail-closed `allowed_models` — OpenAI-style `429`
+  `rate_limit_exceeded`/`insufficient_quota` + `x-ratelimit-*`, scoped `/usage`.
+  Legacy flat `BROKER_API_KEYS` still work as unlimited keys.
+- **Routing reliability & scale** (ADR 0009): transparent **retries** with
+  full-jitter backoff and per-member **cooldowns** (circuit breaker), both within a
+  model's pool (never a different model), and an optional **Redis**-backed shared
+  state so multiple broker replicas share sticky/counter/cache state.
+- **Cache-aware pool routing** (ADR 0010, opt-in `BROKER_ROUTE_STRATEGY=cache_aware`):
+  route to the member that already holds a request's prompt **prefix** (warm KV
+  cache), scored against relative load.
+- **Auto-router evolution** (ADR 0011, opt-in): **cascade** mode (serve cheap,
+  escalate once on a quality signal), **latency-budget** routing, fail-closed
+  **placement / data-residency pinning**, and an offline RouteLLM **eval harness**.
+- **Caching, runtime control & observability** (ADR 0012, all default-off): an exact
+  **response cache** (scope-isolated, `x-broker-cache` header), an **admin** control
+  plane (runtime unload/load + transactional registry hot-reload) behind an
+  admin-scoped key, and optional **OpenTelemetry** tracing (`gen_ai.*` spans, no
+  content).
 - Broker-managed process supervision for runtimes that only load a model at
   process startup (vLLM, llama.cpp, Strata); native lazy loading for Ollama.
 - Per-model load locking, configurable global/per-model concurrency, idle unload

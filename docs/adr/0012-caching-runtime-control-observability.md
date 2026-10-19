@@ -102,13 +102,21 @@ page (strict CSP, no external CDN, key in memory only) is real work orthogonal t
 the three backend features; the admin + cache APIs are the substrate a future UI
 would consume. Recorded as deferred here and in the roadmap.
 
-### Admin-scope seam (parallel work: ADR 0008)
+### Admin-scope seam (resolved in integration with ADR 0008)
 
-ADR 0008 introduces virtual keys with `user|admin` scopes. Until it lands, the
-admin surface is gated by a minimal `BROKER_ADMIN_API_KEYS` list behind a small,
-clearly-isolated `check_admin`/`require_admin` dependency (`broker/auth.py`,
-`broker/app.py`). This is the **single swap point**: the integrator replaces the
-key-list check with 0008's admin-scope check without touching any route.
+ADR 0008 introduces virtual keys with `user|admin` scopes. This ADR shipped the
+admin surface behind a small, clearly-isolated `require_admin` dependency
+(`broker/app.py`) with a minimal `BROKER_ADMIN_API_KEYS` list as its single swap
+point. **In the `integration/p1-p2` integration that swap is done:** `require_admin`
+now authorizes a request by **either** a virtual key whose scope is `admin`
+(resolved through the ADR 0008 key store) **or** a `BROKER_ADMIN_API_KEYS` value
+(retained as a documented back-compat source). Both are compared **byte-wise** so a
+non-ASCII/over-long admin key fails closed with a clean `401` (not a `500`), and the
+admin surface stays locked even when data-plane auth is disabled. Config validation
+accepts a `BROKER_KEYS_PATH` (admin-scope key source) as an alternative to
+`BROKER_ADMIN_API_KEYS`. Regression tests: `tests/test_admin.py`
+(`test_admin_non_ascii_key_401_not_500`, `test_admin_scope_virtual_key_authorizes`,
+`test_user_scope_virtual_key_denied_on_admin`).
 
 ## Alternatives considered
 

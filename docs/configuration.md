@@ -276,14 +276,16 @@ bypass. Per-request bypass via `Cache-Control: no-cache`/`no-store` or
 ## Admin runtime control (ADR 0012)
 
 Privileged control plane (`GET /admin/models`, model unload/load, registry
-hot-reload), **default off**. When enabled it is gated by a **dedicated** admin
-key list — intentionally separate from `BROKER_API_KEYS` so a future virtual-key
-admin scope (ADR 0008) can replace it without touching routes.
+hot-reload), **default off**. When enabled, a request is authorized by **either**
+an ADR 0008 virtual key whose scope is `admin` **or** a value in the dedicated
+`BROKER_ADMIN_API_KEYS` list — both intentionally separate from an ordinary
+data-plane key, and both compared byte-wise (a malformed key is a clean `401`, not
+a `500`). The admin surface stays locked even when data-plane auth is disabled.
 
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
-| `BROKER_ADMIN_ENABLED` | bool | `false` | Expose `/admin/*`. When off, the routes return a structured `admin_disabled` error. |
-| `BROKER_ADMIN_API_KEYS` | list[str] | `[]` | Admin keys (presented as `X-Admin-Key`, or `Authorization: Bearer`). **Required** when admin is enabled and auth is on. |
+| `BROKER_ADMIN_ENABLED` | bool | `false` | Expose `/admin/*`. When off, the routes return a structured `admin_disabled` error (HTTP 400). |
+| `BROKER_ADMIN_API_KEYS` | list[str] | `[]` | Admin keys (presented as `X-Admin-Key`, or `Authorization: Bearer`). When admin + auth are on, you must configure **either** this **or** a `BROKER_KEYS_PATH` holding an `admin`-scope virtual key; startup fails fast otherwise. |
 | `BROKER_ADMIN_DRAIN_TIMEOUT_SECONDS` | float | `30` | How long `unload ?drain=true` / registry reload waits for in-flight requests to finish before giving up. |
 
 ## Web UI / playground (ADR 0012) — deferred
