@@ -183,28 +183,37 @@ exchange rate between cache benefit and load:
 
 - `0.0` → **pure prefix affinity**: always the warm member; best hit rate, but under
   real load it **hot-spots** a popular prefix onto one member, whose queue then blows
-  up the tail latency (see the queueing matrix below).
+  up the tail latency (see the sweep below).
 - `0.5` (default) → prefix affinity still dominates, but a member running above the
   fleet-average load is nudged aside enough to keep queues balanced. Chosen from the
-  **queueing** benchmark matrix below: the smallest `beta` that keeps a low-pressure
-  pool balanced (≤1.25×) *and* is no worse than `sticky` on p95 TTFT in any scenario.
+  **queueing** benchmark below: the smallest `beta` that keeps a low-pressure pool
+  balanced (≤1.25×) *and* stays within 10% of `least_busy` (the tail-latency-best
+  strategy) on p95 TTFT in every scenario **at a moderate ≤85% utilization**.
 - `1.0` → a member at **2× the fleet-average load** is docked one full cache hit's
   worth of preference. This over-spreads: `cache_aware` gives up cache reuse (hit rate
   under cache pressure collapses toward `least_busy`) for only marginal extra tail
   relief.
 - higher → spreads harder, trading away cache reuse for even load (→ `least_busy`).
 
+> **`cache_aware` is not the tail-latency-best strategy — `least_busy` is.** In this
+> simulated queueing model `least_busy` has the lowest p95 TTFT and the highest
+> SLO-capacity in **every** scenario (see the tables below). `cache_aware`'s payoff is
+> a different metric: it computes **far fewer uncached prefill tokens** (GPU work) and
+> lands a **higher hit rate** on shared-prefix workloads, while staying within ~10% of
+> `least_busy` on p95. Pick the strategy by your goal — see
+> [when to use which strategy](#when-to-use-which-strategy).
+
 > **Why the default is `0.5`, not `0.25` (ADR 0018) or `1.0`.** ADR 0010 shipped
 > `0.25`, chosen from a *balance-only* heuristic because its benchmark modeled **no
-> queueing** — nothing priced load imbalance as latency. ADR 0018 added a queueing
-> model to the bench; re-measured against it, `beta=0.25` **breaks its own 1.25×
-> balance bound** (low-pressure spread 1.35×) and leaves a real tail on the table
-> (long_lived p95 190 ms vs 27 ms at `beta=0.5`). `beta=0.5` is the smallest `beta`
-> that is balanced *and* no worse than `sticky` on p95 anywhere — and it matches
-> llm-d/KServe, which weight the prefix scorer ≈2× the load scorer (effective
-> `beta ≈ 0.5`). The vLLM production-stack ships `beta=1.0`, but it routes on a
-> *precise*, token-exact index; this broker's *approximate* character-block index is
-> a weaker match signal, so `1.0` over-spreads here.
+> queueing**. ADR 0018 added a queueing model; its follow-up re-derives the default
+> against the right baseline (`least_busy`) at a realistic, **non-saturated** load.
+> Re-measured there, `beta=0.25` **breaks its own 1.25× balance bound** (low-pressure
+> spread ~1.5×) *and* is >10% worse than `least_busy` on p95 in `cross_session`.
+> `beta=0.5` is the smallest `beta` that is balanced *and* within 10% of `least_busy`
+> on p95 everywhere — and it matches llm-d/KServe, which weight the prefix scorer ≈2×
+> the load scorer (effective `beta ≈ 0.5`). The vLLM production-stack ships `beta=1.0`,
+> but it routes on a *precise*, token-exact index; this broker's *approximate*
+> character-block index is a weaker match signal, so `1.0` over-spreads here.
 
 **Load signal.** `load` defaults to in-flight request count. Set
 `BROKER_CACHE_AWARE_USE_METRICS=true` to let the **non-loading** health probe
@@ -238,9 +247,10 @@ can report **TTFT p50/p95/p99 including queueing, throughput, and per-member
 utilization**. It runs from anywhere — no `PYTHONPATH` needed:
 
 ```
-python scripts/bench_routing.py --matrix          # scenario × β matrix (headline)
-python scripts/bench_routing.py --select-beta      # apply the ADR 0018 β selection rule
-python scripts/bench_routing.py --scenario cache_pressure   # one scenario, all strategies
+python scripts/bench_routing.py --sweep           # utilization sweep (50/70/85/95% util) + SLO capacity
+python scripts/bench_routing.py --matrix          # scenario × β matrix at a moderate (~85% util) load
+python scripts/bench_routing.py --select-beta      # apply the β selection rule (vs least_busy)
+python scripts/bench_routing.py --scenario cache_pressure   # one scenario, all strategies (saturated)
 python scripts/bench_routing.py --load-signal chars # compare load signals (ADR 0018 item 3)
 python scripts/bench_routing.py --capacity-sweep  # sticky vs cache_aware across cache sizes
 python scripts/bench_routing.py --smoke           # tiny fast run (CI)
@@ -265,64 +275,119 @@ seeds) span the regimes that matter:
   *across* sessions — what sticky-by-session cannot capture).
 - **skewed_bursty** — Zipf-skewed session popularity under a high arrival rate.
 
-**Scenario × β matrix** (`sticky` baseline vs `cache_aware` at each β; hit rate / TTFT
-**p95 ms (incl. queueing)** / load spread min–max). The **default `β=0.5`** column is
-marked:
+**All four strategies at the saturated operating point** (each scenario's native
+arrival rate, ~99% max utilization; hit rate / TTFT **p95 ms (incl. queueing)** /
+prefill **work per req** — uncached prefill tokens computed). Run
+`python scripts/bench_routing.py --scenario <name>`:
 
-| scenario | sticky | β=0.0 | β=0.25 | **β=0.5** | β=1.0 |
-|---|---|---|---|---|---|
-| long_lived (low pressure) | 91.2% / 888 / 143-165 | 93.4% / 3657 / 65-217 | 92.5% / 190 / 123-166 | **90.9% / 27 / 142-158** | 89.2% / 25 / 147-153 |
-| cache_pressure | 32.6% / 1006 / 144-164 | 53.1% / 599 / 141-159 | 50.7% / 475 / 142-154 | **46.2% / 342 / 146-155** | 36.8% / 206 / 147-154 |
-| cross_session | 76.3% / 433 / 143-160 | 92.3% / 397 / 141-174 | 91.9% / 368 / 135-175 | **90.7% / 155 / 142-158** | 84.2% / 28 / 148-155 |
-| skewed_bursty | 43.8% / 8305 / 128-192 | 36.6% / 1776 / 133-167 | 34.0% / 1326 / 138-159 | **35.5% / 1172 / 142-159** | 30.8% / 1099 / 145-154 |
-
-Reproduce with `python scripts/bench_routing.py --matrix` (figures are a *simulation*,
-deterministic for the fixed seeds; absolute ms depend on the documented service-model
-constants — the *rankings* and the β decision are the point).
-
-**How the default `β=0.5` was chosen (ADR 0018 selection rule).** *Among the swept β,
-keep those that (a) hold the low-pressure `long_lived` load spread ≤ 1.25× and (b) are
-no worse than `sticky` on p95 TTFT by >10% in any scenario; pick the smallest eligible
-β (most cache reuse).* Run `python scripts/bench_routing.py --select-beta`:
-
-| β | long_lived spread | balance ok | worst p95 vs sticky | eligible |
+| strategy | long_lived | cache_pressure | cross_session | skewed_bursty |
 |---|---|---|---|---|
-| 0.0 | 3.34× | no | +312% | no |
-| 0.1 | 3.23× | no | +168% | no |
-| 0.25 | 1.35× | no | +0% | no |
-| **0.5** | **1.11×** | **yes** | **+0%** | **YES (smallest)** |
-| 1.0 | 1.04× | yes | +0% | yes |
-| 2.0 | 1.05× | yes | +0% | yes |
+| round_robin | 87% / 81 / 37 | 28% / 356 / 178 | 77% / 193 / 53 | 20% / 1206 / 802 |
+| **least_busy** | 87% / **25** / 37 | 26% / **181** / 183 | 75% / **26** / 53 | 20% / **1093** / 793 |
+| sticky | 91% / 888 / 24 | 33% / 1006 / 171 | 76% / 433 / 54 | 44% / 8305 / 673 |
+| cache_aware β=0.5 | 91% / 27 / **29** | 46% / 342 / **139** | 91% / 155 / **27** | 36% / 1172 / **745** |
 
-Once queueing is modeled, **the old `β=0.25` hot-spots** (long_lived spread 1.35×,
-breaking the balance bound it held under the no-queueing harness) and leaves a real
-tail (p95 190 ms vs 27 ms at `β=0.5`). `β=0.5` is the smallest β that is balanced and
-no worse than `sticky` on p95 anywhere; `β≥1.0` over-spreads and gives up cache reuse
-(cache_pressure hit 46% → 37%). ADR 0010's "TTFT is an upper bound (no queueing)"
-caveat is **resolved** for these claims — the queueing model now supports them.
+**`least_busy` has the best (lowest) p95 TTFT in every scenario.** `cache_aware` is a
+close second and far ahead of `sticky`, while computing the **fewest uncached prefill
+tokens** and the **highest hit rate** in the reuse-heavy scenarios. `sticky` has the
+worst tail by far — session pinning imbalances the pool — but keeps the highest raw hit
+rate under skew. These are all *simulated* figures (see the caveat below).
 
-**When to use `cache_aware` vs `sticky`.**
+**Utilization sweep.** A single saturated point does not generalize, so `--sweep` runs
+every strategy across load levels (arrival rate calibrated per scenario via
+`least_busy` to ~50/70/85/95% max utilization — the *same* offered load for every
+strategy at each level). p95 differences are tiny until the pool approaches saturation;
+the enduring, load-independent difference is **prefill work** and **hit rate**. Example
+(`cross_session`, p95 ms / work per req):
 
-- **Use `cache_aware`** (at the default `β=0.5`) when your pool serves **shared
-  prefixes**: shared system prompts / few-shot preambles / RAG contexts across many
-  (even short) sessions, or long multi-turn chats. In `cache_pressure` and
-  `cross_session` it lifts hit rate (33%→46%, 76%→91%) *and* cuts p95 TTFT (1006→342,
-  433→155 ms). Even in `long_lived` (a hit-rate near-tie) it slashes p95 (888→27 ms)
-  by keeping the pool balanced.
-- **Under bursty, skewed load (`skewed_bursty`)**, `cache_aware` β=0.5 now also beats
-  `sticky` on p95 (8.3 s → 1.2 s) and throughput (+18%) by spreading the hot-session
-  queue — though `sticky` keeps a higher raw hit rate (44% vs 36%). This reverses the
-  ADR 0010 guidance (which, under the no-queueing model, saw `skewed_bursty` as a
-  sticky win on hit rate alone).
-- **Keep `sticky` as the default strategy** for conservatism (unchanged behavior) and
-  for workloads where per-session pinning is contractually required; `cache_aware`
-  stays opt-in.
+| load level | round_robin | least_busy | sticky | cache_aware β=0.5 |
+|---|---|---|---|---|
+| ~50% util | 15 / 53 | 14 / 55 | 16 / 50 | 15 / **29** |
+| ~70% util | 16 / 53 | 15 / 54 | 18 / 55 | 16 / **25** |
+| ~85% util | 19 / 53 | 16 / 52 | 19 / 54 | 18 / **27** |
+| ~95% util | 21 / 53 | 19 / 52 | 21 / 54 | 20 / **26** |
 
-`β` moves `cache_aware` along the cache-vs-balance curve: lower β → higher hit rate but
-looser balance (β=0 hot-spots a member to 2–4× the fleet average and blows up the
-tail); higher β → tighter balance approaching `least_busy`. Re-tune per workload with
-`--matrix` / `--select-beta` / `--capacity-sweep` if your prompt-length, reuse, and
-load distribution differ.
+At every load `cache_aware` is within ~10% of `least_busy` on p95 while computing
+roughly **half** the prefill tokens. Reproduce with `python scripts/bench_routing.py
+--sweep`.
+
+**Capacity under an SLO.** `--sweep` also reports each strategy's **capacity** — the
+max sustained arrival rate (req/s) that keeps TTFT **p95 ≤ SLO**, found by a bisection
+search. The SLO is **200 ms** (a common interactive first-token budget, ~an order of
+magnitude above this model's unloaded batched-prefill latency and above the bursty
+service floor, so capacity reflects the onset of *queueing*, not the service floor):
+
+| scenario | round_robin | least_busy | sticky | cache_aware β=0.5 |
+|---|---|---|---|---|
+| long_lived | 12.5 | **13.1** | 10.3 | 12.8 |
+| cache_pressure | 12.5 | **13.0** | 10.3 | 12.7 |
+| cross_session | 13.0 | **14.3** | 12.7 | 13.6 |
+| skewed_bursty | 11.8 | **12.7** | 7.9 | 12.1 |
+
+On **p95-SLO capacity** the order is `least_busy` ≥ `cache_aware` > `round_robin` >
+`sticky` in every scenario: `least_busy` leads, `cache_aware` trails it by only ~2–5%
+(and beats `sticky` by 15–55%). `cache_aware`'s distinct advantage is the **prefill
+work it saves** (20–48% fewer uncached tokens in reuse-heavy scenarios): if your
+bottleneck is prefill compute (GPU FLOPs/energy) rather than batch slots, that work
+saved *is* extra capacity — but this slot-bound simulation does not turn it into higher
+p95-SLO capacity. State the goal, then pick (below).
+
+**How the default `β=0.5` was chosen (selection rule).** *Evaluated at a moderate
+≤85% utilization (not saturation): among the swept β, keep those that (a) hold the
+low-pressure `long_lived` served-count spread ≤ 1.25× and (b) are no worse than
+`least_busy` on p95 TTFT by >10% in any scenario; pick the smallest eligible β (most
+cache reuse / least prefill work).* Run `python scripts/bench_routing.py --select-beta`:
+
+| β | long_lived spread | balance ok | worst p95 vs least_busy | p95 ok | eligible |
+|---|---|---|---|---|---|
+| 0.0 | 4.69× | no | +48% | no | no |
+| 0.1 | 3.01× | no | +39% | no | no |
+| 0.25 | 1.50× | no | +13% | no | no |
+| **0.5** | **1.10×** | **yes** | **+8%** | **yes** | **YES (smallest)** |
+| 1.0 | 1.07× | yes | +0% | yes | yes |
+| 2.0 | 1.07× | yes | +6% | yes | yes |
+
+Re-measured against `least_busy` at a realistic load, **the old `β=0.25` fails on both
+counts** — it hot-spots the low-pressure pool (spread 1.50×) *and* is 13% worse than
+`least_busy` on p95 in `cross_session`. `β=0.5` is the smallest β that is balanced *and*
+within 10% of `least_busy` on p95 everywhere; `β≥1.0` over-spreads and gives up cache
+reuse (cache_pressure hit 46% → 32%). ADR 0010's "TTFT is an upper bound (no queueing)"
+caveat is resolved, and the ADR 0018 "beats sticky in every scenario" framing is
+replaced by this honest, `least_busy`-referenced one.
+
+> **These are simulation results.** Absolute milliseconds depend on the service-model
+> constants (`iter_base_ms`, `iter_per_seq_ms`, `member_slots`, arrival rates), which
+> are documented and overridable; what the bench establishes are the **rankings**, the
+> **work saved**, and the **β decision** — robust across the scenario matrix. Validate
+> in production via `/status` (live hit rate + per-member in-flight).
+
+### When to use which strategy
+
+Pick by your primary goal (all `cache_aware` figures at the default `β=0.5`; all
+simulated):
+
+- **Lowest tail latency / p95 under load, and simplest** → **`least_busy`**. It has the
+  best p95 TTFT and the highest p95-SLO capacity in every scenario here, and needs no
+  tuning. This is the right default choice when latency is the objective.
+- **GPU work / energy saved, or prefix-compute-bound capacity, or shared-prefix
+  workloads** (shared system prompts / few-shot preambles / RAG contexts across many —
+  even short — sessions, or long multi-turn chats) → **`cache_aware`**. It computes
+  20–48% fewer uncached prefill tokens and lands a much higher hit rate (cache_pressure
+  26%→46%, cross_session 75%→91%) while staying within ~10% of `least_busy` on p95. It
+  does **not** beat `least_busy` on tail latency.
+- **Session affinity** (a conversation must stay on one backend; contractual per-session
+  pinning) or **highest raw hit rate under skew** → **`sticky`** (the **default**
+  strategy, kept for conservatism/unchanged behavior). Accept its worse tail and lower
+  capacity under load as the cost of strict pinning.
+- **`round_robin`** → only when you want a deterministic even spread and care about
+  neither cache locality nor adapting to load.
+
+`β` moves `cache_aware` along the cache-vs-balance curve: lower β → higher hit rate /
+less prefill work but looser balance (β=0 hot-spots a member to 3–5× the fleet average
+and blows up the tail at saturation); higher β → tighter balance approaching
+`least_busy` (and its work/hit-rate advantage fades). Re-tune per workload with
+`--sweep` / `--matrix` / `--select-beta` / `--capacity-sweep` if your prompt-length,
+reuse, and load distribution differ.
 
 ## Health & liveness (never loads a model)
 

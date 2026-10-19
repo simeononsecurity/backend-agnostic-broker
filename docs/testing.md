@@ -3,7 +3,7 @@
 Run the suite:
 
 ```bash
-make test                 # pytest -q  (368 collected: 342 passed, 26 skipped)
+make test                 # pytest -q  (401 collected: 373 passed, 28 skipped)
 make cov                  # with coverage
 python -m pytest -q tests/test_security.py   # one file
 ```
@@ -13,14 +13,14 @@ so they exercise the real request path, lifecycle, locking, and security
 boundaries without any external runtime. The suite is CPU-only; optional GPU
 tests (if added) should be marked and excluded from CI.
 
-In the default CPU venv, 362 pass and 28 skip — the skips are the Redis-backed
+In the default CPU venv, 373 pass and 28 skip — the skips are the Redis-backed
 `StateStore` paths (counters, prefix index, response cache, prefix-index sorted-set
 LRU) and the OpenTelemetry span path, which need the optional `redis`/`otel` extras.
-In a venv with `pip install -e '.[dev,redis,otel]'` those run too: **388 passed, 2
+In a venv with `pip install -e '.[dev,redis,otel]'` those run too: **399 passed, 2
 skipped** (the remaining 2 are import-guard paths that only fire when a package is
 *absent*).
 
-## Coverage map (390 collected)
+## Coverage map (401 collected)
 
 | File | Tests | Covers |
 |------|-------|--------|
@@ -34,7 +34,7 @@ skipped** (the remaining 2 are import-guard paths that only fire when a package 
 | `tests/test_retry.py` | 8 | Retries + full-jitter backoff (ADR 0009): backoff bounds, default single-pass-no-sleep, retries stay within the pool (never cross-model), attempt cap, transient recovery, no retry mid-stream. |
 | `tests/test_cooldown.py` | 5 | Member cooldowns (ADR 0009): bench after N failures + selection skip, half-open trial after expiry, success resets, `/status` + `/healthz/backends` visibility, default-off. |
 | `tests/test_cache_routing.py` | 31 | Cache-aware routing (ADR 0010/0018): prompt normalization + chained block hashing, longest-prefix match, LRU/TTL index eviction, hit-rate stats, vLLM `/metrics` parse; manager routing (warm-member reuse, no-match→least_busy, load flips choice, beta=0 affinity, 3-member longest-prefix); invariants (unhealthy/cooldown excluded, failover, single-member, sticky map untouched, default builds no router, embeddings); StateStore index in-process + Redis (fakeredis); **sorted-set LRU size bound (ADR 0018) in-process + Redis + a cross-replica shared-bound test**; bench smoke run. |
-| `tests/test_bench_routing.py` | 19 | Queueing-model routing bench (ADR 0018): pins the re-validated config default β (`0.5`) beats `sticky` on hit rate *and* p95 TTFT (incl. queueing) for `cache_pressure`/`cross_session`, holds the 1.25× low-pressure balance bound while β=0.25 now breaks it; model correctness (percentile ordering, bounded utilization, throughput ≤ offered, uniform⇒symmetric queues, zero-cache⇒cache_aware≈least_busy, β monotonicity); β selection-rule unit tests + a real-matrix integration test; `--smoke` CLI. |
+| `tests/test_bench_routing.py` | 30 | Queueing-model routing bench (ADR 0018 + follow-up): pins the config default β (`0.5`); asserts `cache_aware` **saves prefill work** and **lifts hit rate vs `least_busy`** (cache_pressure/cross_session), its p95 is within the rule's tolerance of `least_busy` at ≤85% util, and `least_busy` is **tail-best at saturation** (p95 ≤ cache_aware < sticky); holds the 1.25× low-pressure balance bound while β=0.25 fails a selection bound at moderate load; **SLO capacity** (cache_aware > sticky, least_busy leads) and the **utilization-sweep** helpers; model correctness (percentile ordering, bounded utilization, throughput ≤ offered, uniform⇒symmetric queues, zero-cache⇒cache_aware≈least_busy, β monotonicity, prefill-work consistency); the (least_busy-referenced) β selection-rule unit tests + a real-matrix integration test; `--smoke` and `--sweep --smoke` CLI. |
 | `tests/test_state.py` | 31 | `StateStore` contract parametrized over in-process + Redis (fakeredis, skips if absent): sticky/LRU, counters + sliding window, cooldown transitions, half-open claim, bytes/JSON KV, factory fail-fast. |
 | `tests/test_health_probe.py` | 8 | Non-loading health: `/healthz/backends`, periodic probe marks dead backends failed (never loads), `/api/ps` aggregation. |
 | `tests/test_router.py` | 29 | `auto` router: flag extraction, Stage-1 capability filter, overrides, heuristic task routing, fallback, cache, GBNF/prompt builders, manager + API end-to-end. |

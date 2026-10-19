@@ -14,12 +14,23 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   queueing simulation** of continuous-batching pool members (per-member `nmax` slots,
   `t_iter(n)=W+H·n`, prefill ∝ uncached prefix tokens, decode ∝ output tokens,
   **TTFT = queue wait + prefill**), reporting TTFT **p50/p95/p99 incl. queueing**,
-  throughput, and per-member utilization. Re-measured against it, `β=0.25` breaks the
-  1.25× low-pressure balance bound (hot-spots) and leaves a real tail; `β=0.5` is the
-  smallest β that stays balanced and is no worse than `sticky` on p95 in every
-  scenario (and matches the llm-d/KServe ≈2:1 prefix:load weighting). `sticky` remains
-  the default *strategy*; this only affects deployments that opted into `cache_aware`
-  without setting β. New bench flags: `--select-beta`, `--load-signal`.
+  **prefill work (uncached tokens computed)**, throughput, and per-member utilization.
+  The default is re-derived against the right baseline — **`least_busy`, the
+  tail-latency-best strategy — at a moderate (≤85% util) load, not one saturated
+  point**: `β=0.5` is the smallest β that holds the 1.25× low-pressure balance bound
+  *and* stays within 10% of `least_busy` on p95 in every scenario (matching the
+  llm-d/KServe ≈2:1 prefix:load weighting), while `β=0.25` fails both (spread ~1.5×,
+  +13% p95 in cross_session). `sticky` remains the default *strategy*; this only affects
+  deployments that opted into `cache_aware` without setting β. New bench modes:
+  `--sweep` (all 4 strategies at ~50/70/85/95% util + SLO-capacity bisection),
+  `--select-beta`, `--load-signal`.
+- **Cache-aware routing docs corrected to honest conclusions** (ADR 0018 follow-up):
+  `least_busy` has the best p95 TTFT and highest p95-SLO capacity in every simulated
+  scenario; `cache_aware`'s benefit is **fewer uncached prefill tokens (GPU work, 20–48%
+  less) and higher hit rate**, not tail latency (it stays within ~10% of `least_busy`).
+  Added a "when to use which strategy" guide; the earlier "doubles hit rate" wording is
+  weakened to "materially higher" (cache_pressure 1.4×, cross_session 1.2×). All figures
+  labeled *simulated*.
 - **Cache-aware prefix index size bound is now cross-replica under Redis** (ADR 0018):
   a new `StateStore` sorted-set LRU (`zlru_touch`/`zlru_trim`/`zlru_size`) backs the
   `BROKER_CACHE_AWARE_MAX_ENTRIES` bound, so N replicas sharing Redis keep one shared

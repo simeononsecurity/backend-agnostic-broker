@@ -7,6 +7,16 @@ from hot-spotting one member. Design: [ADR 0010](../../docs/adr/0010-cache-aware
 extended by [ADR 0018](../../docs/adr/0018-cache-aware-v2.md) (queueing-model bench +
 re-validated default `β=0.5`). Full guide: [routing-and-health.md](../../docs/routing-and-health.md#cache-aware-routing-adr-0010).
 
+> **Pick the strategy by your goal (all figures are simulated).** In the queueing
+> benchmark, `least_busy` has the **best tail latency (p95 TTFT)** and the highest
+> SLO-capacity in every scenario — use it if latency is your objective. Choose
+> `cache_aware` when you want **fewer uncached prefill tokens (GPU work/energy)** and a
+> **higher hit rate** on shared-prefix workloads (shared system prompts, RAG contexts,
+> long chats): it computes 20–48% less prefill work while staying within ~10% of
+> `least_busy` on p95 — it does **not** beat `least_busy` on tail latency. `sticky` (the
+> default strategy) is for contractual per-session pinning. See
+> [when to use which strategy](../../docs/routing-and-health.md#when-to-use-which-strategy).
+
 ## Files
 
 - `registry.example.yaml` — the 3-member `chat` pool (host URLs from `${VLLM_URL_1..3}`).
@@ -64,11 +74,12 @@ your workload actually shares prefixes.
 
 ## Tune β for your workload
 
-The default `β=0.5` was chosen by the queueing benchmark's selection rule. Re-run it
-against your own scenario mix:
+The default `β=0.5` was chosen by the queueing benchmark's selection rule (evaluated
+against `least_busy` at a moderate load). Re-run it against your own scenario mix:
 
 ```bash
-python scripts/bench_routing.py --matrix        # scenario × β table (hit rate / p95 / spread)
-python scripts/bench_routing.py --select-beta    # apply the ADR 0018 selection rule
+python scripts/bench_routing.py --sweep         # all 4 strategies at 50/70/85/95% util + SLO capacity
+python scripts/bench_routing.py --matrix        # scenario × β table at a moderate load
+python scripts/bench_routing.py --select-beta    # apply the selection rule (vs least_busy)
 python scripts/bench_routing.py --capacity-sweep # sticky vs cache_aware across cache sizes
 ```
