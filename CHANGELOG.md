@@ -33,6 +33,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `GET /usage` responses now include a `scope` field and (for `user` scope) the
   caller's `api_key_id`; `admin` scope adds a `by_key` breakdown.
 
+### Security
+
+- **Auth no longer 500s on a non-ASCII API key.** `hmac.compare_digest` raises
+  `TypeError` on a non-ASCII `str`, so a request presenting a key with a non-ASCII
+  (e.g. latin-1) byte in `Authorization`/`X-API-Key` previously returned **500**
+  instead of **401** on the unauthenticated-reachable auth path (pre-existing in
+  v0.4.0 `broker/auth.py`, and the same class in the new virtual-key verification).
+  Both paths now compare the UTF-8/surrogateescape **byte** encodings (and reject
+  absurdly long keys early), so malformed keys fail closed with a clean `401`.
+  Regression tests cover non-ASCII and over-long keys on the data-plane auth path.
+
 ### Added (routing reliability & shared state — ADR 0009)
 
 - **Retries with full-jitter backoff** (ADR 0009): `BROKER_RETRY_MAX_ATTEMPTS`,

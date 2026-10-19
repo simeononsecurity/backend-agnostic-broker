@@ -144,6 +144,10 @@ Verified by `tests/test_keys.py` and `tests/test_governance.py`:
 - **Backward compatibility** — `BROKER_API_KEYS` keys authenticate as unlimited
   and no governance headers/limits apply; with no keys file the request path is
   unchanged.
+- **Non-ASCII / over-long key hardening** — a malformed key (non-ASCII byte or
+  absurd length) fails closed with a clean `401` on both the legacy and virtual-key
+  paths, never an unhandled `500` (`tests/test_auth.py`, `tests/test_keys.py`,
+  `tests/test_governance.py`).
 - **Redis-backed counters** exercised via `fakeredis` (skipped cleanly when the
   optional `[redis]` extra is absent).
 

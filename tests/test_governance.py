@@ -288,6 +288,28 @@ def test_http_invalid_key_401(gov_client):
     assert r.status_code == 401
 
 
+def test_http_non_ascii_key_401_not_500(gov_client):
+    # A latin-1/non-ASCII byte in the key must yield a clean 401, not a 500 from
+    # an unhandled hmac.compare_digest TypeError on the data-plane auth path.
+    # Raw bytes put a non-ASCII byte on the wire (httpx rejects non-ASCII str).
+    body = {"model": "echo", "messages": [{"role": "user", "content": "hi"}]}
+    r = gov_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": b"Bearer brk_httpkey1_\xe9\xe9\xe9"},
+        json=body,
+    )
+    assert r.status_code == 401
+    r2 = gov_client.post(
+        "/v1/chat/completions", headers={"X-API-Key": b"l\xe9gacy-\xe9"}, json=body
+    )
+    assert r2.status_code == 401
+
+
+def test_http_overlong_key_401_not_500(gov_client):
+    r = _chat(gov_client, "brk_httpkey1_" + "a" * 20000)
+    assert r.status_code == 401
+
+
 def test_http_usage_scoped_user_vs_admin(gov_client):
     _chat(gov_client, _SECRET)  # a user-key request
     _chat(gov_client, "legacy-flat-key")  # a different principal's request

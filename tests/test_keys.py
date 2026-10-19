@@ -115,6 +115,26 @@ def test_admin_scope_round_trip(tmp_path):
     assert p is not None and p.is_admin is True
 
 
+def test_resolve_non_ascii_key_returns_none(tmp_path):
+    # A non-ASCII presented key must fail cleanly (→ None → 401), never raise
+    # TypeError from hmac.compare_digest (which would surface as a 500).
+    secret = "brk_tkey0001_" + "a" * 48
+    kp = tmp_path / "keys.yaml"
+    _write_keys(kp, [_record(secret)])
+    store = KeyStore(str(kp), legacy_api_keys=["flat-key"])
+    assert store.resolve("Bearer\xe9-not-a-key") is None  # latin-1 byte
+    assert store.resolve("brk_tkey0001_\xe9\xe9\xe9") is None
+    # Non-ASCII presented against a legacy key must also not raise.
+    assert store.resolve("fl\xe9t-key") is None
+
+
+def test_resolve_overlong_key_returns_none(tmp_path):
+    kp = tmp_path / "keys.yaml"
+    _write_keys(kp, [_record("brk_tkey0001_" + "a" * 48)])
+    store = KeyStore(str(kp), legacy_api_keys=["flat-key"])
+    assert store.resolve("brk_tkey0001_" + "a" * 20000) is None
+
+
 # --- CLI --------------------------------------------------------------------
 
 

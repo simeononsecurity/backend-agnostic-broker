@@ -44,11 +44,34 @@ _SECRET_PREFIX = "brk"
 # A fixed dummy hash to compare against when no record matches, so verification
 # takes the same work whether or not the key id exists (no timing oracle).
 _DUMMY_HASH = hashlib.sha256(b"broker-nonexistent-key").hexdigest()
+# Upper bound on a presented secret; anything longer can't be a real key and is
+# rejected early (cheap guard against pathological inputs).
+_MAX_PRESENTED_LEN = 8192
 
 
 def hash_secret(secret: str) -> str:
-    """Return the hex SHA-256 of a key secret (what we store; never the secret)."""
-    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    """Return the hex SHA-256 of a key secret (what we store; never the secret).
+
+    Uses ``surrogateescape`` so a secret carrying raw non-ASCII/latin-1 bytes
+    hashes deterministically instead of raising.
+    """
+    return hashlib.sha256(secret.encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def _ct_equal(a: str, b: str) -> bool:
+    """Constant-time equality for two secrets, safe for non-ASCII input.
+
+    ``hmac.compare_digest`` raises ``TypeError`` on non-ASCII ``str`` (CWE-208
+    hardening only covers ASCII str or bytes). Comparing the UTF-8/surrogateescape
+    byte encodings avoids that, so a non-ASCII or malformed presented key simply
+    fails to match (→ 401) instead of raising an unhandled error (→ 500).
+    """
+    try:
+        return hmac.compare_digest(
+            a.encode("utf-8", "surrogateescape"), b.encode("utf-8", "surrogateescape")
+        )
+    except Exception:  # noqa: BLE001 - any encoding failure means "not a match"
+        return False
 
 
 def generate_secret() -> tuple[str, str]:
@@ -276,27 +299,32 @@ class KeyStore:
         if not presented:
             return None
         presented = presented.strip()
+        if not presented or len(presented) > _MAX_PRESENTED_LEN:
+            return None
 
         # --- virtual keys ---
         key_id = _key_id_from_secret(presented)
         rec = self.records.get(key_id) if key_id else None
-        presented_hash = hash_secret(presented)
+        try:
+            presented_hash = hash_secret(presented)
+        except Exception:  # noqa: BLE001 - malformed secret can't match a real key
+            presented_hash = _DUMMY_HASH
         # Always run a constant-time compare (against a dummy if no record) so the
-        # response time does not reveal whether the key id exists.
+        # response time does not reveal whether the key id exists. Both operands
+        # are hex digests (ASCII), so compare_digest is safe here.
         target_hash = rec.secret_sha256 if rec is not None else _DUMMY_HASH
         match = hmac.compare_digest(presented_hash, target_hash)
         if rec is not None and match and rec.enabled and not rec.is_expired():
             return rec.principal()
 
         # --- legacy flat keys (unlimited user) ---
-        legacy_hit = False
-        for k in self.legacy_api_keys:
-            if hmac.compare_digest(presented, k):
-                legacy_hit = True
-                break
+        # Byte-wise constant-time compare: a non-ASCII presented key must fail to
+        # match (→ generic 401), never raise (which would surface as a 500 on the
+        # unauthenticated-reachable auth path).
+        legacy_hit = any(_ct_equal(presented, k) for k in self.legacy_api_keys)
         if legacy_hit:
             # Stable, non-reversible usage id so /usage can scope legacy keys too.
-            fp = hashlib.sha256(presented.encode("utf-8")).hexdigest()[:12]
+            fp = hash_secret(presented)[:12]
             return Principal(usage_id=f"legacy_{fp}", scope="user", unlimited=True)
         return None
 

@@ -43,8 +43,17 @@ def check_auth(
             remediation="send Authorization: Bearer <key> or X-API-Key",
         )
     for key in settings.api_keys:
-        if hmac.compare_digest(presented, key):
-            return
+        # Byte-wise compare: hmac.compare_digest raises TypeError on a non-ASCII
+        # str, which on this unauthenticated-reachable path would surface as a 500
+        # instead of a clean 401. Comparing UTF-8/surrogateescape bytes avoids it.
+        try:
+            if hmac.compare_digest(
+                presented.encode("utf-8", "surrogateescape"),
+                key.encode("utf-8", "surrogateescape"),
+            ):
+                return
+        except Exception:  # noqa: BLE001 - encoding failure means "not a match"
+            continue
     raise AuthError(
         "invalid API key",
         remediation="use a configured API key",
