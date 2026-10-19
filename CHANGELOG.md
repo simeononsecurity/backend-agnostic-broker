@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.1] - 2026-10-18
 
 ### Documentation
 
@@ -13,6 +13,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pulls; `docs/docker.md` adds pulling, running, and swapping the bundled
   classifier; `docs/auto-router.md` adds running the LLM outside the container and
   verifying `via: llm` vs a heuristic fallback.
+- Annotate the auto-router configuration surface in the shipped examples:
+  `registry.example.yaml` documents every per-model router field and the full
+  `router` block (policy, weights, overrides); `.env.example` describes every
+  `BROKER_ROUTER_*` setting.
 
 ## [0.3.0] - 2026-10-18
 
