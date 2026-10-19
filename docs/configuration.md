@@ -77,6 +77,51 @@ or `reject`; `route_strategy` must be `sticky`, `least_busy`, or `round_robin`;
 
 See [routing-and-health.md](routing-and-health.md).
 
+## Retries & backoff (ADR 0009)
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_RETRY_MAX_ATTEMPTS` | int | `0` | Total serve attempts per request. `0` = legacy (one attempt per pool member — a single failover pass). A positive value caps attempts and enables re-trying members after a backoff delay. |
+| `BROKER_RETRY_BACKOFF_BASE_MS` | float | `0` | Backoff base. `0` = no sleep (legacy). |
+| `BROKER_RETRY_BACKOFF_MAX_MS` | float | `2000` | Backoff cap. |
+
+Retries re-select a member **within the requested model's pool only** — never a
+different model. The delay between attempts is full-jitter capped exponential
+(the [AWS pattern](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)):
+`delay = uniform(0, min(MAX_MS, BASE_MS * 2**attempt))`. Streaming only retries
+*before the first byte*; once a stream is emitting it is never retried. Retrying
+respects `BROKER_REQUEST_TIMEOUT_SECONDS` as an overall deadline. **Defaults
+reproduce v0.4.0 exactly** (one failover pass, no sleep).
+
+## Member cooldowns (ADR 0009)
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_COOLDOWN_FAILURES` | int | `0` | Consecutive failures before a member is benched. `0` = disabled (circuit breaker off). |
+| `BROKER_COOLDOWN_SECONDS` | float | `30` | How long a benched member stays out before a half-open trial. |
+
+A circuit breaker per pool member: after `COOLDOWN_FAILURES` consecutive failures
+a member is benched for `COOLDOWN_SECONDS` and selection skips it; once the window
+elapses the member is eligible again as a half-open trial (a success resets its
+failure count, another failure re-benches it). When enabled, cooldown state is the
+authoritative benching signal; if every member is benched the pool falls through
+so it can still self-heal. Cooldown state is shown in `GET /status` (per model)
+and `GET /healthz/backends`. **Default-off preserves v0.4.0.**
+
+## Shared state / Redis (ADR 0009)
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_REDIS_URL` | str? | _(unset)_ | When set, the sticky map, cooldowns, counters, and cached values live in Redis so multiple broker replicas share one view. Unset = in-process (no new dependency). |
+| `BROKER_REDIS_PREFIX` | str | `broker` | Key namespace, so one Redis can host several brokers. |
+| `BROKER_ROUTE_STICKY_TTL_SECONDS` | float | `0` | TTL for Redis sticky keys (`0` = no expiry). In-process sticky uses `BROKER_ROUTE_STICKY_MAX_ENTRIES` (LRU) instead. |
+
+`redis` is an **optional** dependency: `pip install
+'backend-agnostic-broker[redis]'`. If `BROKER_REDIS_URL` is set but the package is
+missing, the broker fails fast with a `ConfigError` (never a silent downgrade to
+in-process). See [routing-and-health.md](routing-and-health.md) and
+[operations-runbook.md](operations-runbook.md).
+
 ## Health probing (non-loading)
 
 | Env var | Type | Default | Description |

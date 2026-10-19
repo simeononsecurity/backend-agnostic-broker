@@ -102,6 +102,39 @@ class Settings(BaseSettings):
     # Deterministic fallback model id (overrides registry router.default).
     router_default_model: str | None = None
 
+    # --- Retries & backoff (ADR 0009) ---
+    # Transparent retry of a failed request WITHIN the requested model's pool
+    # (never a different model). Defaults reproduce v0.4.0 exactly: one pass over
+    # the pool members (failover) with NO sleep.
+    #   retry_max_attempts: 0 = legacy (one attempt per pool member). >0 caps the
+    #     total attempts for a request and enables re-trying members after the
+    #     backoff delay (useful for single-member pools / transient failures).
+    #   backoff: full-jitter exponential delay between attempts (AWS pattern):
+    #     delay = uniform(0, min(max_ms, base_ms * 2**(attempt-1))). base_ms=0
+    #     disables sleeping (the default), so legacy behavior is byte-for-byte.
+    retry_max_attempts: int = 0
+    retry_backoff_base_ms: float = 0.0
+    retry_backoff_max_ms: float = 2000.0
+
+    # --- Member cooldowns / circuit breaker (ADR 0009) ---
+    # After `cooldown_failures` consecutive failures a pool member is benched for
+    # `cooldown_seconds`; selection skips benched members. Once the window
+    # elapses the member is eligible again as a half-open trial: a success resets
+    # it, another failure re-benches it. Default-off (0) preserves v0.4.0.
+    cooldown_failures: int = 0
+    cooldown_seconds: float = 30.0
+
+    # --- Optional shared state via Redis (ADR 0009) ---
+    # When BROKER_REDIS_URL is set, the sticky map, cooldowns, counters, and
+    # cached values live in Redis so multiple broker replicas share one view.
+    # Absent the URL, state is in-process (exactly today's behavior, no new dep).
+    # `redis` is an optional extra: pip install 'backend-agnostic-broker[redis]'.
+    redis_url: str | None = None
+    redis_prefix: str = "broker"
+    # TTL (seconds) applied to Redis sticky keys (0 = no expiry). In-process
+    # sticky is LRU-bounded by route_sticky_max_entries instead.
+    route_sticky_ttl_seconds: float = 0.0
+
     # --- Limits ---
     max_request_bytes: int = 2_000_000
 
@@ -178,6 +211,18 @@ class Settings(BaseSettings):
             raise ConfigError("BROKER_MAX_LOADED_MODELS must be >= 1")
         if self.max_concurrent_requests < 1:
             raise ConfigError("BROKER_MAX_CONCURRENT_REQUESTS must be >= 1")
+        if self.retry_max_attempts < 0:
+            raise ConfigError("BROKER_RETRY_MAX_ATTEMPTS must be >= 0 (0 = legacy one-pass)")
+        if self.retry_backoff_base_ms < 0 or self.retry_backoff_max_ms < 0:
+            raise ConfigError("BROKER_RETRY_BACKOFF_* must be >= 0")
+        if self.retry_backoff_max_ms < self.retry_backoff_base_ms:
+            raise ConfigError("BROKER_RETRY_BACKOFF_MAX_MS must be >= BROKER_RETRY_BACKOFF_BASE_MS")
+        if self.cooldown_failures < 0:
+            raise ConfigError("BROKER_COOLDOWN_FAILURES must be >= 0 (0 = disabled)")
+        if self.cooldown_seconds < 0:
+            raise ConfigError("BROKER_COOLDOWN_SECONDS must be >= 0")
+        if self.redis_url is not None and not self.redis_url:
+            raise ConfigError("BROKER_REDIS_URL must be a non-empty URL when set")
         if not Path(self.registry_path).exists():
             raise ConfigError(
                 f"registry not found: {self.registry_path!r}",

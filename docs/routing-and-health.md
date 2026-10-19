@@ -87,6 +87,52 @@ get a single `backend_unavailable` pointing you at `GET /healthz/backends`.
 > There is **no silent fallback to a different model** — failover only ever
 > retries *equivalent members of the same pool*.
 
+### Retries & backoff (ADR 0009)
+
+Failover is "try each member once". On top of it, optional **retries with
+full-jitter backoff** let a request keep trying within its pool:
+
+- `BROKER_RETRY_MAX_ATTEMPTS` caps the total serve attempts. `0` (default) means
+  one attempt per pool member — the single failover pass above, unchanged. A
+  positive value caps attempts and, once distinct members are exhausted, re-tries
+  members (still within the same pool).
+- Between attempts the manager waits `delay = uniform(0, min(MAX_MS, BASE_MS *
+  2**attempt))` — capped exponential backoff with **full jitter** (the AWS
+  pattern, which minimizes retry storms). `BROKER_RETRY_BACKOFF_BASE_MS=0`
+  (default) means no sleep, so the legacy path is byte-for-byte unchanged.
+- Retrying respects `BROKER_REQUEST_TIMEOUT_SECONDS` as an overall deadline.
+- Streaming retries **before the first byte only** (same rule as failover).
+
+Retries **never cross to a different model** — same invariant as failover.
+
+### Member cooldowns / circuit breaker (ADR 0009)
+
+A per-member circuit breaker keeps a flapping backend out of rotation:
+
+- After `BROKER_COOLDOWN_FAILURES` consecutive failures a member is **benched**
+  for `BROKER_COOLDOWN_SECONDS`; selection skips benched members.
+- Once the window elapses the member is eligible again as a **half-open trial**:
+  a success resets its failure count (breaker closes), another failure re-benches
+  it (breaker re-opens).
+- When enabled, cooldown is the authoritative benching signal (it supersedes the
+  transient `healthy` flag so an expired member can be trialed). If *every* member
+  is benched, the pool falls through to the healthy tier so it can still self-heal.
+- `BROKER_COOLDOWN_FAILURES=0` (default) disables cooldowns entirely.
+
+Cooldown state is visible per member in `GET /status` and `GET /healthz/backends`
+(`cooldown: {failures, in_cooldown, until, seconds_remaining}`).
+
+### Shared state across replicas (ADR 0009)
+
+By default routing state (sticky map, cooldowns, counters) is **in-process**, so a
+single broker is fully self-contained. To run several broker replicas behind a
+load balancer with one consistent view, set `BROKER_REDIS_URL` and the state moves
+to Redis (sticky pins, cooldowns, and counters are then shared). `redis` is an
+optional extra (`pip install 'backend-agnostic-broker[redis]'`); absent the URL
+nothing changes and no new dependency is required. See
+[architecture.md](architecture.md) for the `StateStore` API and
+[operations-runbook.md](operations-runbook.md) for the multi-replica runbook.
+
 ## Health & liveness (never loads a model)
 
 Three surfaces, all non-loading:
@@ -99,7 +145,8 @@ Live, on-demand liveness of every backend member:
   "status": "ok",                        // or "degraded" if any member is unhealthy
   "backends": [
     {"alias": "chat-node-1", "model": "chat", "backend": "ollama",
-     "state": "ready", "status": "ok", "detail": "tags 200", "inflight": 1},
+     "state": "ready", "status": "ok", "detail": "tags 200", "inflight": 1,
+     "cooldown": {"failures": 0, "in_cooldown": false, "until": null, "seconds_remaining": 0.0}},
     {"alias": "qwen-llamacpp", "model": "qwen-llamacpp", "backend": "llamacpp",
      "state": "unloaded", "status": "not_loaded", "detail": "model not loaded"}
   ]
@@ -146,7 +193,15 @@ never touch a member that is mid-request.
 | Env var | Default | Meaning |
 |---|---|---|
 | `BROKER_ROUTE_STRATEGY` | `sticky` | `sticky`, `least_busy`, or `round_robin` |
-| `BROKER_ROUTE_STICKY_MAX_ENTRIES` | `10000` | max remembered session→member pairings (LRU) |
+| `BROKER_ROUTE_STICKY_MAX_ENTRIES` | `10000` | max remembered session→member pairings (LRU, in-process) |
+| `BROKER_RETRY_MAX_ATTEMPTS` | `0` | serve attempts per request (`0` = one failover pass) |
+| `BROKER_RETRY_BACKOFF_BASE_MS` | `0` | full-jitter backoff base (`0` = no sleep) |
+| `BROKER_RETRY_BACKOFF_MAX_MS` | `2000` | backoff cap |
+| `BROKER_COOLDOWN_FAILURES` | `0` | consecutive failures before benching a member (`0` = off) |
+| `BROKER_COOLDOWN_SECONDS` | `30` | bench window before a half-open trial |
+| `BROKER_REDIS_URL` | _(unset)_ | share routing state across replicas (optional `[redis]` extra) |
+| `BROKER_REDIS_PREFIX` | `broker` | Redis key namespace |
+| `BROKER_ROUTE_STICKY_TTL_SECONDS` | `0` | TTL for Redis sticky keys (`0` = none) |
 | `BROKER_HEALTH_PROBE_ENABLED` | `true` | enable the background liveness probe |
 | `BROKER_HEALTH_PROBE_INTERVAL_SECONDS` | `30` | seconds between probe sweeps |
 | `BROKER_HEALTH_PROBE_TIMEOUT_SECONDS` | `5` | per-probe timeout |
