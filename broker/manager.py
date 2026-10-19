@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import logging
 import random
 import time
@@ -98,6 +99,67 @@ class ResolvedRoute:
     mode: str = "single"
     cascade_cfg: Any = None  # CascadeConfig when mode == "cascade"
     required_placement: frozenset[str] = field(default_factory=frozenset)
+
+
+@dataclass
+class StreamPlan:
+    """How a streaming request will be served (ADR 0019).
+
+    ``kind == "single"`` streams one concrete model (``concrete``); this is the
+    default and the only mode for completions/responses. ``kind ==
+    "cascade_buffer"`` is the opt-in buffered streaming cascade: ``hops`` holds
+    ``[primary, escalation]`` and the chat endpoint buffers the cheap hop, scores
+    it, then replays it or streams the stronger hop — one model's output per
+    stream, never a mix. ``route_path`` is the ``x-broker-route`` header value.
+    """
+
+    route_path: str
+    kind: str  # "single" | "cascade_buffer"
+    public_name: str = ""
+    concrete: str | None = None  # for kind == "single"
+    hops: list[str] | None = None  # for kind == "cascade_buffer"
+    cascade_cfg: Any = None
+    required_placement: frozenset[str] = field(default_factory=frozenset)
+    # Set by stream_cascade_buffer once the serving model is known, so the caller
+    # can attribute the usage row to the model that actually served.
+    served: str | None = None
+
+
+def _result_to_sse_chunks(result: dict, model: str) -> list[bytes]:
+    """Reconstruct OpenAI chat streaming SSE from a buffered completion dict.
+
+    Used by the buffered streaming cascade (ADR 0019) to replay the cheap hop's
+    already-generated answer as a stream. The whole answer is emitted as a single
+    content chunk followed by a finish chunk and ``[DONE]`` — it is one model's
+    output, never a mix of two.
+    """
+    choices = result.get("choices") or [{}]
+    ch = choices[0] or {}
+    msg = ch.get("message") or {}
+    content = msg.get("content")
+    content = content if isinstance(content, str) else ""
+    finish = ch.get("finish_reason") or "stop"
+    base = {
+        "id": result.get("id") or "chatcmpl-cascade",
+        "object": "chat.completion.chunk",
+        "created": result.get("created") or int(time.time()),
+        "model": model,
+    }
+    first = {
+        **base,
+        "choices": [
+            {"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": None}
+        ],
+    }
+    final: dict[str, Any] = {
+        **base,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+    }
+    return [
+        f"data: {json.dumps(first)}\n\n".encode(),
+        f"data: {json.dumps(final)}\n\n".encode(),
+        b"data: [DONE]\n\n",
+    ]
 
 
 class ManagedModel:
@@ -338,14 +400,18 @@ class ModelManager:
     ) -> tuple[str, str]:
         """Resolve a streaming request to a single concrete model + route label.
 
-        Streaming cannot cheaply re-score a live stream, so a cascade route falls
-        back to the single strong pick (documented). Returns ``(name, route_path)``.
+        This is the ``fallback_single`` path (the default and the only mode for
+        the completions/responses streaming endpoints): a cascade route falls
+        back to the single strong pick, because a live stream cannot be cheaply
+        re-scored. For the ``buffer`` streaming-cascade mode the chat endpoint
+        uses :meth:`plan_stream` / :meth:`stream_cascade_buffer` instead.
+        Returns ``(name, route_path)``.
         """
         req = frozenset(required_placement or ())
         if self.router is not None and name == self.settings.router_alias:
             async with self._router_lock:
                 decision = await asyncio.to_thread(
-                    self.router.route, payload, req, latency_budget_ms
+                    self.router.route, payload, req, latency_budget_ms, True
                 )
             if decision.cascade and len(decision.cascade) > 1:
                 strong = decision.cascade[-1]
@@ -356,6 +422,72 @@ class ModelManager:
             return decision.chosen, decision.chosen
         self._members_for(name, req)  # fail-closed placement for explicit models
         return name, name
+
+    async def plan_stream(
+        self,
+        name: str,
+        payload: dict,
+        required_placement: frozenset[str] | None = None,
+        latency_budget_ms: float | None = None,
+        *,
+        allow_buffer: bool = False,
+    ) -> StreamPlan:
+        """Plan a streaming request, optionally as a buffered streaming cascade.
+
+        When ``allow_buffer`` is set, ``router.mode: cascade`` is active, and
+        ``router.cascade.stream_mode == "buffer"`` (all opt-in; ADR 0019), a
+        two-hop cascade route is returned as a ``cascade_buffer`` plan: the chat
+        endpoint buffers the cheap hop, scores it, and then either replays the
+        buffered answer or streams the stronger model — never interleaving two
+        models into one stream. Otherwise this collapses to the single
+        ``fallback_single`` pick (identical to :meth:`resolve_stream`).
+        """
+        req = frozenset(required_placement or ())
+        cfg = self.router.cfg if self.router is not None else None
+        want_buffer = (
+            allow_buffer
+            and cfg is not None
+            and cfg.mode == "cascade"
+            and getattr(cfg.cascade, "stream_mode", "fallback_single") == "buffer"
+        )
+        if self.router is not None and name == self.settings.router_alias:
+            async with self._router_lock:
+                decision = await asyncio.to_thread(
+                    self.router.route, payload, req, latency_budget_ms, True
+                )
+            if decision.cascade and len(decision.cascade) > 1:
+                if want_buffer:
+                    primary, strong = decision.cascade[0], decision.cascade[-1]
+                    return StreamPlan(
+                        route_path=f"{primary}->{strong} (cascade:buffer)",
+                        kind="cascade_buffer",
+                        hops=list(decision.cascade),
+                        cascade_cfg=self.router.cfg.cascade,
+                        public_name=name,
+                        required_placement=req,
+                    )
+                strong = decision.cascade[-1]
+                self.router.record_cascade(
+                    decision.cascade[0], strong, False, "stream_fallback_single"
+                )
+                return StreamPlan(
+                    route_path=f"{strong} (cascade->single: streaming)",
+                    kind="single",
+                    concrete=strong,
+                    public_name=name,
+                    required_placement=req,
+                )
+            return StreamPlan(
+                route_path=decision.chosen,
+                kind="single",
+                concrete=decision.chosen,
+                public_name=name,
+                required_placement=req,
+            )
+        self._members_for(name, req)  # fail-closed placement for explicit models
+        return StreamPlan(
+            route_path=name, kind="single", concrete=name, public_name=name, required_placement=req
+        )
 
     def _record_hop(
         self, endpoint: str, requested: str, result: dict, request_id: str, status: str
@@ -966,6 +1098,62 @@ class ModelManager:
         if isinstance(result2, dict):
             result2["_broker_route"] = f"{primary_served}->{served}"
         return result2
+
+    async def stream_cascade_buffer(
+        self,
+        plan: StreamPlan,
+        payload: dict,
+        request_id: str,
+        route_key: str | None = None,
+        allowed_models: set[str] | None = None,
+        model_guard: Callable[[str], Awaitable[None]] | None = None,
+    ) -> AsyncIterator[bytes]:
+        """Serve a buffered streaming cascade (ADR 0019): buffer, score, then
+        replay or stream the stronger model.
+
+        The cheap hop is served **non-streamed** so its complete answer can be
+        scored by the same :func:`should_escalate` signals as the non-stream
+        cascade. If it passes, the buffered answer is **replayed** as a single
+        stream. If a signal fires, the stronger hop is **streamed live**. Only
+        one model's output is ever emitted into the stream — the invariant that a
+        cascade never mixes two models' tokens holds for streaming too. Per-key
+        scoping (ADR 0008) is enforced fail-closed on both hops.
+        """
+        hops = plan.hops or []
+        primary, escalation = hops[0], hops[-1]
+        req = plan.required_placement
+        self._check_allowed(primary, allowed_models)
+        if model_guard is not None:
+            await model_guard(primary)
+        # Serve the cheap hop fully (non-streamed) so we can inspect its answer.
+        result = await self._serve_one(primary, payload, request_id, route_key, req)
+        escalate, reason = should_escalate(result, plan.cascade_cfg)
+        primary_served = result.get("model", primary) if isinstance(result, dict) else primary
+        if not escalate:
+            if self.router is not None:
+                self.router.record_cascade(primary_served, escalation, False, "")
+            plan.served = primary_served
+            for chunk in _result_to_sse_chunks(result, primary_served):
+                yield chunk
+            return
+        # Escalate: fail-closed scope check on the stronger hop, record the
+        # primary hop, then stream the stronger model live (its output only).
+        self._check_allowed(escalation, allowed_models)
+        if model_guard is not None:
+            await model_guard(escalation)
+        self._record_hop("chat_cascade", plan.public_name, result, request_id, "escalated")
+        if self.router is not None:
+            self.router.record_cascade(primary_served, escalation, True, reason)
+        plan.served = escalation
+        async for chunk in self.stream_chat(
+            escalation,
+            payload,
+            request_id,
+            route_key=route_key,
+            required_placement=req,
+            allowed_models=allowed_models,
+        ):
+            yield chunk
 
     async def _serve_chat(
         self, m: ManagedModel, public_name: str, payload: dict, request_id: str

@@ -28,14 +28,18 @@ router:
   # Heuristic-backend scoring weights (also used on LLM fallback). Capability
   # match dominates by default; raise `cost` to push cheaper models harder,
   # `prefer_loaded` to favor already-loaded models, `priority` to weight each
-  # model's `priority` field.
-  weights: { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0 }
+  # model's `priority` field. `cost_normalized` (default false = v0.5.0) keeps
+  # the cost term un-normalized: a large price gap can outweigh a single
+  # capability match. Set it true (ADR 0019 opt-in) to normalize the cost term to
+  # [0,1]·cost so one capability match always wins over price — note this changed
+  # NOTHING on the orchestrator's independent eval set, so it is left opt-in.
+  weights:
+    { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0, cost_normalized: false }
 
-  # --- Cascade mode (opt-in; ADR 0011) ---------------------------------------
+  # --- Cascade mode (opt-in; ADR 0011 + 0019) --------------------------------
   # "single" (default) = one-shot classification. "cascade" = serve the cheapest
   # capable model first, inspect its ACTUAL answer, and escalate ONCE to a stronger
-  # capable model when a signal fires. Non-streaming only; a streaming cascade
-  # request falls back to the single strong pick (see docs/auto-router.md).
+  # capable model when a signal fires (see docs/auto-router.md).
   # mode: cascade
   # cascade:
   #   escalate_on_length: true     # first hop truncated (finish_reason == "length")
@@ -43,6 +47,21 @@ router:
   #   min_chars: 1                 # shorter than this (stripped) => escalate
   #   escalate_on_refusal: true    # answer matches a refusal pattern
   #   refusal_patterns: ["(?i)\\bI\\s+cannot\\b", "(?i)as an AI\\b"]
+  #   # Streaming (ADR 0019): "fallback_single" (default) serves the single strong
+  #   # pick; "buffer" makes the chat endpoint buffer the cheap hop, score it, then
+  #   # replay it or stream the stronger hop (never mixing two models in a stream).
+  #   stream_mode: fallback_single
+  #   # Calibrated reliability scorer (ADR 0019, opt-in): one tunable threshold in
+  #   # place of the booleans. Graded features (length + optional token logprobs)
+  #   # with hard refusal/truncation gates; escalate when score < threshold.
+  #   scorer:
+  #     enabled: false
+  #     threshold: 0.5             # escalate when reliability < 0.5
+  #     target_chars: 200          # length (stripped) at which length-feature = 1
+  #     weight_length: 1.0
+  #     weight_logprob: 0.0        # >0 uses token logprobs when present
+  #     gate_refusal: true         # a refusal always escalates
+  #     gate_truncation: true      # finish_reason == "length" always escalates
 
   # --- Latency budget (opt-in; ADR 0011) -------------------------------------
   # Default per-request latency budget in ms. If the chosen model's estimated

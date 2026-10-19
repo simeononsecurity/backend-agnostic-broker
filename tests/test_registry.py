@@ -51,6 +51,23 @@ def test_pricing_block_parsed_and_survives_backend_filter(tmp_path):
     assert reg.pricing["a"].output_per_million == 1.5
 
 
+def test_router_weights_cost_normalized_defaults_off_and_parses(tmp_path):
+    # ADR 0019 follow-up: the new router.weights.cost_normalized knob defaults to
+    # v0.5.0 behavior (off) and round-trips from YAML when set true.
+    p = tmp_path / "rw.yaml"
+    p.write_text(
+        "router:\n  default: a\n  weights: { capability: 3.0, cost: 1.0, cost_normalized: true }\n"
+        "models:\n  - alias: a\n    backend: fake\n    runtime_model_id: x\n"
+    )
+    reg = load_registry(str(p), enabled_backends={"fake"})
+    assert reg.router.weights.cost_normalized is True
+
+    p2 = tmp_path / "rw2.yaml"
+    p2.write_text("models:\n  - alias: a\n    backend: fake\n    runtime_model_id: x\n")
+    reg2 = load_registry(str(p2), enabled_backends={"fake"})
+    assert reg2.router.weights.cost_normalized is False  # default = v0.5.0
+
+
 def test_pricing_rejects_negative(tmp_path):
     p = tmp_path / "negprice.yaml"
     p.write_text(

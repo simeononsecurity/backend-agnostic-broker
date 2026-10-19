@@ -84,6 +84,48 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     property; rotation covers the operational need.
 - CLI `broker.keys create` gains `--rpm-burst`, `--placement`, `--per-model`;
   new `rotate` subcommand.
+- **Router v2** (ADR 0019), resolving every deferred item from ADR 0011. All new
+  behavior is **opt-in and default-off** — a request/registry with none of the new
+  knobs reproduces v0.5.0 exactly.
+  - **TTFT estimation.** The usage log records **time-to-first-token** (`ttft_ms`)
+    for streaming requests via a backward-compatible additive schema migration (an
+    existing `usage.sqlite3` is upgraded in place; old rows keep NULL). The
+    latency-budget router uses the **TTFT** p90 for a **streaming** request and the
+    **end-to-end** p90 otherwise (`UsageLog.latency_percentiles(metric=...)`).
+  - **Calibrated cascade reliability scorer** (`router.cascade.scorer`, opt-in).
+    Reduces the cheap hop's answer to one reliability score in `[0,1]` — graded
+    length + optional token-logprob features with hard refusal/truncation gates —
+    and escalates when `score < threshold`, giving one tunable knob in place of the
+    booleans (which remain the default). The trained FrugalGPT-style scorer was
+    **rejected** (needs labeled data + a model); see ADR 0019.
+  - **Buffered streaming cascade** (`router.cascade.stream_mode: buffer`, opt-in).
+    The chat endpoint buffers the cheap hop, scores it, then **replays** it as a
+    stream or **streams the stronger hop live** — never mixing two models' output in
+    one stream. Per-key scope (ADR 0008) and per-model limits (ADR 0016) are enforced
+    on **both** hops. Default `fallback_single` (= v0.5.0); completions/responses keep
+    `fallback_single`.
+  - **Heuristic code/math/reasoning accuracy via structural features.** Instead of
+    growing keyword lists (which over-fit), the scorer reads the **structure** of a
+    request: code-like punctuation / file extensions / CLI-tool & language names /
+    error shapes; digit-operator/fraction/`prime`/`sum of` math phrasing; and
+    `why`/`prove`/`plan`/`trade-off`, syllogisms, and long multi-constraint
+    questions. Keyword lists are reverted to v0.5.0 (minus the over-broad `"write a"`
+    creative token). Accuracy is reported by **independence**, with the **blind** set
+    (a 44-prompt set the implementer never saw, `tests/data/router_eval_blind.jsonl`,
+    authored by the orchestrator) as the **headline**: v0.5.0 → now **code 0.08 → 0.75,
+    math 0.00 → 0.70, reasoning 0.00 → 0.44**, chat/creative 1.0. The earlier
+    "independent" set (`router_eval_independent.jsonl`, code 0.92 / math 0.90 /
+    reasoning 1.00) was **seen during the fix**, so it is labeled as such and is not
+    the headline. In-sample PGR stays **< 1.0** (not saturated). Keyword heuristics
+    generalize only partially — the docs point to the LLM router backend / cascade
+    for hard routing; per-feature unit tests, the frozen disjoint sets, and the
+    honest per-task floors are enforced in tests.
+  - **`router.weights.cost_normalized`** (opt-in, default **false** = v0.5.0). The
+    ADR 0019 normalized-cost term is gated behind this knob because it made **no
+    difference on the independent set** (it only lifted in-sample numbers); the
+    unjustified default change is reverted.
+  - Example: `examples/auto-router/` (registry with tags/cost tiers + cascade +
+    scorer + buffer + latency budget + placement, a README, and a tested pytest).
 
 ### Changed
 

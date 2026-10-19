@@ -59,7 +59,7 @@ Data-driven policy for the `auto` alias (see [auto-router.md](auto-router.md)):
 | `default` | str? | _(none)_ | Deterministic fallback model id when the classifier returns an invalid choice. |
 | `policy` | str? | _(none)_ | System-prompt / routing-policy override for the LLM classifier. |
 | `overrides` | list | `[]` | Hard `when → use` rules, first match bypasses the LLM (skipped if the target isn't a valid candidate). |
-| `weights` | object | _(see below)_ | Heuristic scoring weights: `capability` (3.0), `cost` (1.0), `prefer_loaded` (1.0), `priority` (1.0). |
+| `weights` | object | _(see below)_ | Heuristic scoring weights: `capability` (3.0), `cost` (1.0), `prefer_loaded` (1.0), `priority` (1.0), `cost_normalized` (false). `cost_normalized: false` (default = v0.5.0) keeps the un-normalized cost term `(5 − cost_tier)·cost`, where a large price gap can outweigh a single capability match; `true` (ADR 0019 opt-in) normalizes it to `[0,1]·cost` so one capability match always beats price. |
 | `mode` | str | `single` | `single` (one-shot, default) or `cascade` (cheapest-capable first, escalate once on a signal — ADR 0011). |
 | `cascade` | object | _(see below)_ | Escalation signals for `mode: cascade`. |
 | `latency_budget_ms` | float? | _(none)_ | Default latency budget (ms); the `x-broker-latency-budget-ms` header wins, then this, then `BROKER_ROUTER_LATENCY_BUDGET_MS`. |
@@ -79,6 +79,26 @@ the request escalates once to a stronger capable model (ADR 0011).
 | `min_chars` | int | `1` | Minimum acceptable answer length (characters, stripped). |
 | `escalate_on_refusal` | bool | `true` | Escalate when the answer matches a refusal regex. |
 | `refusal_patterns` | list[str] | _(built-in set)_ | Refusal regexes (validated at load). |
+| `stream_mode` | str | `fallback_single` | Streaming cascade mode (ADR 0019): `fallback_single` (= v0.5.0, serve the single strong pick) or `buffer` (chat endpoint buffers the cheap hop, scores it, then replays it or streams the stronger hop — never mixing two models). |
+| `scorer` | object | _(disabled)_ | Opt-in calibrated reliability scorer (ADR 0019); see below. |
+
+#### `cascade.scorer` (ScorerConfig) — ADR 0019
+
+Opt-in. When `enabled`, the cheap hop's answer is reduced to one reliability score
+in `[0, 1]` and the hop escalates when `score < threshold`, instead of the booleans
+above. The score is a weighted mean of **graded** features (length adequacy +
+optional token-logprob confidence) with **hard gates** (refusal / truncation cap the
+score to 0). Default-off preserves v0.5.0 behavior.
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `enabled` | bool | `false` | Use the scorer instead of the boolean signals. |
+| `threshold` | float | `0.5` | Escalate when reliability `< threshold` (must be in `[0,1]`). |
+| `target_chars` | int | `200` | Answer length (stripped) at which the length feature saturates to 1. |
+| `weight_length` | float | `1.0` | Weight of the length-adequacy feature (`>= 0`). |
+| `weight_logprob` | float | `0.0` | Weight of the token-logprob confidence feature, used only when the response carries logprobs (`>= 0`). |
+| `gate_refusal` | bool | `true` | A refusal match caps the score to 0 (always escalate). |
+| `gate_truncation` | bool | `true` | `finish_reason == "length"` caps the score to 0 (always escalate). |
 
 ### `pricing` (top-level, optional) — ADR 0008
 

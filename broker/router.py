@@ -86,13 +86,93 @@ class RouteDecision:
     latency_estimate_ms: float | None = None  # estimate for the chosen model
 
 
+def _logprob_confidence(result: dict) -> float | None:
+    """Mean per-token probability from OpenAI ``logprobs`` if present, else None.
+
+    Reads ``choices[0].logprobs.content[*].logprob`` (natural-log probabilities)
+    and returns ``exp(mean(logprob)) in (0, 1]`` — a confidence proxy. Returns
+    ``None`` when the response carries no usable logprobs so the scorer can skip
+    the feature instead of inventing a value.
+    """
+    choices = result.get("choices") or []
+    if not choices:
+        return None
+    lp = (choices[0] or {}).get("logprobs") or {}
+    content = lp.get("content")
+    if not isinstance(content, list) or not content:
+        return None
+    vals = [
+        float(t["logprob"])
+        for t in content
+        if isinstance(t, dict) and isinstance(t.get("logprob"), (int, float))
+    ]
+    if not vals:
+        return None
+    import math
+
+    return math.exp(sum(vals) / len(vals))
+
+
+def reliability_score(result: dict, cfg: CascadeConfig) -> tuple[float, dict]:
+    """Calibrated reliability score in ``[0, 1]`` for a cascade first-hop answer.
+
+    Graded part (tunable): a weighted mean of answer-length adequacy and — when
+    the response carries token logprobs — mean token probability. Hard safety
+    gates: a refusal match or a truncation caps the score to 0 so it always
+    escalates (parity with the v0.5.0 booleans). Pure and dependency-free.
+    Returns ``(score, features)`` where ``features`` is a breakdown for logging.
+    """
+    sc = cfg.scorer
+    choices = result.get("choices") or []
+    ch = (choices[0] if choices else {}) or {}
+    finish = ch.get("finish_reason")
+    content = (ch.get("message") or {}).get("content")
+    text = content.strip() if isinstance(content, str) else ""
+
+    f_length = min(1.0, len(text) / float(sc.target_chars))
+    conf = _logprob_confidence(result)
+    graded: list[tuple[float, float]] = [(sc.weight_length, f_length)]
+    if conf is not None:
+        graded.append((sc.weight_logprob, conf))
+    wsum = sum(w for w, _ in graded)
+    graded_score = (sum(w * v for w, v in graded) / wsum) if wsum > 0 else 1.0
+
+    refused = sc.gate_refusal and any(_safe_search(p, text) for p in cfg.refusal_patterns)
+    truncated = sc.gate_truncation and finish == "length"
+    score = 0.0 if (refused or truncated) else graded_score
+    breakdown = {
+        "score": round(score, 4),
+        "length": round(f_length, 4),
+        "refused": refused,
+        "truncated": truncated,
+        "logprob": (round(conf, 4) if conf is not None else None),
+    }
+    return score, breakdown
+
+
+def _safe_search(pattern: str, text: str) -> bool:
+    try:
+        return bool(re.search(pattern, text))
+    except re.error:  # pragma: no cover - validated at load time
+        return False
+
+
 def should_escalate(result: dict, cfg: CascadeConfig) -> tuple[bool, str]:
     """Decide whether a cascade's first-hop response warrants escalation.
 
     Pure and data-driven: inspects the *actual* OpenAI chat-completion result
     against the configured signals and returns ``(escalate, reason)``. The
     reason is a short machine-friendly tag for the decision/usage log.
+
+    When ``cfg.scorer.enabled`` (ADR 0019) the fixed boolean signals are replaced
+    by a single calibrated reliability score with one threshold; otherwise the
+    v0.5.0 boolean signals (length / empty / refusal) are used unchanged.
     """
+    if getattr(cfg, "scorer", None) is not None and cfg.scorer.enabled:
+        score, _ = reliability_score(result, cfg)
+        if score < cfg.scorer.threshold:
+            return (True, f"reliability={score:.2f}<{cfg.scorer.threshold:.2f}")
+        return (False, "")
     choices = result.get("choices") or []
     if not choices:
         # No choices at all is as bad as empty output.
@@ -189,6 +269,17 @@ class RouterBackend:
 
 # Tag -> keyword synonyms for intent matching. The registry's ``tags`` are the
 # vocabulary; this just broadens matching for common classes (data, easy to edit).
+#
+# NOTE (ADR 0019 follow-up): this list is intentionally kept SMALL — close to the
+# v0.5.0 vocabulary, not the bloated set that was tuned to the author's held-out
+# split. (The one deletion from v0.5.0 is the over-broad creative token "write a",
+# which is a generic instruction prefix, not a creative signal — it mis-stole
+# "write a python function ..." code prompts for the cheap generalist; removing it
+# raised independent-set code accuracy.) Keyword matching memorizes vocabulary and
+# generalizes poorly to natural prompts that share no word with the list (e.g.
+# "convert this bash loop to use xargs"). Generalization comes from the STRUCTURAL
+# features below, not from growing this dict. Do not add task-specific vocabulary
+# here to pass an eval.
 _TAG_KEYWORDS: dict[str, list[str]] = {
     "code": [
         "code",
@@ -215,7 +306,7 @@ _TAG_KEYWORDS: dict[str, list[str]] = {
     "vision": ["image", "photo", "picture", "screenshot", "diagram", "chart", "vision"],
     "reasoning": ["reason", "prove", "theorem", "logic", "step by step", "deduce", "analyze"],
     "math": ["math", "calculate", "equation", "integral", "derivative", "algebra", "arithmetic"],
-    "creative": ["poem", "story", "novel", "lyrics", "creative", "essay", "haiku", "write a"],
+    "creative": ["poem", "story", "novel", "lyrics", "creative", "essay", "haiku"],
     "long-context": ["summarize", "summarise", "transcript", "whole document", "entire"],
     "json": ["json", "schema", "structured output"],
     "tools": ["tool", "function call", "api call", "call the"],
@@ -226,6 +317,143 @@ def _keywords_for(tag: str) -> list[str]:
     return _TAG_KEYWORDS.get(tag.lower(), [tag.lower()])
 
 
+# --- structural intent features (ADR 0019 follow-up) --------------------------
+#
+# These detectors look at the *shape* of a request rather than its exact words,
+# so they transfer to prompts the author never saw. Each ``*_strength`` function
+# returns a value in ``[0, 1]`` (0 = no signal). They are deliberately built from
+# structure classes the task defined — code-like punctuation / file extensions /
+# CLI-tool & language names / error shapes; arithmetic operators & math phrasing;
+# argument / puzzle / planning structure — NOT from per-prompt vocabulary. Each
+# feature has a unit test over prompts that appear in no eval dataset.
+
+# Code structure -------------------------------------------------------------
+_CODE_PUNCT = re.compile(r"`|\(\)|[{}]|(?<!\w);|->|=>|::|\[\]|&&|\|\||\$\(|/\*")
+_FILE_EXT = re.compile(
+    r"\.(py|js|ts|jsx|tsx|rs|go|rb|c|cc|cpp|h|hpp|java|kt|swift|scala|sh|bash|"
+    r"sql|html|css|json|ya?ml|toml|php|lua|pl)\b"
+)
+_CLI_TOOLS = re.compile(
+    r"\b(git|docker|dockerfile|kubectl|k8s|kubernetes|helm|terraform|ansible|"
+    r"npm|yarn|pnpm|pip|cargo|rustc|gcc|clang|gdb|make|cmake|bazel|curl|wget|"
+    r"xargs|grep|sed|awk|jq|ssh|scp|bash|zsh|pytest|jest|mocha|psql|mysql|"
+    r"sqlite|redis|nginx|systemctl|ffmpeg|webpack|vite)\b"
+)
+_LANG_TECH = re.compile(
+    r"\b(python|javascript|typescript|golang|rust|ruby|kotlin|swift|scala|"
+    r"haskell|perl|php|react|vue|angular|svelte|flask|django|fastapi|express|"
+    r"nodejs|node\.js|spring|rails|laravel|pandas|numpy|pytorch|tensorflow|"
+    r"sklearn)\b"
+)
+_CODE_TOKENS = re.compile(
+    r"\b(struct|interface|enum|async|await|coroutine|lambda|pointer|segfault|"
+    r"stacktrace|traceback|exception|compiler|runtime|stdout|stderr|boolean|"
+    r"closure|middleware|endpoint|nullpointer|crashloopbackoff|borrow checker|"
+    r"linked list|binary search|list comprehension|type hints?)\b"
+)
+_ERROR_SHAPE = re.compile(
+    r"segmentation fault|segfault|stack ?trace|traceback|null ?pointer|"
+    r"cannot read propert|\bundefined\b|crashloopbackoff|core dump|panic|"
+    r"syntax error|runtime error|compile error|exit code|\bline \d+\b|re-?render"
+)
+# camelCase / PascalCase-with-two-humps identifiers (setState, useEffect,
+# CrashLoopBackOff). A single leading capital (Title Case prose) does not match.
+_CAMEL = re.compile(r"\b[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*\b|\b[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*\b")
+
+# Math structure -------------------------------------------------------------
+# Arithmetic operators glued to digits/variables, exponents, fractions, equations.
+_MATH_SYMBOLIC = re.compile(
+    r"\^|\b\d+\s*[-+*/x]\s*\d|\d\s*%|=\s*-?\d|-?\d\s*=|\b\d+\s*/\s*\d|"
+    r"\b[a-z]\s*=|\b[a-z]\^?\d|\d+x\d+|\b\d+(\.\d+)\b"
+)
+_MATH_WORDS = re.compile(
+    r"\b(prime|roots?|factorial|fraction|probability|permutation|combination|"
+    r"divisor|modulo|remainder|polynomial|matrix|determinant|deviation|variance|"
+    r"quadratic|logarithm|exponent|percent|integral|derivative|infinity|"
+    r"odd numbers|even numbers)\b|sum of|expected value|how many ways|"
+    r"square root|greatest common|least common|standard deviation|area of"
+)
+
+# Reasoning / argument / planning structure ----------------------------------
+_REASON_WORDS = re.compile(
+    r"\bwhy\b|\bprove\b|\bproof\b|pros and cons|trade[- ]?offs?|counterexample|"
+    r"fallac(y|ies)|\bflaw\b|\bargument\b|\bdeduce\b|\breasoning\b|\bparadox\b|"
+    r"step[- ]by[- ]step|how many ways|\bplan\b|\bweigh\b|\bcritique\b|"
+    r"first cause|correlation|causation|\bpuzzle\b"
+)
+_SYLLOGISM = re.compile(r"\bif (all|some|no|every|any|each)\b")
+_FAIR_DESIGN = re.compile(r"\b(fair|fairly|optimal)\b.*\b(way|split|divide|allocat|schedul)")
+
+
+def _strength(hits: int) -> float:
+    """Map a structural hit count to a capability-boost strength in ``[0, 1]``.
+
+    One signal is enough to route (0.7, which still beats the cheap generalist),
+    two or more make it unambiguous (1.0). Pure; no per-prompt tuning.
+    """
+    if hits <= 0:
+        return 0.0
+    if hits == 1:
+        return 0.7
+    return 1.0
+
+
+def code_strength(message: str) -> float:
+    """Structural likelihood that a request is a coding task, in ``[0, 1]``."""
+    m = message
+    low = message.lower()
+    hits = 0
+    hits += bool(_CODE_PUNCT.search(m))
+    hits += bool(_FILE_EXT.search(low))
+    hits += bool(_CLI_TOOLS.search(low))
+    hits += bool(_LANG_TECH.search(low))
+    hits += bool(_CODE_TOKENS.search(low))
+    hits += bool(_ERROR_SHAPE.search(low))
+    hits += bool(_CAMEL.search(m))
+    return _strength(hits)
+
+
+def math_strength(message: str) -> float:
+    """Structural likelihood that a request is a math task, in ``[0, 1]``."""
+    low = message.lower()
+    hits = 0
+    hits += bool(_MATH_SYMBOLIC.search(low))
+    hits += bool(_MATH_WORDS.search(low))
+    return _strength(hits)
+
+
+def reasoning_strength(message: str) -> float:
+    """Structural likelihood that a request is a reasoning task, in ``[0, 1]``."""
+    low = message.lower()
+    hits = 0
+    hits += bool(_REASON_WORDS.search(low))
+    hits += bool(_SYLLOGISM.search(low))
+    hits += bool(_FAIR_DESIGN.search(low))
+    # Multi-constraint, lengthy questions are usually reasoning even without a
+    # cue word: a long prompt that asks something and stacks constraints.
+    words = low.split()
+    if len(words) >= 18 and ("?" in message or low.count(",") >= 2):
+        hits += 1
+    return _strength(hits)
+
+
+def structural_intents(message: str) -> dict[str, float]:
+    """Per-intent structural strengths keyed by the registry ``tag`` they credit.
+
+    ``math`` also credits the ``reasoning`` tag: a math problem is served fine by
+    a reasoning-capable model, so a model tagged ``reasoning`` (but not ``math``)
+    still gets the boost. Returned values are in ``[0, 1]``.
+    """
+    code_s = code_strength(message)
+    math_s = math_strength(message)
+    reason_s = reasoning_strength(message)
+    return {
+        "code": code_s,
+        "math": math_s,
+        "reasoning": max(reason_s, math_s),
+    }
+
+
 class HeuristicRouterBackend(RouterBackend):
     """Deterministic scorer: capability match dominates, then cost/loaded/priority."""
 
@@ -234,11 +462,19 @@ class HeuristicRouterBackend(RouterBackend):
     def score(self, flags: RequestFlags, message: str, c: Candidate, w: RouterWeights) -> float:
         msg = message.lower()
         tags = {t.lower() for t in c.tags}
+        intents = structural_intents(message)
         s = 0.0
-        # Intent match: reward tags whose keywords appear in the message.
+        # Intent match: reward a tag when its keywords appear (vocabulary) OR when
+        # the request's STRUCTURE matches that intent (generalizes to unseen
+        # prompts). Structure gives a partial-to-full capability boost; a keyword
+        # hit is a full one. Per tag we take whichever is stronger (no double
+        # count between the keyword and structural view of the same tag).
         for tag in tags:
-            if any(kw in msg for kw in _keywords_for(tag)):
-                s += w.capability
+            kw = 1.0 if any(kw in msg for kw in _keywords_for(tag)) else 0.0
+            st = intents.get(tag, 0.0)
+            match = max(kw, st)
+            if match > 0.0:
+                s += w.capability * match
         # Flag-driven capability boosts.
         if flags.has_images and "vision" in tags:
             s += w.capability
@@ -248,8 +484,16 @@ class HeuristicRouterBackend(RouterBackend):
             s += w.capability * 0.5
         if flags.approx_ctx_tokens > 8000 and "long-context" in tags:
             s += w.capability
-        # Prefer cheaper, already-loaded, higher-priority models (tie-breakers).
-        s += (5 - c.cost_tier) * w.cost
+        # Prefer cheaper, already-loaded, higher-priority models. When
+        # ``w.cost_normalized`` (ADR 0019, justified on the independent set) the
+        # cost term is NORMALIZED to [0, 1]·w.cost (0 = most expensive tier, 1 =
+        # cheapest) so at the default weights it stays a TIE-BREAKER and can never
+        # outweigh a single capability match — a cheap generalist no longer beats
+        # the one capable model on a code/math prompt. With it off the v0.5.0
+        # un-normalized term ``(5 - cost_tier)·w.cost`` is used (cost can dominate
+        # capability). The eval's cost sweep traces the full curve either way.
+        cost_term = (5 - c.cost_tier) / 4.0 if w.cost_normalized else (5 - c.cost_tier)
+        s += cost_term * w.cost
         if c.loaded:
             s += w.prefer_loaded
         s += c.priority * w.priority
@@ -502,6 +746,7 @@ class AutoRouter:
         payload: dict,
         required_placement: frozenset[str] | None = None,
         latency_budget_ms: float | None = None,
+        stream: bool = False,
     ) -> RouteDecision:
         t0 = time.monotonic()
         req_place = frozenset(required_placement or ())
@@ -533,6 +778,7 @@ class AutoRouter:
             message[:256],
             tuple(sorted(req_place)),
             budget,
+            stream,
         )
         if cache_key in self._cache:
             cached = self._cache[cache_key]
@@ -569,7 +815,7 @@ class AutoRouter:
         # candidate (never below the capability/placement filters).
         est: float | None = None
         if budget is not None:
-            pick, via, est = self._apply_latency_budget(pick, via, candidates, budget)
+            pick, via, est = self._apply_latency_budget(pick, via, candidates, budget, stream)
 
         self._store(cache_key, pick)
         return self._finish(
@@ -635,16 +881,25 @@ class AutoRouter:
             return [primary]
         return [primary, strong]
 
-    def _latency_estimates(self, candidates: list[Candidate]) -> dict[str, float | None]:
+    def _latency_estimates(
+        self, candidates: list[Candidate], stream: bool = False
+    ) -> dict[str, float | None]:
         """Per-candidate estimated latency (ms): usage-log p90 + cold-start penalty.
 
-        ``None`` means no data yet for that model (so the budget can't rank it).
+        For a streaming request the estimate uses **time-to-first-token** (TTFT,
+        ADR 0019) — the latency a streaming client actually perceives before the
+        first token — summarized only over prior streamed samples. For a
+        non-streaming request it uses end-to-end latency. ``None`` means no usable
+        sample yet for that model (so the budget can't rank it).
         """
         stats: dict[str, dict[str, float]] = {}
         usage = getattr(self.manager, "usage", None)
         if usage is not None:
             try:
-                stats = usage.latency_percentiles(self.settings.router_latency_window_seconds)
+                stats = usage.latency_percentiles(
+                    self.settings.router_latency_window_seconds,
+                    metric="ttft" if stream else "latency",
+                )
             except Exception as exc:  # noqa: BLE001 - never break routing on the log
                 log.warning("latency estimate unavailable: %s", exc)
                 stats = {}
@@ -661,9 +916,14 @@ class AutoRouter:
         return out
 
     def _apply_latency_budget(
-        self, chosen: str, via: str, candidates: list[Candidate], budget: float
+        self,
+        chosen: str,
+        via: str,
+        candidates: list[Candidate],
+        budget: float,
+        stream: bool = False,
     ) -> tuple[str, str, float | None]:
-        ests = self._latency_estimates(candidates)
+        ests = self._latency_estimates(candidates, stream)
         chosen_est = ests.get(chosen)
         if chosen_est is None or chosen_est <= budget:
             return chosen, via, chosen_est
@@ -768,5 +1028,6 @@ __all__ = [
     "RouterBackend",
     "RouterUnavailable",
     "extract_flags",
+    "reliability_score",
     "should_escalate",
 ]

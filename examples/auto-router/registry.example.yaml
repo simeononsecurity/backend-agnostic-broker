@@ -1,0 +1,107 @@
+# examples/auto-router/registry.example.yaml
+#
+# A complete `auto`-router registry exercising every router feature from ADR 0004
+# / 0011 / 0019: per-model tags + priority + cost tiers, a cascade with the
+# calibrated reliability scorer and the buffered streaming mode, a latency budget,
+# hard overrides, and fail-closed placement labels.
+#
+# The models use `backend: fake` so this example is fully runnable offline (the
+# bundled test serves real requests against it). In a real deployment, swap each
+# `backend`/`runtime_model_id`/`base_url` for your Ollama / vLLM / llama.cpp model;
+# the router metadata (tags, cost_tier, placement, the whole `router` block) is
+# unchanged.
+
+router:
+  # Deterministic fallback if the classifier returns an invalid/empty choice.
+  default: tiny
+  # Heuristic scoring weights (capability dominates; cost is a tie-breaker).
+  # cost_normalized: true (ADR 0019 opt-in) normalizes the cost term to [0,1]·cost
+  # so a single capability match always beats price — here it keeps a code prompt
+  # on the dedicated `coder` instead of letting the cheap generalist win the tie
+  # and escalate to the pricier `reasoner`. The broker default is false (v0.5.0).
+  weights:
+    { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0, cost_normalized: true }
+
+  # Hard overrides (data), checked in order; the first capable match wins.
+  overrides:
+    - when: { has_images: true }      # always send images to the vision model
+      use: vizard
+    - when: { min_ctx_tokens: 32000 } # big contexts go to the long-context model
+      use: longboi
+
+  # Cascade: serve the cheapest capable model, escalate once on a bad answer.
+  mode: cascade
+  cascade:
+    # Calibrated reliability scorer (ADR 0019): one tunable threshold instead of
+    # the fixed booleans. Escalate when reliability < threshold.
+    scorer:
+      enabled: true
+      threshold: 0.5
+      target_chars: 200
+      weight_length: 1.0
+      weight_logprob: 0.0     # set >0 if your backend returns token logprobs
+      gate_refusal: true      # a refusal always escalates
+      gate_truncation: true   # finish_reason == "length" always escalates
+    # Streaming cascade (ADR 0019): buffer the cheap hop, score it, then replay it
+    # or stream the stronger hop (chat endpoint; never mixes two models).
+    stream_mode: buffer
+
+  # Latency budget (ADR 0011/0019): if the chosen model's estimated latency
+  # exceeds this, pick the fastest capable model instead. For streaming requests
+  # the estimate is time-to-first-token; otherwise end-to-end. Header
+  # `x-broker-latency-budget-ms` overrides this per request.
+  latency_budget_ms: 4000
+
+models:
+  - alias: tiny
+    backend: fake
+    runtime_model_id: tiny-chat-v1
+    tags: [general, cheap, fast, chat, creative]
+    description: cheap generalist for chat & short creative tasks
+    cost_tier: 1
+    priority: 1
+    placement: [local]
+
+  - alias: tooly
+    backend: fake
+    runtime_model_id: tool-use-v1
+    tags: [tools, json]
+    description: tool-calling & structured JSON
+    supports_tools: true
+    cost_tier: 2
+    placement: [local]
+
+  - alias: coder
+    backend: fake
+    runtime_model_id: coder-v1
+    tags: [code, reasoning]
+    description: strong at code & debugging
+    supports_tools: true
+    cost_tier: 3
+    placement: [local]
+
+  - alias: vizard
+    backend: fake
+    runtime_model_id: vision-v1
+    tags: [vision]
+    description: vision / image understanding
+    supports_vision: true
+    cost_tier: 4
+    placement: [local]
+
+  - alias: longboi
+    backend: fake
+    runtime_model_id: long-context-v1
+    tags: [long-context]
+    description: long-document summarization
+    context_limit: 200000
+    cost_tier: 4
+    placement: [local]
+
+  - alias: reasoner
+    backend: fake
+    runtime_model_id: reasoner-v1
+    tags: [reasoning, math, general]
+    description: deep reasoning & math
+    cost_tier: 5
+    placement: [local]

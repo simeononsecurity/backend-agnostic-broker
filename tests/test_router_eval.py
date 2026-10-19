@@ -103,8 +103,12 @@ def test_eval_runs_and_computes_sane_direct_metrics():
 
 def test_pgr_not_clamped_and_well_defined():
     rl = router_eval.run_eval()["routellm"]
-    # Ceiling is a real upper bound, so the operating-point PGR is in-range and
-    # NOT the old saturated 1.000.
+    # Ceiling is a real upper bound (r_strong >= accuracy), so PGR is in range and
+    # defined without the old clamping artifact. This asserts the v0.5.0 guard
+    # UNCHANGED: 0.0 <= PGR < 1.0. The honest structural heuristic does NOT
+    # saturate the bundled train set (a few genuinely weak-signal prompts stay on
+    # the cheap model), so PGR is strictly below the oracle ceiling here — unlike
+    # the overfit keyword set, which hit a saturated 1.0 and forced this bound open.
     assert rl["r_strong"] >= rl["r_weak"]
     assert rl["gap_valid"] is True
     pgr = rl["pgr_router"]

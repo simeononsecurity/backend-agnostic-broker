@@ -569,25 +569,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         start = time.monotonic()
         if req.stream:
-            # Resolve the (possibly auto) route to one concrete model before streaming
-            # so the route is known for the header and placement is enforced up front.
-            concrete, route_path = await manager.resolve_stream(
-                alias, payload, required_placement=placement, latency_budget_ms=budget
+            # Resolve the (possibly auto) route before streaming so the route is
+            # known for the header and placement is enforced up front. The chat
+            # endpoint supports the opt-in buffered streaming cascade (ADR 0019).
+            plan = await manager.plan_stream(
+                alias,
+                payload,
+                required_placement=placement,
+                latency_budget_ms=budget,
+                allow_buffer=True,
             )
 
             async def gen():
                 INFLIGHT.inc()
                 stream_status = "ok"
+                ttft_ms: float | None = None
                 try:
-                    async for chunk in manager.stream_chat(
-                        concrete,
-                        payload,
-                        request_id,
-                        route_key=session_key,
-                        required_placement=placement,
-                        allowed_models=allowed,
-                        model_guard=model_guard,
-                    ):
+                    if plan.kind == "cascade_buffer":
+                        aiter = manager.stream_cascade_buffer(
+                            plan,
+                            payload,
+                            request_id,
+                            route_key=session_key,
+                            allowed_models=allowed,
+                            model_guard=model_guard,
+                        )
+                    else:
+                        aiter = manager.stream_chat(
+                            plan.concrete or alias,
+                            payload,
+                            request_id,
+                            route_key=session_key,
+                            required_placement=placement,
+                            allowed_models=allowed,
+                            model_guard=model_guard,
+                        )
+                    async for chunk in aiter:
+                        if ttft_ms is None:
+                            ttft_ms = (time.monotonic() - start) * 1000
                         yield chunk
                     REQUESTS.labels("chat_stream", alias, "ok").inc()
                 except BrokerError as exc:
@@ -604,12 +623,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     usage.record(
                         endpoint="chat_stream",
                         requested=alias,
-                        model=concrete,
+                        model=plan.served or plan.concrete,
                         request_id=request_id,
                         api_key_id=key_id,
                         latency_ms=(time.monotonic() - start) * 1000,
                         status=stream_status,
                         stream=True,
+                        ttft_ms=ttft_ms,
                     )
 
             return StreamingResponse(
@@ -618,7 +638,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 headers={
                     "x-request-id": request_id,
                     "cache-control": "no-cache",
-                    "x-broker-route": route_path,
+                    "x-broker-route": plan.route_path,
                     **admission.headers,
                 },
             )
@@ -752,6 +772,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             async def gen():
                 INFLIGHT.inc()
                 st = "ok"
+                ttft_ms: float | None = None
                 try:
                     aiter = manager.stream_chat(
                         concrete,
@@ -763,6 +784,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         model_guard=model_guard,
                     )
                     async for out in chat_sse_to_text_sse(aiter, model):
+                        if ttft_ms is None:
+                            ttft_ms = (time.monotonic() - start) * 1000
                         yield out
                     REQUESTS.labels("completions_stream", model, "ok").inc()
                 except BrokerError as exc:
@@ -787,6 +810,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         latency_ms=(time.monotonic() - start) * 1000,
                         status=st,
                         stream=True,
+                        ttft_ms=ttft_ms,
                     )
 
             return StreamingResponse(
@@ -922,6 +946,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             async def gen():
                 INFLIGHT.inc()
                 st = "ok"
+                ttft_ms: float | None = None
                 try:
                     aiter = manager.stream_chat(
                         concrete,
@@ -933,6 +958,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         model_guard=model_guard,
                     )
                     async for out in chat_sse_to_responses_sse(aiter, model):
+                        if ttft_ms is None:
+                            ttft_ms = (time.monotonic() - start) * 1000
                         yield out
                     REQUESTS.labels("responses_stream", model, "ok").inc()
                 except BrokerError as exc:
@@ -957,6 +984,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         latency_ms=(time.monotonic() - start) * 1000,
                         status=st,
                         stream=True,
+                        ttft_ms=ttft_ms,
                     )
 
             return StreamingResponse(

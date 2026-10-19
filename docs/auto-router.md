@@ -113,7 +113,10 @@ build must too.
 # registry.yaml
 router:
   default: small-chat            # deterministic fallback
-  weights: { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0 }
+  # capability/cost/prefer_loaded/priority weights, plus cost_normalized (ADR 0019,
+  # default false = v0.5.0: cost can outweigh capability; set true to make a single
+  # capability match always beat price — see "Honest accuracy" §4).
+  weights: { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0, cost_normalized: false }
   overrides:
     - when: { has_images: true }      # always send images to the vision model
       use: llava
@@ -167,11 +170,12 @@ incapable model.
 - No model loads at broker startup — the classifier model loads lazily on first
   `auto` request and stays resident.
 
-## Advanced routing (ADR 0011, all opt-in)
+## Advanced routing (ADR 0011 + 0019, all opt-in)
 
-These four features are **off by default**; with none configured, `auto` behaves
-exactly as above. Design rationale and prior art: [ADR 0011](adr/0011-auto-router-evolution.md)
-and [docs/research/adr-0011-auto-router-evolution.md](research/adr-0011-auto-router-evolution.md).
+These features are **off by default**; with none configured, `auto` behaves
+exactly as above. Design rationale and prior art: [ADR 0011](adr/0011-auto-router-evolution.md),
+[ADR 0019](adr/0019-router-v2.md), and the research notes under
+[docs/research/](research/).
 
 ### 1. Cascade mode (cheap → escalate once)
 
@@ -193,9 +197,58 @@ router:
 
 Both hops are recorded (usage log + `GET /status` → `router.recent_decisions`),
 and the response header **`x-broker-route`** shows the path (`tiny` or
-`tiny->coder`). **Streaming**: a live stream cannot be cheaply re-scored, so a
-streaming cascade request **falls back to the single strong pick** and the route
-header reads `strong (cascade->single: streaming)`.
+`tiny->coder`).
+
+#### Calibrated reliability scorer (ADR 0019, opt-in)
+
+Instead of the fixed booleans, set `router.cascade.scorer.enabled: true` to reduce
+the cheap hop's answer to one **reliability score** in `[0, 1]` and escalate when
+`score < threshold`. The score combines **graded** features (answer-length adequacy
+and, when the response carries token logprobs, mean token probability) with **hard
+safety gates** (a refusal match or a truncation caps the score to 0, exactly like
+the booleans). This gives one calibrated knob — slide `threshold` up to demand more
+certainty (escalate more), down to let the cheap model carry more load.
+
+```yaml
+router:
+  mode: cascade
+  cascade:
+    scorer:
+      enabled: true
+      threshold: 0.5        # escalate when reliability < 0.5
+      target_chars: 200     # answer length at which the length feature saturates
+      weight_length: 1.0
+      weight_logprob: 0.0   # >0 uses token logprobs when the response has them
+      gate_refusal: true    # a refusal always escalates
+      gate_truncation: true # finish_reason == "length" always escalates
+```
+
+The scorer is **off by default**; disabled, the boolean signals above are used
+unchanged. It is a heuristic aggregator (one tunable threshold + an optional logprob
+signal), not a trained reliability model — see [ADR 0019](adr/0019-router-v2.md) for
+why the trained FrugalGPT-style scorer was rejected.
+
+#### Streaming: fallback-to-single (default) or buffer (ADR 0019)
+
+A live stream cannot be re-scored, so `router.cascade.stream_mode` decides:
+
+- **`fallback_single`** (default, = v0.5.0): a streaming cascade request is served
+  by the single strong pick; the route header reads `strong (cascade->single:
+  streaming)`.
+- **`buffer`**: the **chat** endpoint buffers the cheap hop fully, scores it, then
+  **replays** the buffered answer as a stream (kept path) or **streams the stronger
+  hop live** (escalated path). Only one model's output is ever emitted into a
+  stream — never a mix. The kept path pays the cheap model's full generation time as
+  perceived TTFT (inherent to buffering). The route header reads
+  `tiny->strong (cascade:buffer)`; the executed path is in `GET /status`. The
+  completions/responses streaming endpoints always use `fallback_single`.
+
+```yaml
+router:
+  mode: cascade
+  cascade:
+    stream_mode: buffer   # chat streaming cascade; default is fallback_single
+```
 
 ### 2. Latency budget
 
@@ -204,8 +257,14 @@ Send `x-broker-latency-budget-ms: 2000` (or set `router.latency_budget_ms` /
 from the usage log (ADR 0007) — p90 over `BROKER_ROUTER_LATENCY_WINDOW_SECONDS`,
 plus `BROKER_ROUTER_COLD_START_MS` when the model is not currently resident — and,
 if the chosen model would exceed the budget, picks the fastest capable candidate
-instead. It **never** violates the Stage-1 capability filter or placement. The
-estimate is end-to-end latency (not time-to-first-token).
+instead. It **never** violates the Stage-1 capability filter or placement.
+
+**TTFT for streaming (ADR 0019).** For a **streaming** request the estimate uses
+**time-to-first-token** (the latency a streaming client actually perceives before
+the first token), summarized only over prior *streamed* samples; for a
+**non-streaming** request it uses **end-to-end** latency. A model with no streamed
+samples yet has no TTFT estimate and is simply not ranked by the budget (rather than
+treated as instant). TTFT is recorded automatically for every streaming request.
 
 ### 3. Placement / data-residency pinning (fail-closed)
 
@@ -226,55 +285,109 @@ curl -s localhost:8080/v1/chat/completions -H "Authorization: Bearer ***" \
 ### 4. Evaluation harness
 
 `scripts/router_eval.py` measures routing quality against a labeled set
-(`tests/data/router_eval.jsonl`, ≥40 prompts) instead of vibe-checking it. It runs
-the **heuristic** backend offline (no GPU/network) and optionally the LLM backend
-when a GGUF is available. It reports two families of numbers: **direct metrics**
-(always valid) and **RouteLLM metrics** (PGR / APGR / CPT), each computed both
-from the **router's own swept cost–quality curve** and from an **oracle upper
+(`tests/data/router_eval.jsonl`, 82 prompts, plus a frozen held-out split
+`tests/data/router_eval_heldout.jsonl`, 24 prompts) instead of vibe-checking it. It
+runs the **heuristic** backend offline (no GPU/network) and optionally the LLM
+backend when a GGUF is available. It reports two families of numbers: **direct
+metrics** (always valid) and **RouteLLM metrics** (PGR / APGR / CPT), each computed
+both from the **router's own swept cost–quality curve** and from an **oracle upper
 bound** derived from the labels. The exact definitions and citations are in the
-research note (`docs/research/adr-0011-auto-router-evolution.md`).
+research notes (`docs/research/adr-0011-auto-router-evolution.md`,
+`docs/research/adr-0019-router-v2.md`).
 
 ```bash
-python scripts/router_eval.py                 # markdown report (heuristic backend)
+python scripts/router_eval.py                                        # train set
+python scripts/router_eval.py --dataset tests/data/router_eval_heldout.jsonl
 python scripts/router_eval.py --format json   # metrics as JSON
-python scripts/router_eval.py --out report.md # write the report
 python scripts/router_eval.py --backend llm   # use the GGUF classifier
 ```
 
-A CI run of the harness on the heuristic backend over the bundled 45-prompt set:
+A CI run of the harness on the heuristic backend over the bundled **82-prompt
+train** set (`tests/data/router_eval.jsonl`, in-sample) with the ADR 0019
+structural heuristic:
 
 | Direct metric | Value |
 |---------------|-------|
-| Prompts | 45 |
-| Accuracy (chosen is acceptable) | 0.867 |
-| Cheapest-capable accuracy | 0.822 |
-| Mean cost_tier (router) | 2.289 |
-| Mean cost_tier (oracle / cheapest-capable) | 2.489 |
-| Router strong-call fraction (top tier) | 0.022 |
-
-RouteLLM metrics. `r(M_w)` is the globally cheapest model's accuracy; `r(M_s)` is
-the **quality ceiling** — a perfect oracle that always picks an acceptable model
-(see "What the metrics mean" below). PGR / APGR / CPT in the *Router curve* column
-come from re-routing the whole set while sweeping `router.weights.cost` over 12
-points; the *Oracle upper bound* is the cost-optimal label frontier (a ceiling the
-router cannot beat), shown for reference only.
+| Prompts | 82 |
+| Accuracy (chosen is acceptable) | 0.976 |
+| Cheapest-capable accuracy | 0.817 |
+| Mean cost_tier (router) | 2.829 |
+| Mean cost_tier (oracle / cheapest-capable) | 2.573 |
+| Router strong-call fraction (top tier) | 0.146 |
 
 | RouteLLM metric | Router curve | Oracle upper bound |
 |-----------------|--------------|--------------------|
-| r(M_w) / r(M_s) | 0.267 / 1.000 | — |
-| PGR (operating point) | 0.818 | — |
-| APGR | 0.724 | 0.849 |
-| CPT(50%) | 0.194 | 0.144 |
-| CPT(80%) | 0.322 | 0.272 |
+| r(M_w) / r(M_s) | 0.220 / 1.000 | — |
+| PGR (operating point) | 0.969 | — |
+| APGR | 0.766 | 0.834 |
+| CPT(50%) | 0.457 | 0.159 |
+| CPT(80%) | 0.457 | 0.283 |
 
-Per-task accuracy exposes real weaknesses — e.g. `math` ≈ 0.33 and `code` ≈ 0.60
-with the default weights, because a single tag match (+capability) can be
-outweighed by the cheap-model cost bonus. That is exactly the kind of regression
-the harness exists to surface (the motivating `tiny`-for-code mis-route); tune
-`router.weights` or add overrides and re-run to measure the effect. The swept
-curve confirms this directly: dropping `router.weights.cost` toward 0 lifts
-accuracy to ≈0.91 (PGR ≈0.88) by letting capability outweigh the cheap-model
-bonus — so the default weights are *not* this set's optimum.
+The operating-point PGR is **0.969 — strictly below 1.0**: the heuristic does *not*
+saturate even its own tuning set. (An earlier iteration of ADR 0019 reached a
+saturated PGR = 1.000 here by over-fitting keyword lists to the data; that was a
+red flag, not a win — see below.)
+
+#### Honest accuracy — three prompt sets, by independence (ADR 0019 follow-up)
+
+> **Keyword heuristics generalize poorly.** A small keyword + structural scorer
+> like this one is a cheap, offline, CI-safe *default*, **not** a strong
+> classifier. For reliable code / math / reasoning routing use the **LLM router
+> backend** (`router_backend: llm`, a tiny GGUF — see §2) or the **calibrated
+> cascade** (serve cheap, verify the real answer, escalate), which inspect far
+> more signal than any word list. The numbers below are measured, not aspired to.
+
+Three sets, labeled by how independent they are from the tuning:
+
+- **Train** (`tests/data/router_eval.jsonl`, 82) — the set the heuristic was tuned
+  against. **In-sample**; an optimistic upper bound.
+- **Author held-out** (`tests/data/router_eval_heldout.jsonl`, 24) — written by the
+  same author in the **same commit** with the **same vocabulary**. It is *adjacent*
+  to the training data, **not independent**; it saturates and should be read as
+  such, not as validation.
+- **Independent** (`tests/data/router_eval_independent.jsonl`, 44) — written
+  separately by the orchestrator, disjoint phrasing and vocabulary. **This is the
+  only set that measures generalization.**
+
+Per-task accuracy, v0.5.0 heuristic → ADR 0019 structural heuristic:
+
+| Task | Train v0.5.0 → now | Author held-out v0.5.0 → now | **Independent** v0.5.0 → now |
+|------|--------------------|------------------------------|------------------------------|
+| code | 0.636 → **0.955** | 0.500 → 1.000 | 0.250 → **0.917** |
+| math | 0.091 → **1.000** | 0.000 → 1.000 | 0.100 → **0.900** |
+| reasoning | 0.833 → 0.833 | 1.000 → 1.000 | 0.000 → **1.000** |
+| chat | 1.000 → 1.000 | 1.000 → 1.000 | 1.000 → 1.000 |
+| creative | 1.000 → 1.000 | 1.000 → 1.000 | 1.000 → 1.000 |
+| tools / json | 1.000 → 1.000 | 1.000 → 1.000 | — (not in set) |
+| vision / long-context | 1.000 → 1.000 | 1.000 → 1.000 | — (not in set) |
+| **overall** | 0.768 → **0.976** | 0.667 → 1.000 | 0.386 → **0.955** |
+
+Read the **Independent** column: code/math/reasoning rise from near-zero to
+0.9+ on prompts the heuristic never saw, and no protected task type (chat,
+creative, tools, json, vision, long-context) drops below v0.5.0. Train and
+Independent are now **close** (0.976 vs 0.955) — the signature of genuine
+generalization. (A previous ADR 0019 iteration scored Train 1.000 / Independent
+0.43 — a large gap that is the classic sign of over-fitting; it reported a
+"perfect" held-out 1.000 that did **not** hold on independent prompts.)
+
+**How it generalizes: structure, not vocabulary.** Instead of growing keyword
+lists, the scorer reads the *shape* of a request (`broker/router.py`): code-like
+punctuation / file extensions / CLI-tool & language names / error shapes; digits
+glued to operators, fractions, and `prime`/`roots`/`sum of`/probability phrasings
+for math; and `why`/`prove`/`plan`/`trade-off`, syllogisms, and long
+multi-constraint questions for reasoning. Each feature has a unit test over
+prompts that appear in no eval set (`tests/test_router_v2.py`). The one vocabulary
+change is a **deletion**: the greedy `"write a"` creative keyword (a generic
+instruction prefix) was removed because it mis-stole `"write a python function …"`
+code prompts for the cheap generalist.
+
+The accuracy floors are pinned by `tests/test_router_v2.py`: in-sample PGR **< 1.0**
+(not saturated), and on the independent set **code ≥ 0.6, math ≥ 0.5,
+reasoning ≥ 0.3**, with chat/creative no lower than v0.5.0. The independent set is
+frozen and enforced disjoint from both train and the author held-out split. The
+cost of capability-first routing is a higher mean cost_tier (2.57 → 2.83 on train);
+the swept cost–quality curve still spans the full range, so APGR/CPT stay
+meaningful.
 
 #### What the metrics mean (and the limits of label-based evaluation)
 
@@ -296,7 +409,10 @@ bonus — so the default weights are *not* this set's optimum.
 - **No silent clamping.** PGR is reported raw; if the quality gap
   `r(M_s) − r(M_w) ≤ 0`, or a value is out of `[0, 1]`, the metric is marked
   `invalid` with a reason in both the markdown and JSON output.
-- **Limitations.** Numbers are only as good as the labels: small set (45),
-  hand-labeled capability (not human-graded quality), and a synthetic 6-model
-  catalogue. Treat them as a regression signal for routing *changes*, not an
-  absolute quality score. The LLM backend and real registries will shift them.
+- **Limitations.** Numbers are only as good as the labels: a small hand-labeled
+  set (82 train + 24 author held-out + 44 independent), capability labels (not
+  human-graded quality), and a synthetic 6-model catalogue. A keyword + structural
+  heuristic generalizes only partially — the **Independent** column is the number
+  to trust, and it is well below the in-sample set. Treat these as a regression
+  signal for routing *changes*, not an absolute quality score, and prefer the LLM
+  router backend or the cascade for hard code/math/reasoning routing.

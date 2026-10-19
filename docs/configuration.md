@@ -257,7 +257,7 @@ next request reloads/reroutes. Surfaced at `GET /healthz/backends` and in
 | `BROKER_ROUTER_TIMEOUT_SECONDS` | float | `10` | Per-classification timeout. |
 | `BROKER_ROUTER_DEFAULT_MODEL` | str? | _(unset)_ | Fallback model id (overrides registry `router.default`). |
 | `BROKER_ROUTER_LATENCY_BUDGET_MS` | float? | _(unset)_ | Default per-request latency budget (ms); the `x-broker-latency-budget-ms` header then registry `router.latency_budget_ms` win first. See [auto-router.md](auto-router.md). |
-| `BROKER_ROUTER_LATENCY_WINDOW_SECONDS` | float | `3600` | Rolling window of the usage log used to estimate per-model latency (p90). |
+| `BROKER_ROUTER_LATENCY_WINDOW_SECONDS` | float | `3600` | Rolling window of the usage log used to estimate per-model latency (p90). For a **streaming** request the estimate uses **time-to-first-token** (TTFT), for a non-stream request it uses end-to-end latency (ADR 0019). |
 | `BROKER_ROUTER_COLD_START_MS` | float | `1500` | Estimated extra latency added for a not-currently-resident model (cold start). |
 
 Policy, per-model `tags`/`priority`/`cost_tier`, cascade mode, and hard overrides
