@@ -152,6 +152,42 @@ class FakeAdapter(BackendAdapter):
     async def cancel(self, request_id: str) -> None:
         self._cancelled.add(request_id)
 
+    async def embeddings(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        if not self._ready:
+            raise BackendUnavailableError(
+                "model not ready", backend=self.name, model=self.entry.alias
+            )
+        inp = payload.get("input")
+        if inp is None or (isinstance(inp, (list, str)) and len(inp) == 0):
+            from ..errors import ValidationError
+
+            raise ValidationError(
+                "`input` is required and must be a non-empty string or list",
+                model=self.entry.alias,
+            )
+        texts = [inp] if isinstance(inp, str) else [str(x) for x in inp]
+        dims = 16  # small, fixed, deterministic embedding dimension for tests
+        data = []
+        total_tokens = 0
+        for i, text in enumerate(texts):
+            total_tokens += len(text.split())
+            # Deterministic pseudo-embedding: seed a hash per dimension.
+            import hashlib
+
+            vec = []
+            for d in range(dims):
+                h = hashlib.sha256(f"{text}:{d}".encode()).digest()
+                # map first 4 bytes to a float in [-1, 1]
+                n = int.from_bytes(h[:4], "big")
+                vec.append((n / 0xFFFFFFFF) * 2 - 1)
+            data.append({"object": "embedding", "index": i, "embedding": vec})
+        return {
+            "object": "list",
+            "data": data,
+            "model": self.entry.alias,
+            "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
+        }
+
     async def collect_status(self) -> dict[str, Any]:
         return {
             "backend": self.name,

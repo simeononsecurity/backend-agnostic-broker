@@ -11,7 +11,8 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 |---|------|--------|-----|
 | 1 | `/v1/completions` + `/v1/responses` (chat-translation shims) | ✅ done | [0006](adr/0006-openai-endpoint-surface.md) |
 | 2 | Usage/token + routing-decision log (`/usage`, SQLite) | ✅ done | [0007](adr/0007-usage-accounting-store.md) |
-| 3 | `/v1/embeddings` (+ `/v1/rerank`) | 🔜 next — needs a new adapter method + live-backend tests | [0006](adr/0006-openai-endpoint-surface.md) |
+| 3 | `/v1/embeddings` (Ollama native + OpenAI-compat passthrough) | ✅ done — verified live against Ollama (nomic-embed-text, 768-dim) | [0006](adr/0006-openai-endpoint-surface.md) |
+| 3b | `/v1/rerank` | 📋 planned | [0006](adr/0006-openai-endpoint-surface.md) |
 
 ## P1 — governance, reliability, routing intelligence
 

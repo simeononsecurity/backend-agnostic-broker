@@ -205,6 +205,24 @@ curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
 The text-first shim flattens content parts to text; multimodal/tool fidelity is
 best-effort. The no-silent-fallback guarantee holds (unknown model → 404).
 
+### `POST /v1/embeddings` — embeddings (auth)
+
+Routed to an **embedding-capable backend/model** (not the chat pipeline — there is
+nothing to generate). Required: `model`, `input` (string or list of strings).
+Ollama models are translated to the native `/api/embed`; OpenAI-compatible
+runtimes (vLLM, llama.cpp) are proxied to their `/v1/embeddings`. Returns an
+OpenAI `list` of `embedding` objects. Routing, pooling, lazy-load, and failover
+apply; a chat-only model returns `400` (`does not support embeddings`), an unknown
+model `404`.
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"model":"nomic-embed-text","input":"the cat sat on the mat"}' \
+  http://127.0.0.1:8080/v1/embeddings
+# -> {"object":"list","data":[{"object":"embedding","index":0,"embedding":[...768 floats...]}],
+#     "model":"nomic-embed-text","usage":{"prompt_tokens":8,"total_tokens":8}}
+```
+
 ### `GET /usage` — request/token usage (auth)
 
 Aggregated usage from the usage log ([ADR 0007](adr/0007-usage-accounting-store.md)):

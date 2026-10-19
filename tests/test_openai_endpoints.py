@@ -125,3 +125,48 @@ def test_usage_records_across_endpoints(client):
 
 def test_usage_requires_auth(client):
     assert client.get("/usage").status_code == 401
+
+
+# --- /v1/embeddings ----------------------------------------------------------
+def test_embeddings_single_string(client):
+    r = client.post("/v1/embeddings", headers=AUTH, json={"model": "echo", "input": "hello"})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["object"] == "list"
+    assert d["model"] == "echo"
+    assert len(d["data"]) == 1
+    emb = d["data"][0]
+    assert emb["object"] == "embedding"
+    assert emb["index"] == 0
+    assert len(emb["embedding"]) == 16
+    assert all(isinstance(x, float) for x in emb["embedding"])
+    assert "prompt_tokens" in d["usage"]
+
+
+def test_embeddings_batch(client):
+    r = client.post(
+        "/v1/embeddings", headers=AUTH, json={"model": "echo", "input": ["a", "b", "c"]}
+    )
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert [e["index"] for e in d["data"]] == [0, 1, 2]
+
+
+def test_embeddings_deterministic(client):
+    a = client.post("/v1/embeddings", headers=AUTH, json={"model": "echo", "input": "same"}).json()
+    b = client.post("/v1/embeddings", headers=AUTH, json={"model": "echo", "input": "same"}).json()
+    assert a["data"][0]["embedding"] == b["data"][0]["embedding"]
+
+
+def test_embeddings_requires_input(client):
+    r = client.post("/v1/embeddings", headers=AUTH, json={"model": "echo"})
+    assert r.status_code == 400
+
+
+def test_embeddings_requires_auth(client):
+    assert client.post("/v1/embeddings", json={"model": "echo", "input": "x"}).status_code == 401
+
+
+def test_embeddings_unknown_model_404(client):
+    r = client.post("/v1/embeddings", headers=AUTH, json={"model": "nope", "input": "x"})
+    assert r.status_code == 404

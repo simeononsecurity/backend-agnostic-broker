@@ -19,8 +19,8 @@ backend over the network, all with copy-paste examples.
 
 - OpenAI-compatible API: `GET /v1/models`, `POST /v1/chat/completions`,
   `POST /v1/completions`, `POST /v1/responses` (all streaming + non-streaming),
-  plus `/healthz`, `/readyz`, `/status`, `/usage`, `/metrics` and an optional
-  Ollama-style `/api/tags` discovery endpoint.
+  `POST /v1/embeddings`, plus `/healthz`, `/readyz`, `/status`, `/usage`,
+  `/metrics` and an optional Ollama-style `/api/tags` discovery endpoint.
 - Lazy per-model loading with an explicit lifecycle state machine
   (`unloaded → loading → ready → busy → unloading → failed → stopping`).
 - **Load-balancing pools**: route one model name across multiple backend hosts

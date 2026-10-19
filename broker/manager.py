@@ -447,6 +447,70 @@ class ModelManager:
             m.sem.release()
             self.global_sem.release()
 
+    async def embeddings(
+        self, name: str, payload: dict, request_id: str, route_key: str | None = None
+    ) -> dict:
+        """Route an embeddings request through pool selection + failover.
+
+        Unlike chat, ``auto`` does not apply (there is nothing to classify); the
+        request is routed to the named model/pool. Shares the same member
+        selection, concurrency gating, lazy-load, and failover as chat.
+        """
+        members = self._members_for(name)
+        exclude: set[str] = set()
+        last: Exception | None = None
+        for _ in range(len(members)):
+            m = await self._select_member(name, members, exclude, route_key)
+            if m is None:
+                break
+            try:
+                return await self._serve_embeddings(m, name, payload, request_id)
+            except _FAILOVER_ERRORS as exc:
+                m.healthy = False
+                exclude.add(m.entry.alias)
+                last = exc
+                log.warning(
+                    "pool %s: member %s failed (%s); failing over", name, m.entry.alias, exc
+                )
+                continue
+        if last is not None:
+            raise last
+        raise BackendUnavailableError(
+            f"no healthy backend available for model {name!r}",
+            model=name,
+            remediation="check GET /healthz/backends",
+        )
+
+    async def _serve_embeddings(
+        self, m: ManagedModel, public_name: str, payload: dict, request_id: str
+    ) -> dict:
+        try:
+            await self._maybe_evict(m.entry.alias)
+            await m.ensure_ready()
+            async with self.global_sem:
+                if m.sem.locked() and self.settings.load_concurrency_policy == "reject":
+                    raise ConcurrencyLimitError(
+                        f"per-model concurrency limit for {m.entry.alias}",
+                        model=m.entry.alias,
+                        remediation="retry later or raise per-model concurrency",
+                    )
+                async with m.sem:
+                    if m.machine.state == State.READY:
+                        m.machine.to(State.BUSY)
+                    result = await asyncio.wait_for(
+                        m.adapter.embeddings(payload, request_id),
+                        timeout=m.entry.request_timeout_seconds,
+                    )
+                    m.healthy = True
+                    if isinstance(result, dict):
+                        result["model"] = public_name
+                    return result
+        finally:
+            m.machine.inflight -= 1
+            m.machine.touch()
+            if m.machine.inflight == 0 and m.machine.state == State.BUSY:
+                m.machine.to(State.READY)
+
     async def cancel(self, name: str, request_id: str) -> None:
         # The serving member holds the cancel event; signalling all members of
         # the pool is harmless (only the owner reacts).

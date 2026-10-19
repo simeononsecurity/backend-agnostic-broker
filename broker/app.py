@@ -6,6 +6,7 @@ Routes
 * ``POST /v1/chat/completions``  — chat (streaming + non-streaming)
 * ``POST /v1/completions``       — legacy text completions (translated to chat)
 * ``POST /v1/responses``         — OpenAI Responses API (translated to chat)
+* ``POST /v1/embeddings``        — embeddings (routed to an embedding backend)
 * ``GET  /healthz``              — liveness (always 200 if process is up)
 * ``GET  /readyz``               — readiness (config + registry loaded)
 * ``GET  /status``               — per-model lifecycle + GPU allocation
@@ -559,6 +560,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             INFLIGHT.dec()
             REQUEST_LATENCY.labels("responses", model).observe(time.monotonic() - start)
+
+    @app.post("/v1/embeddings")
+    async def embeddings(
+        request: Request,
+        authorization: str | None = Header(None),
+        x_api_key: str | None = Header(None),
+    ):
+        """OpenAI embeddings — routed to an embedding-capable backend (ADR 0006)."""
+        authed(authorization, x_api_key)
+        key_id = UsageLog.key_fingerprint(x_api_key or authorization)
+        request_id = request.state.request_id
+        raw = await request.body()
+        if len(raw) > settings.max_request_bytes:
+            raise RequestTooLargeError(f"request body exceeds {settings.max_request_bytes} bytes")
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValidationError(f"invalid JSON body: {exc}") from exc
+        model = body.get("model")
+        if not model or not isinstance(model, str):
+            raise ValidationError("`model` is required")
+        reject_request_flags(model, "model")
+        if body.get("input") is None:
+            raise ValidationError("`input` is required (string or list of strings)")
+        payload = {"input": body["input"]}
+        for k in ("truncate", "options", "keep_alive", "encoding_format", "dimensions", "user"):
+            if k in body:
+                payload[k] = body[k]
+        session_key = _session_key(request, body)
+        start = time.monotonic()
+        INFLIGHT.inc()
+        try:
+            result = await manager.embeddings(model, payload, request_id, route_key=session_key)
+            REQUESTS.labels("embeddings", model, "ok").inc()
+            u = result.get("usage") or {}
+            usage.record(
+                endpoint="embeddings",
+                requested=model,
+                model=result.get("model", model),
+                request_id=request_id,
+                api_key_id=key_id,
+                prompt_tokens=u.get("prompt_tokens", 0),
+                completion_tokens=0,
+                total_tokens=u.get("total_tokens", u.get("prompt_tokens", 0)),
+                latency_ms=(time.monotonic() - start) * 1000,
+                status="ok",
+            )
+            return JSONResponse(content=result, headers={"x-request-id": request_id})
+        finally:
+            INFLIGHT.dec()
+            REQUEST_LATENCY.labels("embeddings", model).observe(time.monotonic() - start)
 
     @app.exception_handler(BrokerError)
     async def broker_error_handler(request: Request, exc: BrokerError):

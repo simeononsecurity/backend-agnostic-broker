@@ -88,6 +88,26 @@ models:
     supports_streaming: true
     supports_tools: true
 
+  # ---- Ollama embedding model (POST /v1/embeddings) -------------------------
+  # Embedding models are addressed by name on /v1/embeddings (never via `auto` —
+  # there is nothing to classify). Ollama entries are translated to the native
+  # /api/embed; vLLM/llama.cpp are proxied to their OpenAI /v1/embeddings.
+  - alias: nomic-embed-text
+    backend: ollama
+    runtime_model_id: nomic-embed-text   # must be pulled on the Ollama daemon
+    base_url: ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}
+    context_limit: 8192
+    output_limit: 512
+    idle_timeout_seconds: 300
+    keep_alive: "5m"
+    tags: [embedding]
+    description: nomic-embed-text embedding model (768-dim)
+    router_eligible: false               # not a chat model; never a router target
+    readiness:
+      kind: http
+      path: /api/tags
+      expect_status: 200
+
   # ---- llama.cpp (broker-managed process; model loads at startup) -----------
   - alias: qwen-llamacpp
     backend: llamacpp

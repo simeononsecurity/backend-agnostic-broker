@@ -21,7 +21,7 @@ from typing import Any
 
 import httpx
 
-from ..errors import TimeoutError_
+from ..errors import BackendUnavailableError, TimeoutError_, ValidationError
 from .base import HealthResult
 from .httpbase import HTTPBackendAdapter
 
@@ -111,6 +111,54 @@ class OllamaAdapter(HTTPBackendAdapter):
         if self._client:
             await self._client.aclose()
             self._client = None
+
+    async def embeddings(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        """Translate OpenAI ``/v1/embeddings`` to Ollama's native ``/api/embed``.
+
+        Ollama's ``/api/embed`` accepts ``input`` as a string or a list of strings
+        and returns ``{"embeddings": [[...], ...], "prompt_eval_count": N}``. We map
+        that to the OpenAI ``{"object": "list", "data": [{"embedding": [...]}]}``
+        shape. The upstream model id is pinned from the registry entry; the request
+        never selects a raw runtime id.
+        """
+        inp = payload.get("input")
+        if inp is None or (isinstance(inp, (list, str)) and len(inp) == 0):
+            raise ValidationError(
+                "`input` is required and must be a non-empty string or list",
+                model=self.entry.alias,
+            )
+        body: dict[str, Any] = {"model": self.entry.runtime_model_id, "input": inp}
+        for k in ("truncate", "options", "keep_alive"):
+            if k in payload:
+                body[k] = payload[k]
+        url = self._validated_url("/api/embed")
+        client = self._client_or_new()
+        try:
+            resp = await client.post(url, json=body)
+        except httpx.HTTPError as exc:
+            raise BackendUnavailableError(
+                f"backend request failed: {exc}",
+                backend=self.name,
+                model=self.entry.alias,
+                remediation="check the Ollama daemon/base_url",
+            ) from exc
+        if resp.status_code >= 400:
+            raise BackendUnavailableError(
+                f"backend returned {resp.status_code}: {resp.text[:200]}",
+                backend=self.name,
+                model=self.entry.alias,
+            )
+        data = resp.json()
+        vectors = data.get("embeddings") or []
+        prompt_tokens = int(data.get("prompt_eval_count") or 0)
+        return {
+            "object": "list",
+            "data": [
+                {"object": "embedding", "index": i, "embedding": v} for i, v in enumerate(vectors)
+            ],
+            "model": self.entry.alias,
+            "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens},
+        }
 
     async def ps(self) -> dict[str, Any]:
         """Return Ollama's ``/api/ps`` — models currently resident in memory.

@@ -117,6 +117,22 @@ class BackendAdapter(abc.ABC):
     async def cancel(self, request_id: str) -> None:
         """Best-effort cancellation of an in-flight request."""
 
+    # --- embeddings (optional capability) --------------------------------
+    async def embeddings(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        """Return an OpenAI ``/v1/embeddings``-shaped response for ``input``.
+
+        Default: the backend/model does not support embeddings. Backends that do
+        (Ollama, OpenAI-compatible HTTP runtimes) override this. Kept non-abstract
+        so chat-only backends need not implement it.
+        """
+        from ..errors import ValidationError
+
+        raise ValidationError(
+            f"backend {self.name!r} does not support embeddings for model {self.entry.alias!r}",
+            model=self.entry.alias,
+            remediation="request an embedding-capable model (e.g. Ollama nomic-embed-text)",
+        )
+
     # --- status ----------------------------------------------------------
     @abc.abstractmethod
     async def collect_status(self) -> dict[str, Any]:

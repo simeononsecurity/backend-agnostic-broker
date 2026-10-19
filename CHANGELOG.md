@@ -13,6 +13,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   inherit routing, pools, lazy-load, failover, and the `auto` router; streaming +
   non-streaming. Unknown models still 404 (no silent fallback). See
   [ADR 0006](docs/adr/0006-openai-endpoint-surface.md).
+- **`POST /v1/embeddings`** via a new `embeddings()` adapter method — Ollama native
+  `/api/embed`, OpenAI-compatible passthrough for vLLM/llama.cpp, deterministic
+  fake for CI. Routes by model name through pool/lazy-load/failover; chat-only
+  models return 400. Verified end-to-end against a live Ollama backend
+  (nomic-embed-text, 768-dim). See [ADR 0006](docs/adr/0006-openai-endpoint-surface.md).
 - **Request usage/decision log** (SQLite) + **`GET /usage`**: per-request token
   counts, latency, requested-vs-served model, endpoint, and a non-reversible API-key
   fingerprint (metadata only, never content). Config: `BROKER_USAGE_LOG_ENABLED`,

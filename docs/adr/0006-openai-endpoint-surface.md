@@ -31,19 +31,23 @@ Both preserve the broker's invariants — the no-silent-fallback guarantee holds
 (an unknown model still 404s), auth and request-size limits apply, and the model
 selector passes the security flag check.
 
-`/v1/embeddings` and `/v1/rerank` are **deferred** (ADR note below): unlike the
-above, they cannot reuse the chat pipeline — they need a new adapter-contract
-method and real per-backend integration that cannot be verified in CI without live
-backends. They are tracked in `docs/roadmap.md` as the next endpoint increment.
+`/v1/embeddings` is also implemented, but **not** as a chat shim: unlike the
+above it needs a new adapter-contract method (`embeddings()`) and real per-backend
+integration (Ollama native `/api/embed`; OpenAI-compatible `/v1/embeddings` for
+vLLM/llama.cpp). It routes by model name (no `auto` — nothing to classify) through
+the same pool/lazy-load/failover machinery, and a chat-only model returns `400`.
+It was verified against a live Ollama backend (nomic-embed-text, 768-dim) in
+addition to the deterministic fake used in CI. `/v1/rerank` remains deferred and
+is tracked in `docs/roadmap.md`.
 
 ## Alternatives considered
 
 - **Proxy each endpoint straight to the backend.** Rejected: bypasses our
   routing/lifecycle/`auto` and multiplies per-backend compatibility work.
-- **Implement embeddings/responses natively now across all adapters.** Rejected
-  for embeddings: real vectors need live backends we can't CI-test; shipping a
-  partially-tested path violates the quality bar. Responses/completions *can* be
-  done safely as translation shims, so they ship now.
+- **Implement embeddings/responses natively now across all adapters.** Partly
+  adopted: responses/completions are translation shims; embeddings gets a real
+  `embeddings()` adapter method with per-backend implementations, verified against
+  a live backend rather than shipped as an untested stub.
 - **Skip the Responses API.** Rejected: it is becoming the default for agent
   frameworks; a translation shim is cheap and forward-compatible.
 
@@ -57,5 +61,8 @@ backends. They are tracked in `docs/roadmap.md` as the next endpoint increment.
 
 ## Confirmation
 
-`tests/test_openai_endpoints.py` exercises both endpoints (non-stream + stream),
-the 404 no-fallback guarantee, and auth; `docs/openapi.yaml` lists the new paths.
+`tests/test_openai_endpoints.py` exercises completions/responses (non-stream +
+stream), embeddings (single/batch/deterministic/validation), the 404 no-fallback
+guarantee, and auth; `docs/openapi.yaml` lists the new paths. Embeddings was
+additionally verified end-to-end against a live Ollama backend (nomic-embed-text,
+768-dim vectors, matching the backend's direct output).

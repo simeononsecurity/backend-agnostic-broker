@@ -43,6 +43,8 @@ class HTTPBackendAdapter(BackendAdapter):
     name = "http"
     #: Path the runtime serves chat completions on.
     chat_path = "/v1/chat/completions"
+    #: Path the runtime serves embeddings on (OpenAI-compatible).
+    embeddings_path = "/v1/embeddings"
 
     def __init__(self, entry, settings) -> None:
         super().__init__(entry, settings)
@@ -276,6 +278,35 @@ class HTTPBackendAdapter(BackendAdapter):
         ev = self._inflight.get(request_id)
         if ev:
             ev.set()
+
+    async def embeddings(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        """Proxy to the runtime's OpenAI-compatible ``/v1/embeddings``.
+
+        vLLM / llama.cpp serve an OpenAI-shaped embeddings response, so we pin the
+        upstream model id and pass the body through unchanged.
+        """
+        url = self._validated_url(self.embeddings_path)
+        client = self._client_or_new()
+        body = self._request_body(payload)
+        try:
+            resp = await client.post(url, json=body)
+        except httpx.HTTPError as exc:
+            raise BackendUnavailableError(
+                f"backend request failed: {exc}",
+                backend=self.name,
+                model=self.entry.alias,
+                remediation="check the runtime process/endpoint",
+            ) from exc
+        if resp.status_code >= 400:
+            raise BackendUnavailableError(
+                f"backend returned {resp.status_code}: {resp.text[:200]}",
+                backend=self.name,
+                model=self.entry.alias,
+            )
+        data = resp.json()
+        if isinstance(data, dict):
+            data["model"] = self.entry.alias
+        return data
 
     async def collect_status(self) -> dict[str, Any]:
         return {
