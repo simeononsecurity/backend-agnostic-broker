@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: backend-agnostic-broker
-  version: 0.3.1
+  version: 0.4.0
 paths:
   /healthz:
     get:
@@ -217,6 +217,115 @@ paths:
     post:
       summary: Chat Completions
       operationId: chat_completions_v1_chat_completions_post
+      parameters:
+      - name: authorization
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Authorization
+      - name: x-api-key
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Api-Key
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /usage:
+    get:
+      summary: Usage Summary
+      description: Aggregated request/token usage from the usage log (see ADR 0007).
+      operationId: usage_summary_usage_get
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 20
+          title: Limit
+      - name: authorization
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Authorization
+      - name: x-api-key
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Api-Key
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /v1/completions:
+    post:
+      summary: Completions
+      description: Legacy text completions, translated to the chat pipeline (ADR 0006).
+      operationId: completions_v1_completions_post
+      parameters:
+      - name: authorization
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Authorization
+      - name: x-api-key
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: X-Api-Key
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /v1/responses:
+    post:
+      summary: Responses
+      description: OpenAI Responses API, translated to the chat pipeline (ADR 0006).
+      operationId: responses_v1_responses_post
       parameters:
       - name: authorization
         in: header

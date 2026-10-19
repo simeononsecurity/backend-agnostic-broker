@@ -17,9 +17,10 @@ backend over the network, all with copy-paste examples.
 
 ## Features
 
-- OpenAI-compatible API: `GET /v1/models`, `POST /v1/chat/completions`
-  (streaming + non-streaming), plus `/healthz`, `/readyz`, `/status`, `/metrics`
-  and an optional Ollama-style `/api/tags` discovery endpoint.
+- OpenAI-compatible API: `GET /v1/models`, `POST /v1/chat/completions`,
+  `POST /v1/completions`, `POST /v1/responses` (all streaming + non-streaming),
+  plus `/healthz`, `/readyz`, `/status`, `/usage`, `/metrics` and an optional
+  Ollama-style `/api/tags` discovery endpoint.
 - Lazy per-model loading with an explicit lifecycle state machine
   (`unloaded → loading → ready → busy → unloading → failed → stopping`).
 - **Load-balancing pools**: route one model name across multiple backend hosts
@@ -106,6 +107,8 @@ See [docs/docker.md](docs/docker.md) for running/configuring the `-llm` image an
 | **Getting started** | [docs/getting-started.md](docs/getting-started.md) |
 | Architecture overview | [docs/architecture.md](docs/architecture.md) |
 | ADRs | [docs/adr/](docs/adr/) |
+| Roadmap | [docs/roadmap.md](docs/roadmap.md) |
+| Competitive landscape (research) | [docs/research/competitive-landscape.md](docs/research/competitive-landscape.md) |
 | API reference | [docs/api-reference.md](docs/api-reference.md) · [OpenAPI](docs/openapi.yaml) |
 | Configuration reference | [docs/configuration.md](docs/configuration.md) |
 | Model registry reference | [docs/model-registry.md](docs/model-registry.md) |

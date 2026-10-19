@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-18
+
+### Added
+
+- **`POST /v1/completions`** (legacy) and **`POST /v1/responses`** (OpenAI
+  Responses API), implemented as translation shims over the chat pipeline — they
+  inherit routing, pools, lazy-load, failover, and the `auto` router; streaming +
+  non-streaming. Unknown models still 404 (no silent fallback). See
+  [ADR 0006](docs/adr/0006-openai-endpoint-surface.md).
+- **Request usage/decision log** (SQLite) + **`GET /usage`**: per-request token
+  counts, latency, requested-vs-served model, endpoint, and a non-reversible API-key
+  fingerprint (metadata only, never content). Config: `BROKER_USAGE_LOG_ENABLED`,
+  `BROKER_USAGE_LOG_PATH`. See [ADR 0007](docs/adr/0007-usage-accounting-store.md).
+
+### Docs
+
+- Competitive-landscape research ([docs/research/competitive-landscape.md](docs/research/competitive-landscape.md))
+  and a [roadmap](docs/roadmap.md) with proposed ADR drafts 0008–0012 (per-key
+  governance; routing reliability + optional Redis shared state; cache-aware pool
+  routing; auto-router evolution — cascade/latency-budget/privacy-pinning/eval;
+  caching + runtime control + OpenTelemetry).
+
 ## [0.3.1] - 2026-10-18
 
 ### Documentation

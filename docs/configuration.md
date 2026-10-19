@@ -143,6 +143,8 @@ registry. See [auto-router.md](auto-router.md).
 |---------|------|---------|-------------|
 | `BROKER_METRICS_ENABLED` | bool | `true` | Expose `/metrics`. |
 | `BROKER_TRACING_ENABLED` | bool | `false` | Reserved for tracing integration. |
+| `BROKER_USAGE_LOG_ENABLED` | bool | `true` | Record per-request usage to the SQLite usage log (metadata + token counts only; see `/usage`). |
+| `BROKER_USAGE_LOG_PATH` | str? | `<cache_dir>/usage.sqlite3` | Usage-log path; `:memory:` for ephemeral. Self-disables if unwritable. |
 
 ## Docker / networking
 

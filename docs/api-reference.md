@@ -173,6 +173,46 @@ Streaming responses are `text/event-stream`, emitting `data: {chunk}\n\n`
 `chat.completion.chunk` events and terminating with `data: [DONE]\n\n`. On a
 mid-stream error the broker emits a structured error chunk followed by `[DONE]`.
 
+### `POST /v1/completions` — legacy text completions (auth)
+
+Translated to the chat pipeline (so pooling, lazy-load, failover, and the `auto`
+router all apply — see [ADR 0006](adr/0006-openai-endpoint-surface.md)). Required:
+`model`, `prompt` (string or list of strings). Optional `stream` + any chat
+params. Returns an OpenAI `text_completion` object (`choices[].text`, `usage`);
+streaming emits `text_completion` chunks + `[DONE]`.
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"model":"echo-fake","prompt":"Hello!"}' \
+  http://127.0.0.1:8080/v1/completions
+```
+
+### `POST /v1/responses` — OpenAI Responses API (auth)
+
+Translated to the chat pipeline ([ADR 0006](adr/0006-openai-endpoint-surface.md)).
+Required: `model`, `input` (string or message list). Optional `instructions`
+(prepended as a system message), `max_output_tokens` (mapped to `max_tokens`),
+`stream`. Returns a `response` object (`output[]`, `output_text`, `usage` with
+`input_tokens`/`output_tokens`); streaming emits `response.output_text.delta`
+events then `response.completed` + `[DONE]`.
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"model":"echo-fake","input":"Hello!"}' \
+  http://127.0.0.1:8080/v1/responses
+```
+
+The text-first shim flattens content parts to text; multimodal/tool fidelity is
+best-effort. The no-silent-fallback guarantee holds (unknown model → 404).
+
+### `GET /usage` — request/token usage (auth)
+
+Aggregated usage from the usage log ([ADR 0007](adr/0007-usage-accounting-store.md)):
+total requests + tokens, per-model and per-endpoint counts, and the most recent
+rows (`?limit=N`, default 20). Metadata only — no request/response content, and
+the API key is stored as a non-reversible fingerprint. Returns `{"enabled": false}`
+when the log is disabled.
+
 ## OpenAPI
 
 A generated OpenAPI document is at `docs/openapi.yaml` (regenerate with

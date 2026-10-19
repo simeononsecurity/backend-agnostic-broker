@@ -127,6 +127,13 @@ class Settings(BaseSettings):
     metrics_enabled: bool = True
     tracing_enabled: bool = False
 
+    # --- Usage accounting (request + routing-decision log; see ADR 0007) ---
+    # One row per completed request (metadata + token counts only, never content).
+    # Substrate for cost reporting, budgets, and router evaluation. Path defaults
+    # to <cache_dir>/usage.sqlite3; set ":memory:" for ephemeral, or disable.
+    usage_log_enabled: bool = True
+    usage_log_path: str | None = None
+
     # --- Docker / networking hints (documented, used by compose) ---
     docker_network_mode: str = "bridge"
 
