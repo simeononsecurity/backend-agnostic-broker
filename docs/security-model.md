@@ -104,6 +104,32 @@ baseline, and is enforced **fail-closed** (ADR 0011):
 This makes residency/sovereignty an auditable hard wall rather than a best-effort
 preference.
 
+## Admin control plane (ADR 0012, admin scope per ADR 0008)
+
+The runtime-control surface (`GET /admin/models`, model unload/load, registry
+reload) is **off by default** (`BROKER_ADMIN_ENABLED=false`) and, when enabled, is
+authorized by `require_admin` in `broker/app.py` by **either** an ADR 0008 virtual
+key whose scope is `admin` **or** a dedicated `BROKER_ADMIN_API_KEYS` value
+(back-compat) — both deliberately separate from an ordinary data-plane user key, so
+a leaked user key cannot unload models or reload the registry. Every credential is
+compared **byte-wise** in constant time and never logged (actions are audited by key
+*fingerprint* only); a non-ASCII/over-long key fails closed with `401`, and the
+admin surface stays locked even when data-plane auth is disabled. The admin surface
+cannot introduce a new backend, executable, or path: registry reload re-runs the
+same executable/model-path allow-list validation as startup, and an invalid registry
+makes no change.
+
+## Response-cache isolation (ADR 0012)
+
+The exact response cache (off by default) keys every entry on the caller's
+API-key/tenant scope (and placement requirement) as the **first** hashed component,
+so a cached answer can never be served across a key, tenant, or placement boundary.
+Only successful, non-streaming, deterministic-by-default responses are stored;
+errors and partial streams are never cached. The cache stores response bodies in the
+StateStore (in-process or Redis) — treat that store with the same confidentiality as
+the responses themselves, and scope `BROKER_REDIS_PREFIX` per deployment when
+sharing one Redis.
+
 ## Container hardening
 
 The image (`Dockerfile`) and Compose files apply defense in depth:

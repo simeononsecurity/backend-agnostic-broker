@@ -253,12 +253,52 @@ carry **all** required labels; if none qualify the broker returns
 | `BROKER_CACHE_DIR` | str | `/var/cache/broker` | Writable cache dir (tmpfs/volume in Docker). |
 | `BROKER_TMP_DIR` | str | `/tmp/broker` | Writable tmp dir. |
 
+## Response cache (ADR 0012)
+
+Exact-match response cache, **default off**. When enabled, identical requests to
+the same model and caller scope are served from the ADR 0009 StateStore
+(in-process, or Redis when `BROKER_REDIS_URL` is set) instead of re-running
+inference. The key hashes (API-key/tenant scope, public model **after `auto`
+resolution**, normalized messages/prompt/input + sampling + `tools` +
+`response_format`), so a cached answer **never crosses a key/tenant boundary**.
+Errors and partial/streamed responses are never cached; streaming requests
+bypass. Per-request bypass via `Cache-Control: no-cache`/`no-store` or
+`x-broker-cache: bypass`; every response carries `x-broker-cache: hit|miss|bypass`.
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_RESPONSE_CACHE_ENABLED` | bool | `false` | Master switch for the exact response cache. |
+| `BROKER_RESPONSE_CACHE_TTL_SECONDS` | float | `300` | Entry TTL; `0` = no TTL (rely on `max_entries`). |
+| `BROKER_RESPONSE_CACHE_MAX_ENTRIES` | int | `1000` | In-process LRU bound on live entries; `0` = unbounded (Redis uses TTL). |
+| `BROKER_RESPONSE_CACHE_MAX_BYTES` | int | `1000000` | Per-entry cap; a larger serialized result is not stored. `0` = no cap. |
+| `BROKER_RESPONSE_CACHE_DETERMINISTIC_ONLY` | bool | `true` | Cache only deterministic requests (`temperature == 0` or an explicit `seed`); embeddings always. Set `false` to cache all. |
+
+## Admin runtime control (ADR 0012)
+
+Privileged control plane (`GET /admin/models`, model unload/load, registry
+hot-reload), **default off**. When enabled it is gated by a **dedicated** admin
+key list — intentionally separate from `BROKER_API_KEYS` so a future virtual-key
+admin scope (ADR 0008) can replace it without touching routes.
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_ADMIN_ENABLED` | bool | `false` | Expose `/admin/*`. When off, the routes return a structured `admin_disabled` error. |
+| `BROKER_ADMIN_API_KEYS` | list[str] | `[]` | Admin keys (presented as `X-Admin-Key`, or `Authorization: Bearer`). **Required** when admin is enabled and auth is on. |
+| `BROKER_ADMIN_DRAIN_TIMEOUT_SECONDS` | float | `30` | How long `unload ?drain=true` / registry reload waits for in-flight requests to finish before giving up. |
+
+## Web UI / playground (ADR 0012) — deferred
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_UI_ENABLED` | bool | `false` | Reserved for a future static `/ui`. **Deferred** — currently inert. |
+
 ## Observability
 
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
 | `BROKER_METRICS_ENABLED` | bool | `true` | Expose `/metrics`. |
-| `BROKER_TRACING_ENABLED` | bool | `false` | Reserved for tracing integration. |
+| `BROKER_TRACING_ENABLED` | bool | `false` | OpenTelemetry tracing (ADR 0012). Requires the optional `otel` extra or startup fails fast. Spans carry `gen_ai.*` metadata only — never prompt/response content. OTLP exporter configured via standard `OTEL_*` env vars. No-op + zero overhead when off. |
+| `BROKER_TRACING_SERVICE_NAME` | str | `backend-agnostic-broker` | `service.name` resource attribute for spans (when the broker stands up its own provider). |
 | `BROKER_USAGE_LOG_ENABLED` | bool | `true` | Record per-request usage to the SQLite usage log (metadata + token counts only; see `/usage`). |
 | `BROKER_USAGE_LOG_PATH` | str? | `<cache_dir>/usage.sqlite3` | Usage-log path; `:memory:` for ephemeral. Self-disables if unwritable. |
 

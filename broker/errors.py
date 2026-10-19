@@ -171,3 +171,16 @@ class AuthorizationError(BrokerError):
 
     http_status = 403
     error_type = "permission_error"
+
+
+class ModelBusyError(BrokerError):
+    """An admin action (unload/reload) was refused because the model is serving.
+
+    Raised when ``POST /admin/models/{alias}/unload`` is called without drain on a
+    model with in-flight requests, or when a drain exceeds its timeout. Distinct
+    from the 429 concurrency limit: this is a conflict with current state, not a
+    rate limit.
+    """
+
+    http_status = 409
+    error_type = "model_busy"

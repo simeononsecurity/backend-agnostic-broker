@@ -24,11 +24,20 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.8",
     "fakeredis>=2",
+    "opentelemetry-sdk>=1.20",
 ]
 # Optional: shared routing/runtime state across replicas (ADR 0009). Absent this
 # extra the broker runs exactly as before with in-process state.
 redis = [
     "redis>=5",
+]
+# Optional: OpenTelemetry distributed tracing (ADR 0012). Absent this extra,
+# tracing is a no-op; enabling BROKER_TRACING_ENABLED without it fails fast with
+# a ConfigError. Spans carry gen_ai.* metadata only — never prompt/response
+# content. The OTLP exporter is configured via standard OTEL_* env vars.
+otel = [
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp-proto-http>=1.20",
 ]
 
 [project.scripts]

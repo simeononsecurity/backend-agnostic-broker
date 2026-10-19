@@ -62,15 +62,17 @@ from .errors import (
     AuthorizationError,
     BackendUnavailableError,
     ConcurrencyLimitError,
+    ModelBusyError,
     ModelLoadError,
     ModelNotFoundError,
     PlacementDeniedError,
     TimeoutError_,
 )
 from .lifecycle import LifecycleMachine, State
-from .registry import ModelEntry, Registry
+from .registry import ModelEntry, Registry, load_registry
 from .router import AutoRouter, should_escalate
 from .state import make_state_store
+from .tracing import make_tracer
 
 log = logging.getLogger("broker.manager")
 
@@ -104,6 +106,9 @@ class ManagedModel:
         # Routing / health state.
         self.public_name = entry.public_name
         self.healthy = True
+        # Set True while an admin unload/reload is draining this member: selection
+        # skips it so in-flight requests finish without new ones piling on.
+        self.draining = False
         self._route_seq = 0
         self.last_health: dict[str, Any] | None = None
         # Optional real load signal (vLLM /metrics num_requests_waiting) refreshed
@@ -199,6 +204,10 @@ class ModelManager:
         # Redis when BROKER_REDIS_URL is set (multi-replica). Owns the sticky
         # session map, per-member cooldowns, counters, and a generic KV.
         self.state = make_state_store(settings)
+        # Optional OpenTelemetry tracer (ADR 0012): no-op unless tracing_enabled.
+        # Constructed here so an enabled-but-not-installed otel extra fails fast
+        # at app creation (ConfigError), never mid-request.
+        self.tracer = make_tracer(settings)
         # Back-compat view of the sticky map for in-process deployments/tests:
         # (public_name, session_key) -> member alias, LRU-ordered. None under
         # Redis (the shared store is authoritative there).
@@ -291,10 +300,14 @@ class ModelManager:
         """
         req = frozenset(required_placement or ())
         if self.router is not None and name == self.settings.router_alias:
-            async with self._router_lock:
-                decision = await asyncio.to_thread(
-                    self.router.route, payload, req, latency_budget_ms
-                )
+            with self.tracer.span(
+                "auto_route", {"gen_ai.operation.name": "route", "gen_ai.request.model": name}
+            ) as sp:
+                async with self._router_lock:
+                    decision = await asyncio.to_thread(
+                        self.router.route, payload, req, latency_budget_ms
+                    )
+                sp.set_attribute("broker.route.chosen", decision.chosen)
             if decision.cascade and len(decision.cascade) > 1:
                 return ResolvedRoute(
                     hops=list(decision.cascade),
@@ -356,6 +369,17 @@ class ModelManager:
             )
         except Exception as exc:  # noqa: BLE001 - logging must never break a request
             log.warning("cascade hop usage record failed: %s", exc)
+
+    async def resolve_public(self, name: str, payload: dict) -> str:
+        """Resolve ``auto``/cascade to the model the response cache keys on.
+
+        Runs the router (no serving) and returns the model the request will run
+        under; for a cascade route this is the first (primary) hop. The final
+        served model for a cascade is carried in the cached response body, per
+        ADR 0012.
+        """
+        resolved = await self._resolve_route(name, payload, frozenset(), None)
+        return resolved.hops[0]
 
     # --- eviction --------------------------------------------------------
     async def _maybe_evict(self, keep_alias: str) -> None:
@@ -500,7 +524,7 @@ class ModelManager:
         member.
         """
         async with self._route_lock:
-            pool = [m for m in members if m.entry.alias not in exclude]
+            pool = [m for m in members if m.entry.alias not in exclude and not m.draining]
             if not pool:
                 return None
             tier = [m for m in pool if m.healthy and m.machine.state != State.FAILED]
@@ -735,7 +759,11 @@ class ModelManager:
         # inflight was reserved by _select_member; release it in finally.
         try:
             await self._maybe_evict(m.entry.alias)
-            await m.ensure_ready()
+            with self.tracer.span(
+                "load_model",
+                {"gen_ai.request.model": public_name, "broker.member.alias": m.entry.alias},
+            ):
+                await m.ensure_ready()
             async with self.global_sem:
                 if m.sem.locked() and self.settings.load_concurrency_policy == "reject":
                     raise ConcurrencyLimitError(
@@ -746,10 +774,30 @@ class ModelManager:
                 async with m.sem:
                     if m.machine.state == State.READY:
                         m.machine.to(State.BUSY)
-                    result = await asyncio.wait_for(
-                        m.adapter.chat(payload, request_id),
-                        timeout=m.entry.request_timeout_seconds,
-                    )
+                    with self.tracer.span(
+                        "inference",
+                        {
+                            "gen_ai.operation.name": "chat",
+                            "gen_ai.request.model": public_name,
+                            "gen_ai.provider.name": m.adapter.name,
+                            "broker.member.alias": m.entry.alias,
+                        },
+                    ) as sp:
+                        result = await asyncio.wait_for(
+                            m.adapter.chat(payload, request_id),
+                            timeout=m.entry.request_timeout_seconds,
+                        )
+                        if isinstance(result, dict):
+                            usage = result.get("usage") or {}
+                            sp.set_attribute("gen_ai.response.model", public_name)
+                            if usage.get("prompt_tokens") is not None:
+                                sp.set_attribute(
+                                    "gen_ai.usage.input_tokens", usage["prompt_tokens"]
+                                )
+                            if usage.get("completion_tokens") is not None:
+                                sp.set_attribute(
+                                    "gen_ai.usage.output_tokens", usage["completion_tokens"]
+                                )
                     m.healthy = True
                     # Present the public (requested) model name back to the caller.
                     if isinstance(result, dict):
@@ -907,6 +955,151 @@ class ModelManager:
         # the pool is harmless (only the owner reacts).
         for m in self._members_for(name):
             await m.adapter.cancel(request_id)
+
+    # --- admin runtime control (ADR 0012) --------------------------------
+    async def _drain(self, m: ManagedModel, timeout: float | None = None) -> bool:
+        """Wait for a member's in-flight requests to reach zero (bounded).
+
+        Returns True if drained, False on timeout. The caller sets ``m.draining``
+        first so selection stops routing new work to the member.
+        """
+        timeout = self.settings.admin_drain_timeout_seconds if timeout is None else timeout
+        deadline = time.monotonic() + max(0.0, timeout)
+        while m.machine.inflight > 0 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        return m.machine.inflight == 0
+
+    def admin_list_models(self) -> list[dict[str, Any]]:
+        """Per-model runtime snapshot for the admin API (never loads anything)."""
+        out: list[dict[str, Any]] = []
+        for alias, m in self.models.items():
+            out.append(
+                {
+                    "alias": alias,
+                    "model": m.public_name,
+                    "backend": m.adapter.name,
+                    "state": m.machine.state.value,
+                    "inflight": m.machine.inflight,
+                    "loaded": m.machine.is_active(),
+                    "loaded_at": m.machine.loaded_at,
+                    "idle_seconds": round(m.machine.idle_seconds(), 2),
+                    "healthy": m.healthy,
+                    "draining": m.draining,
+                }
+            )
+        return out
+
+    async def admin_unload(self, alias: str, *, drain: bool = False) -> dict[str, Any]:
+        """Unload a model on demand (admin). Refuses or drains if it is serving.
+
+        * ``drain=False`` (default): refuse with :class:`ModelBusyError` if there
+          are in-flight requests; otherwise unload immediately.
+        * ``drain=True``: stop selecting the member, wait for in-flight to reach
+          zero (bounded by ``admin_drain_timeout_seconds``), then unload. If the
+          drain times out, the model is left serving and ModelBusyError is raised.
+        """
+        m = self.get(alias)
+        if not drain:
+            if m.machine.inflight > 0:
+                raise ModelBusyError(
+                    f"model {alias!r} has {m.machine.inflight} in-flight request(s)",
+                    model=alias,
+                    remediation="retry with drain=true to wait for them to finish",
+                )
+            await m.unload()
+            return {"alias": alias, "state": m.machine.state.value, "drained": False}
+        m.draining = True
+        try:
+            drained = await self._drain(m)
+            if not drained:
+                raise ModelBusyError(
+                    f"drain of {alias!r} timed out with {m.machine.inflight} in-flight",
+                    model=alias,
+                    remediation="raise BROKER_ADMIN_DRAIN_TIMEOUT_SECONDS or retry",
+                )
+            await m.unload()
+            return {"alias": alias, "state": m.machine.state.value, "drained": True}
+        finally:
+            m.draining = False
+
+    async def admin_load(self, alias: str) -> dict[str, Any]:
+        """Explicitly preload a model (admin). The ONLY non-request load path.
+
+        Preserves the lazy-load invariant for the normal data path: a model still
+        never loads at startup or on a health check — only on an inference request
+        or this explicit admin action.
+        """
+        m = self.get(alias)
+        await self._maybe_evict(alias)
+        await m.ensure_ready()
+        return {"alias": alias, "state": m.machine.state.value, "loaded": m.machine.is_active()}
+
+    async def admin_reload_registry(self) -> dict[str, Any]:
+        """Re-read + validate the registry and apply the diff without a restart.
+
+        Transactional: the new registry is fully loaded and every adapter config
+        validated BEFORE anything mutates, so an invalid registry makes **no
+        change** and surfaces a structured :class:`ConfigError`. Unchanged models
+        keep their live instance (and loaded state); changed and removed models
+        are drained then stopped; added models are registered (not loaded).
+        """
+        # 1. Load + validate the candidate registry (raises ConfigError, no change).
+        new_reg = load_registry(self.settings.registry_path, set(self.settings.enabled_backends))
+        new_by = {e.alias: e for e in new_reg.models}
+        old_by = {a: m.entry for a, m in self.models.items()}
+
+        added = [a for a in new_by if a not in old_by]
+        removed = [a for a in old_by if a not in new_by]
+        changed = [
+            a for a in new_by if a in old_by and new_by[a].model_dump() != old_by[a].model_dump()
+        ]
+        unchanged = [a for a in new_by if a in old_by and a not in changed]
+
+        # 2. Build + validate new ManagedModels for added/changed BEFORE mutating.
+        fresh: dict[str, ManagedModel] = {}
+        for a in added + changed:
+            mm = ManagedModel(new_by[a], self.settings)
+            mm.adapter.validate_config()  # raises → propagates, nothing mutated yet
+            fresh[a] = mm
+
+        # 3. Drain + stop the OLD instances of removed/changed models.
+        for a in removed + changed:
+            old = self.models.get(a)
+            if old is None:
+                continue
+            old.draining = True
+            await self._drain(old)
+            await old.stop()
+
+        # 4. Atomically swap in the new model set (unchanged keep their instance).
+        new_models: dict[str, ManagedModel] = {}
+        for a in new_by:
+            new_models[a] = self.models[a] if a in unchanged else fresh[a]
+        self.models = new_models
+        self.registry = new_reg
+        self.pools = {}
+        for e in new_reg.models:
+            self.pools.setdefault(e.public_name, []).append(self.models[e.alias])
+        # Refresh the auto-router against the new registry policy.
+        if self.settings.router_enabled and self.settings.router_backend != "off":
+            self.router = AutoRouter(self, self.settings, new_reg.router)
+        else:
+            self.router = None
+
+        log.info(
+            "registry reloaded: +%d -%d ~%d (=%d)",
+            len(added),
+            len(removed),
+            len(changed),
+            len(unchanged),
+        )
+        return {
+            "added": sorted(added),
+            "removed": sorted(removed),
+            "changed": sorted(changed),
+            "unchanged": sorted(unchanged),
+            "models": len(self.models),
+        }
 
     # --- idle sweep ------------------------------------------------------
     async def _sweep_once(self) -> None:
@@ -1102,6 +1295,7 @@ class ModelManager:
                 if self.cache_router is not None
                 else {"enabled": False}
             ),
+            "tracing_enabled": self.tracer.enabled,
             "router": self.router.status() if self.router else {"enabled": False},
             "pools": {
                 name: [mm.entry.alias for mm in members] for name, members in self.pools.items()

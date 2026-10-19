@@ -113,14 +113,44 @@ link-local/metadata addresses. See `docs/security-model.md` and
   seconds, last error, live `healthy`/`last_health`, and `cooldown` when enabled)
   plus adapter status (endpoint, GPU allocation), the `pools` map,
   `route_strategy` / `sticky_sessions`, `state_backend` (`in_process`|`redis`),
-  `retry_max_attempts`, and `cooldowns_enabled`.
+  `retry_max_attempts`, `cooldowns_enabled`, `tracing_enabled`, and a
+  `response_cache` stats block (ADR 0012).
 - `GET /healthz/backends` — live, non-loading per-backend liveness (`ok`/`degraded`), with per-member `cooldown`.
 - `GET /api/ps` — Ollama residency passthrough (what is actually in memory).
 - `GET /metrics` — Prometheus exposition (when `metrics_enabled`).
-- Structured JSON logs (`log_format=json`) or text.
+- **OpenTelemetry tracing** (ADR 0012, opt-in `tracing_enabled` + the `otel`
+  extra): `broker/tracing.py` wraps the request path in `gen_ai.*` spans
+  (`auto_route`→`load_model`→`inference`→`cache_lookup`). Content is never
+  captured; the OTLP exporter uses standard `OTEL_*` env vars. Disabled = a no-op
+  null tracer with zero overhead; enabled-but-not-installed = fail-fast
+  `ConfigError`. Prometheus is unchanged.
+- Structured JSON logs (`log_format=json`) or text. Admin actions are logged by
+  the `broker.admin` logger (ADR 0012).
 
 See [routing-and-health.md](routing-and-health.md) for pools, routing, failover,
 and health details.
+
+## Response cache (ADR 0012)
+
+`broker/cache.py` (`ResponseCache`) is a thin policy layer over the StateStore
+`kv_*` API. Off by default. When enabled, the API layer wraps each non-streaming
+inference endpoint in a cache lookup: resolve `auto` → build the key `sha256(key/
+tenant scope, resolved public model, endpoint, normalized body)` → return the
+stored result on a hit, else serve and store. The scope-first key guarantees
+per-key isolation; only deterministic (or embedding) requests are cached by
+default; errors and streams are never stored. Backed by the same StateStore as
+routing state, so it is in-process by default or shared via Redis.
+
+## Admin runtime control (ADR 0012)
+
+Off by default. The `ModelManager` exposes `admin_list_models`, `admin_unload`
+(refuse/drain on in-flight), `admin_load` (explicit preload — the only
+non-request load path), and `admin_reload_registry` (transactional: validate the
+whole candidate registry and all adapters before mutating; drain changed/removed
+members; keep unchanged instances live; invalid → no change). The routes sit
+behind `require_admin` (a dedicated admin-key gate, the swap point for ADR 0008's
+admin scope). A member being drained sets `draining=True`, which member selection
+skips — the two-phase connection-drain pattern.
 
 ## StateStore: shared routing/runtime state (ADR 0009)
 

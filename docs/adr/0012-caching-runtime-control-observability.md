@@ -1,46 +1,165 @@
-# ADR 0012: Caching, runtime control, and tracing/UI
+# ADR 0012: Response cache, runtime control/hot-reload, and tracing (+ optional UI)
 
-- Status: Proposed (draft)
-- Date: 2026-10-18
+- Status: Accepted
+- Date: 2026-10-19
 - Supersedes: none
-- Related: `docs/roadmap.md`; prior art: LiteLLM caching, llama-swap runtime
-  control + UI
+- Related: ADR 0009 (StateStore — the cache's backing store); ADR 0008 (per-key
+  governance — the admin-scope seam); `docs/roadmap.md` items 10/11/12;
+  research: `docs/research/adr-0012-caching-runtime-control-observability.md`.
+  Prior art: LiteLLM caching, OpenRouter caching, RFC 9111, llama-swap runtime
+  control, OpenTelemetry GenAI semantic conventions.
 
 ## Context
 
-Three independent ops/experience gaps vs peers, grouped here as a roadmap draft
-(each may split into its own ADR when picked up):
+Three independent ops/experience gaps vs peer LLM gateways, grouped here because
+each is small and they share the same invariants and admin surface:
 
-1. **Response caching** — no cache today; repeated prompts re-run inference.
-   LiteLLM/OpenRouter show large latency/cost wins from exact (and optional
-   semantic) caching.
-2. **Runtime control** — no way to unload a model or reload the registry without a
-   restart; llama-swap exposes manual unload + list-running + profiles.
-3. **Observability depth** — we emit Prometheus + `/status`; no distributed
+1. **Response caching** — no cache today; identical prompts re-run inference.
+   LiteLLM/OpenRouter show large latency/cost wins from exact caching.
+2. **Runtime control** — no way to unload a model, explicitly preload one, or
+   reload the registry without a restart; llama-swap exposes manual unload +
+   list-running + file-watch reload.
+3. **Observability depth** — we emit Prometheus + `/status`, but no distributed
    tracing, and no built-in UI/playground.
 
-## Decision (proposed)
+Hard constraints from our invariants: **no model loads at startup or on a health
+check** (lazy load); **no silent cross-model fallback**; new behavior is
+**opt-in and default-off** (defaults must reproduce v0.4.0); optional deps go in
+a pyproject extra, import-guarded with a `ConfigError` when enabled-but-missing;
+**no prompt/response content leaves the broker** without explicit opt-in. The
+research note surveys the converging prior art and records what we adopt/reject.
 
-- **Exact response cache**: opt-in, keyed by a hash of (model, normalized
-  messages, sampling params); honor `stream`/`store` semantics; TTL + max size;
-  backed by the ADR 0009 state abstraction (in-process or Redis). Semantic cache is
-  a later, separate decision.
-- **Runtime control endpoints**: `POST /admin/models/unload[/:id]`, list-running,
-  and **registry hot-reload** (re-read + diff without dropping in-flight requests),
-  all behind auth/admin scope.
-- **OpenTelemetry tracing**: optional spans around route→load→inference, gated by
-  `tracing_enabled`; keep Prometheus. A web UI/playground is optional and lowest
-  priority.
+## Decision
+
+Three capabilities, all **opt-in with defaults that reproduce v0.4.0**, plus a
+deferred UI.
+
+### 1. Exact response cache (`BROKER_RESPONSE_CACHE_ENABLED`, default off)
+
+- **Key = SHA-256 of `(caller scope, resolved public model, endpoint, normalized
+  request body)`.** The caller scope (API-key fingerprint, extensible to tenant)
+  is the FIRST component, so a cached answer can **never cross a key/tenant
+  boundary**. The model is the one chosen **after `auto` resolution** (documented
+  decision rule: the cache keys on the concrete public model the request will run
+  on, so two callers who both hit `auto`→*modelX* share correctly). The body is
+  normalized (sorted keys, canonical JSON) and includes sampling params, `tools`,
+  `tool_choice`, and `response_format`; routing-only fields (`model`, `stream`,
+  `user`) are excluded.
+- **Deterministic-only by default** (`temperature == 0` or an explicit `seed`;
+  embeddings are always deterministic). Configurable to cache all requests.
+- **Never cache errors or partial/streamed responses.** Streaming requests
+  **bypass** the cache (replaying an assembled SSE stream from cache is deferred).
+- **Bypass** via `Cache-Control: no-cache`/`no-store` (RFC 9111 request
+  directives — treated as a full bypass since the broker has no revalidation
+  protocol) or `x-broker-cache: bypass`. Every response carries
+  `x-broker-cache: hit|miss|bypass`.
+- **Backed by the ADR 0009 StateStore** (`kv_*`): in-process by default, or Redis
+  (shared across replicas) when `BROKER_REDIS_URL` is set. TTL + per-entry byte
+  cap + an LRU `max_entries` bound. Covers chat, completions, responses
+  (non-stream), embeddings.
+- **Semantic (embedding-similarity) cache is deferred** — it needs an embedding
+  model + vector store and "goes badly wrong on agentic" multi-turn traffic.
+
+### 2. Admin runtime control (`BROKER_ADMIN_ENABLED`, default off)
+
+Behind a dedicated `require_admin` gate (see the admin-scope seam below):
+
+- `GET /admin/models` — per-model runtime snapshot (state, inflight, loaded-at,
+  idle seconds, healthy, draining). Non-loading.
+- `POST /admin/models/{alias}/unload` — unload on demand. Refuses with `409
+  model_busy` if there are in-flight requests; `?drain=true` stops selecting the
+  member, waits (bounded by `admin_drain_timeout_seconds`) for in-flight to reach
+  zero, then unloads (two-phase drain — the standard zero-downtime pattern).
+- `POST /admin/models/{alias}/load` — explicit preload. **The only way a model
+  loads without an inference request**; the lazy-load invariant for the normal
+  data path is untouched (still no load at startup / on health checks).
+- `POST /admin/registry/reload` — re-read + validate the registry and apply the
+  diff without a restart. **Transactional**: the new registry is fully loaded and
+  every adapter config validated *before anything mutates*, so an invalid
+  registry makes **no change** and returns a structured `ConfigError`. Unchanged
+  models keep their live instance (and loaded state); changed/removed models are
+  **drained then stopped**; added models are registered (not loaded).
+- Every admin action is audit-logged (action, target, actor key fingerprint).
+
+### 3. OpenTelemetry tracing (`BROKER_TRACING_ENABLED`, default off)
+
+- Optional `otel` extra. When enabled but `opentelemetry` is missing, startup
+  fails fast with a `ConfigError`. When disabled, tracing is a **no-op with zero
+  overhead** (no SDK import; spans are a null context manager).
+- Spans follow the **GenAI semantic conventions**: `auto_route`, `load_model`,
+  `inference`, `cache_lookup` carry `gen_ai.operation.name`,
+  `gen_ai.request.model`, `gen_ai.provider.name`, `gen_ai.response.model`,
+  `gen_ai.usage.input_tokens`/`output_tokens`, and `error.type`.
+- **No prompt/response content in spans, ever** (the spec mandates content be
+  opt-in; we do not even implement the opt-in here). The OTLP exporter is
+  configured entirely via standard `OTEL_*` env vars; the broker sets only the
+  service name. Prometheus `/metrics` is unchanged.
+
+### 4. Web UI/playground — DEFERRED
+
+`BROKER_UI_ENABLED` is reserved (default off, currently inert). A hardened static
+page (strict CSP, no external CDN, key in memory only) is real work orthogonal to
+the three backend features; the admin + cache APIs are the substrate a future UI
+would consume. Recorded as deferred here and in the roadmap.
+
+### Admin-scope seam (parallel work: ADR 0008)
+
+ADR 0008 introduces virtual keys with `user|admin` scopes. Until it lands, the
+admin surface is gated by a minimal `BROKER_ADMIN_API_KEYS` list behind a small,
+clearly-isolated `check_admin`/`require_admin` dependency (`broker/auth.py`,
+`broker/app.py`). This is the **single swap point**: the integrator replaces the
+key-list check with 0008's admin-scope check without touching any route.
 
 ## Alternatives considered
 
-- **No cache** — simplest; leaves the biggest repeat-latency/cost win unclaimed.
-- **Restart to reload config** — operationally painful for registry edits.
-- **Metrics only** — fine for counts, weak for per-request latency breakdowns.
+- **No cache / metrics-only observability** — simplest; leaves the biggest
+  repeat-latency/cost win and per-request latency breakdowns unclaimed.
+- **Semantic cache now** — rejected: heavy new deps, and fuzzy matches are unsafe
+  for multi-turn/agentic traffic. Deferred.
+- **File-watcher registry reload** (llama-swap style) — rejected in favor of an
+  explicit, audited `POST /admin/registry/reload`: reload becomes an intentional,
+  logged, transactional operation instead of a side effect of an editor save, and
+  is trivially testable.
+- **Reusing the normal API keys for admin** — rejected: the control plane must be
+  isolated from the data plane, and ADR 0008 will introduce a real admin scope.
+- **Capturing prompt content in spans (even opt-in)** — rejected for now: stays on
+  the safe side of the threat model; metadata-only spans are enough for latency
+  and routing analysis.
 
 ## Consequences
 
-- Caching must never serve across auth/tenant boundaries or cache errors; correct
-  invalidation is the main risk.
-- Admin endpoints widen the control surface — must be auth-gated and audited.
-- Each item is independently shippable; this draft records the direction.
+- Caching must never serve across a key/tenant boundary or cache errors/partials;
+  the key design (scope-first, resolved-model, normalized body) and
+  deterministic-only default are the mitigations, each tested.
+- Admin endpoints widen the control surface — gated, audited, and default-off.
+  The drain protocol means an unload/reload never drops an in-flight request.
+- Tracing adds an optional dependency and a tiny per-span cost only when enabled;
+  disabled is byte-for-byte v0.4.0.
+- Each item is independently shippable and default-off, so upgrading changes
+  nothing until an operator opts in.
+
+## Confirmation
+
+Verified by the test suite (run from the worktree; the `otel` span assertions use
+an in-memory exporter and skip cleanly where the optional dep is absent, exercised
+green in a private `[dev,otel]` venv):
+
+- `tests/test_cache.py` — cache-key **stability across dict ordering** and
+  **isolation across scope / model / endpoint**; sampling/tools/`response_format`
+  change the key while `stream`/`user` do not; **deterministic-only default**
+  (temperature>0 never hits); **hit/miss/bypass** headers end-to-end; per-API-key
+  **isolation** (no cross-key read); **errors are not cached**; embeddings cached;
+  disabled = pass-through; StateStore-backed roundtrip, **TTL expiry**,
+  **max_entries LRU eviction**, and **max_bytes** skip.
+- `tests/test_admin.py` — admin **disabled blocks**; **admin key required** (a
+  user key is rejected); model list; **explicit load then unload**; **unload
+  refuses on in-flight** and **drain waits / times out**; a **draining member is
+  skipped by selection**; registry reload **adds/removes**, **keeps unchanged
+  model instances**, and **rolls back on an invalid registry** (no change).
+- `tests/test_tracing.py` — **no-op when disabled** (null span, app serves);
+  **`ConfigError` when enabled without opentelemetry** (skipped when installed);
+  with the SDK present, `inference`/`load_model` spans carry `gen_ai.*`
+  attributes and **no span contains prompt/response content**.
+- Existing suites stay green unchanged, proving defaults reproduce v0.4.0. Gates:
+  `ruff check` + `ruff format --check` + full `pytest`; `docs/openapi.yaml`
+  regenerated.

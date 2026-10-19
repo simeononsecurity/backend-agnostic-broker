@@ -34,7 +34,8 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
 from . import __version__
-from .auth import extract_key
+from .auth import admin_key_match, extract_key
+from .cache import ResponseCache
 from .config import Settings, get_settings
 from .errors import (
     AuthError,
@@ -217,6 +218,98 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.usage = usage
     app.state.key_store = key_store
     app.state.governor = governor
+    # Exact response cache (ADR 0012), backed by the manager's StateStore. A no-op
+    # pass-through unless BROKER_RESPONSE_CACHE_ENABLED.
+    response_cache = ResponseCache(manager.state, settings)
+    app.state.response_cache = response_cache
+    admin_log = logging.getLogger("broker.admin")
+
+    def _cache_bypass(request: Request) -> bool:
+        """True if the caller asked to skip the cache (read AND write).
+
+        Honors the HTTP-standard ``Cache-Control: no-cache``/``no-store`` request
+        directives (treated as a full bypass — the broker has no revalidation
+        protocol, so not-serving-stored is the safe superset) and the
+        broker-specific ``x-broker-cache: bypass`` header.
+        """
+        cc = (request.headers.get("cache-control") or "").lower()
+        xb = (request.headers.get("x-broker-cache") or "").lower()
+        return "no-cache" in cc or "no-store" in cc or xb == "bypass"
+
+    async def _cached_serve(
+        *,
+        request: Request,
+        key_scope: str | None,
+        endpoint: str,
+        alias: str,
+        keyed_payload: dict,
+        serve,
+        always_deterministic: bool = False,
+    ) -> tuple[dict, str]:
+        """Serve a request through the response cache. Returns (result, state).
+
+        ``state`` is ``hit|miss|bypass`` (also set as the ``x-broker-cache``
+        response header). ``serve(name)`` runs the real pipeline for the resolved
+        public model and returns the final response dict. Errors propagate
+        uncached; only a successful result is stored.
+        """
+        if not response_cache.enabled:
+            return await serve(alias), "miss"
+        if _cache_bypass(request):
+            return await serve(alias), "bypass"
+        resolved = await manager.resolve_public(alias, keyed_payload)
+        if not response_cache.cacheable(keyed_payload, always_deterministic=always_deterministic):
+            return await serve(alias), "miss"
+        ckey = ResponseCache.make_key(
+            scope=key_scope or "anon", model=resolved, endpoint=endpoint, payload=keyed_payload
+        )
+        with manager.tracer.span("cache_lookup", {"broker.cache.endpoint": endpoint}) as sp:
+            hit = await response_cache.get(ckey)
+            sp.set_attribute("broker.cache.hit", hit is not None)
+        if hit is not None:
+            return hit, "hit"
+        # Serve through the ORIGINAL alias (not the pre-resolved model) so auto,
+        # cascade, placement and per-key scoping all run in the manager. ``resolved``
+        # is only the cache-key model; a cascade's final served model is in the body.
+        result = await serve(alias)
+        await response_cache.store(ckey, result)
+        return result, "miss"
+
+    def require_admin(
+        authorization: str | None, x_api_key: str | None, x_admin_key: str | None
+    ) -> None:
+        """Gate for /admin/*: 400 ``admin_disabled`` when disabled, else require an
+        admin credential.
+
+        Admin is authorized by EITHER a virtual key whose scope is ``admin``
+        (ADR 0008 key governance) OR a configured ``BROKER_ADMIN_API_KEYS`` value
+        (ADR 0012 back-compat). Both credentials are compared byte-wise so a
+        malformed (non-ASCII / over-long) key fails closed with a clean 401, and
+        the admin surface stays locked even when data-plane auth is disabled.
+        """
+        if not settings.admin_enabled:
+            raise ValidationError(
+                "admin runtime control is disabled",
+                remediation="set BROKER_ADMIN_ENABLED=true to enable /admin",
+                code="admin_disabled",
+            )
+        presented = x_admin_key.strip() if x_admin_key else extract_key(authorization, x_api_key)
+        if not presented:
+            raise AuthError(
+                "missing admin key",
+                remediation="send X-Admin-Key (or Authorization/X-API-Key) with an admin key",
+            )
+        # ADR 0008 virtual-key admin scope takes precedence; fall back to the
+        # dedicated BROKER_ADMIN_API_KEYS list (ADR 0012 back-compat).
+        principal = key_store.resolve(presented)
+        if principal is not None and principal.is_admin:
+            return
+        if admin_key_match(settings, presented):
+            return
+        raise AuthError(
+            "invalid admin key",
+            remediation="use an admin-scope virtual key or a configured BROKER_ADMIN_API_KEYS value",
+        )
 
     def err_response(exc: BrokerError, request_id: str) -> JSONResponse:
         payload = exc.to_payload()
@@ -266,6 +359,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def _allowed_models(principal: Principal) -> set[str] | None:
         models = principal.limits.allowed_models
         return set(models) if models else None
+
+    def _cache_scope(key_id: str | None, placement) -> str:
+        """Cache-key scope: the per-key/tenant id plus the placement requirement,
+        so a cached response never crosses key or placement boundaries (ADR 0012)."""
+        base = key_id or "anon"
+        if placement:
+            return f"{base}|placement={','.join(sorted(placement))}"
+        return base
 
     def _precheck_model(principal: Principal, model: str) -> None:
         """Fast 403 for a directly-requested, disallowed model (before admission).
@@ -326,7 +427,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         authed(authorization, x_api_key)
         LOADED_MODELS.set(manager.loaded_count())
-        return await manager.status()
+        snapshot = await manager.status()
+        snapshot["response_cache"] = response_cache.stats()
+        return snapshot
 
     @app.get("/metrics")
     async def metrics():
@@ -485,14 +588,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         prompt_tokens = completion_tokens = 0
         served_model = alias
         try:
-            result = await manager.chat(
-                alias,
-                payload,
-                request_id,
-                route_key=session_key,
-                required_placement=placement,
-                latency_budget_ms=budget,
-                allowed_models=allowed,
+            async def _serve(name: str) -> dict:
+                return await manager.chat(
+                    name,
+                    payload,
+                    request_id,
+                    route_key=session_key,
+                    required_placement=placement,
+                    latency_budget_ms=budget,
+                    allowed_models=allowed,
+                )
+
+            result, cache_state = await _cached_serve(
+                request=request,
+                key_scope=_cache_scope(key_id, placement),
+                endpoint="chat",
+                alias=alias,
+                keyed_payload=payload,
+                serve=_serve,
             )
             route_path = result.pop("_broker_route", result.get("model", alias))
             REQUESTS.labels("chat", alias, "ok").inc()
@@ -517,6 +630,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 headers={
                     "x-request-id": request_id,
                     "x-broker-route": route_path,
+                    "x-broker-cache": cache_state,
                     **admission.headers,
                 },
             )
@@ -641,14 +755,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         prompt_tokens = completion_tokens = 0
         served_model = model
         try:
-            result = await manager.chat(
-                model,
-                chat_payload,
-                request_id,
-                route_key=session_key,
-                required_placement=placement,
-                latency_budget_ms=budget,
-                allowed_models=allowed,
+            async def _serve(name: str) -> dict:
+                return await manager.chat(
+                    name,
+                    chat_payload,
+                    request_id,
+                    route_key=session_key,
+                    required_placement=placement,
+                    latency_budget_ms=budget,
+                    allowed_models=allowed,
+                )
+
+            result, cache_state = await _cached_serve(
+                request=request,
+                key_scope=_cache_scope(key_id, placement),
+                endpoint="completions",
+                alias=model,
+                keyed_payload=chat_payload,
+                serve=_serve,
             )
             route_path = result.pop("_broker_route", result.get("model", model))
             out = chat_to_text_completion(result, model)
@@ -674,6 +798,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 headers={
                     "x-request-id": request_id,
                     "x-broker-route": route_path,
+                    "x-broker-cache": cache_state,
                     **admission.headers,
                 },
             )
@@ -790,14 +915,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         prompt_tokens = completion_tokens = 0
         served_model = model
         try:
-            result = await manager.chat(
-                model,
-                chat_payload,
-                request_id,
-                route_key=session_key,
-                required_placement=placement,
-                latency_budget_ms=budget,
-                allowed_models=allowed,
+            async def _serve(name: str) -> dict:
+                return await manager.chat(
+                    name,
+                    chat_payload,
+                    request_id,
+                    route_key=session_key,
+                    required_placement=placement,
+                    latency_budget_ms=budget,
+                    allowed_models=allowed,
+                )
+
+            result, cache_state = await _cached_serve(
+                request=request,
+                key_scope=_cache_scope(key_id, placement),
+                endpoint="responses",
+                alias=model,
+                keyed_payload=chat_payload,
+                serve=_serve,
             )
             route_path = result.pop("_broker_route", result.get("model", model))
             out = chat_to_response(result, model)
@@ -823,6 +958,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 headers={
                     "x-request-id": request_id,
                     "x-broker-route": route_path,
+                    "x-broker-cache": cache_state,
                     **admission.headers,
                 },
             )
@@ -875,13 +1011,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         prompt_tokens = 0
         served_model = model
         try:
-            result = await manager.embeddings(
-                model,
-                payload,
-                request_id,
-                route_key=session_key,
-                required_placement=placement,
-                allowed_models=allowed,
+            async def _serve(name: str) -> dict:
+                return await manager.embeddings(
+                    name,
+                    payload,
+                    request_id,
+                    route_key=session_key,
+                    required_placement=placement,
+                    allowed_models=allowed,
+                )
+
+            result, cache_state = await _cached_serve(
+                request=request,
+                key_scope=_cache_scope(key_id, placement),
+                endpoint="embeddings",
+                alias=model,
+                keyed_payload=payload,
+                serve=_serve,
+                always_deterministic=True,
             )
             REQUESTS.labels("embeddings", model, "ok").inc()
             u = result.get("usage") or {}
@@ -900,7 +1047,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status="ok",
             )
             return JSONResponse(
-                content=result, headers={"x-request-id": request_id, **admission.headers}
+                content=result,
+                headers={
+                    "x-request-id": request_id,
+                    "x-broker-cache": cache_state,
+                    **admission.headers,
+                },
             )
         finally:
             INFLIGHT.dec()
@@ -912,6 +1064,74 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 completion_tokens=0,
                 model=served_model,
             )
+
+    # --- admin runtime control (ADR 0012) --------------------------------
+    def _admin_actor(authorization, x_api_key, x_admin_key) -> str:
+        return UsageLog.key_fingerprint(x_admin_key or x_api_key or authorization) or "unknown"
+
+    @app.get("/admin/models")
+    async def admin_models(
+        request: Request,
+        authorization: str | None = Header(None),
+        x_api_key: str | None = Header(None),
+        x_admin_key: str | None = Header(None),
+    ):
+        """Runtime snapshot of every model: state, inflight, last-used (admin)."""
+        require_admin(authorization, x_api_key, x_admin_key)
+        return {"models": manager.admin_list_models()}
+
+    @app.post("/admin/models/{alias}/unload")
+    async def admin_unload(
+        alias: str,
+        request: Request,
+        drain: bool = False,
+        authorization: str | None = Header(None),
+        x_api_key: str | None = Header(None),
+        x_admin_key: str | None = Header(None),
+    ):
+        """Unload a model (admin). Refuses on in-flight unless ``?drain=true``."""
+        require_admin(authorization, x_api_key, x_admin_key)
+        actor = _admin_actor(authorization, x_api_key, x_admin_key)
+        admin_log.info("admin action", extra={"action": "unload", "target": alias, "actor": actor})
+        result = await manager.admin_unload(alias, drain=drain)
+        admin_log.info("admin unload result: %s", result)
+        return result
+
+    @app.post("/admin/models/{alias}/load")
+    async def admin_load(
+        alias: str,
+        request: Request,
+        authorization: str | None = Header(None),
+        x_api_key: str | None = Header(None),
+        x_admin_key: str | None = Header(None),
+    ):
+        """Explicitly preload a model (admin) — the only non-request load path."""
+        require_admin(authorization, x_api_key, x_admin_key)
+        actor = _admin_actor(authorization, x_api_key, x_admin_key)
+        admin_log.info("admin action", extra={"action": "load", "target": alias, "actor": actor})
+        result = await manager.admin_load(alias)
+        admin_log.info("admin load result: %s", result)
+        return result
+
+    @app.post("/admin/registry/reload")
+    async def admin_reload(
+        request: Request,
+        authorization: str | None = Header(None),
+        x_api_key: str | None = Header(None),
+        x_admin_key: str | None = Header(None),
+    ):
+        """Re-read + validate the registry and apply the diff with no restart.
+
+        Transactional: an invalid registry makes no change and returns a
+        structured error; in-flight requests on changed/removed models drain
+        before replacement; unchanged models keep serving.
+        """
+        require_admin(authorization, x_api_key, x_admin_key)
+        actor = _admin_actor(authorization, x_api_key, x_admin_key)
+        admin_log.info("admin action", extra={"action": "registry_reload", "actor": actor})
+        result = await manager.admin_reload_registry()
+        admin_log.info("admin registry reload result: %s", result)
+        return result
 
     @app.exception_handler(BrokerError)
     async def broker_error_handler(request: Request, exc: BrokerError):

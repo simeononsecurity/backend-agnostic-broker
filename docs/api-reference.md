@@ -281,6 +281,69 @@ sees only its own usage (`scope: "key"`, plus its `api_key_id`); an `admin`-scop
 key sees all usage (`scope: "all"`) and a `by_key` per-key spend breakdown. With
 auth disabled, the caller is treated as admin.
 
+### Response cache header (ADR 0012)
+
+When the exact response cache is enabled (`BROKER_RESPONSE_CACHE_ENABLED`), every
+non-streaming response on `/v1/chat/completions`, `/v1/completions`,
+`/v1/responses`, and `/v1/embeddings` carries an **`x-broker-cache`** header:
+
+- `hit` — served from cache (no inference ran);
+- `miss` — served fresh (and stored if eligible);
+- `bypass` — the cache was skipped for this request.
+
+Bypass the cache per request with `Cache-Control: no-cache` (or `no-store`) or
+`x-broker-cache: bypass`. The cache is keyed per API-key/tenant scope, so a cached
+answer never crosses a key boundary; only deterministic requests (`temperature ==
+0` or an explicit `seed`) are cached by default; errors and streaming responses
+are never cached. See [configuration.md](configuration.md#response-cache-adr-0012).
+
+## Admin runtime control (ADR 0012)
+
+Privileged control plane, **off by default** (`BROKER_ADMIN_ENABLED=true`) and
+gated by a dedicated admin key (`X-Admin-Key`, or `Authorization: Bearer`, matched
+against `BROKER_ADMIN_API_KEYS` — separate from the normal API keys). Every action
+is audit-logged. When admin is disabled the routes return a structured
+`admin_disabled` error.
+
+### `GET /admin/models` — runtime snapshot (admin)
+
+Per-model state, in-flight count, loaded-at, idle seconds, healthy, draining.
+Non-loading.
+
+```bash
+curl -s -H "X-Admin-Key: ***" http://127.0.0.1:8080/admin/models
+# -> {"models":[{"alias":"echo","model":"echo","backend":"fake","state":"ready",
+#      "inflight":0,"loaded":true,"idle_seconds":3.1,"healthy":true,"draining":false}, ...]}
+```
+
+### `POST /admin/models/{alias}/unload` — unload (admin)
+
+Refuses with `409 model_busy` if the model has in-flight requests. Pass
+`?drain=true` to stop selecting the member, wait (bounded by
+`BROKER_ADMIN_DRAIN_TIMEOUT_SECONDS`) for in-flight to finish, then unload.
+
+```bash
+curl -s -X POST -H "X-Admin-Key: ***" \
+  "http://127.0.0.1:8080/admin/models/echo/unload?drain=true"
+```
+
+### `POST /admin/models/{alias}/load` — explicit preload (admin)
+
+Loads a model without an inference request — the **only** non-request load path
+(the lazy-load invariant for the data path is otherwise preserved).
+
+### `POST /admin/registry/reload` — registry hot-reload (admin)
+
+Re-reads and validates the registry and applies the diff with no restart.
+**Transactional**: an invalid registry makes **no change** and returns a
+structured `config_error`; changed/removed models are drained then replaced;
+unchanged models keep serving; added models are registered (not loaded).
+
+```bash
+curl -s -X POST -H "X-Admin-Key: ***" http://127.0.0.1:8080/admin/registry/reload
+# -> {"added":["echo3"],"removed":["echo2"],"changed":[],"unchanged":["echo"],"models":2}
+```
+
 ## OpenAPI
 
 A generated OpenAPI document is at `docs/openapi.yaml` (regenerate with
