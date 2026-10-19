@@ -27,7 +27,7 @@ models:
 
 
 def test_example_registry_parses_into_three_member_pool():
-    reg = load_registry(str(_EXAMPLE / "registry.yaml"), {"vllm"})
+    reg = load_registry(str(_EXAMPLE / "registry.example.yaml"), {"vllm"})
     pools = {m.pool for m in reg.models if m.pool}
     assert "chat" in pools
     members = [m for m in reg.models if m.pool == "chat"]

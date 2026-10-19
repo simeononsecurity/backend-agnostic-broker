@@ -9,7 +9,8 @@ re-validated default `β=0.5`). Full guide: [routing-and-health.md](../../docs/r
 
 ## Files
 
-- `registry.yaml` — the 3-member `chat` pool (host URLs from `${VLLM_URL_1..3}`).
+- `registry.example.yaml` — the 3-member `chat` pool (host URLs from `${VLLM_URL_1..3}`).
+  Copy to `registry.yaml` (gitignored) for a real deployment.
 - `.env.example` — copy to `.env`; sets `cache_aware`, `β=0.5`, and the member URLs.
 
 ## Run
