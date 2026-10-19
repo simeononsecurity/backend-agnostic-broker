@@ -99,10 +99,23 @@ constant-time byte compare, no key material in logs/metrics/errors):
   availability is sacrificed for the guard.
 - **Rotation, not retrieval.** Retrievable/decryptable keys are **rejected** — a
   leaked `keys.yaml` yields only hashes. Rotation (`broker.keys rotate` / admin API)
-  mints a successor with a grace overlap; the secret is still shown once.
+  mints a successor with a grace overlap; the secret is still shown once. Rotation
+  can only ever **shorten** a key's life (`expiry = min(existing, today + grace)`)
+  and **refuses to resurrect** a revoked or expired key (`409 key_not_active`), so
+  the kill switch stays a kill switch.
 - **Admin key API.** `/admin/keys` (list/create/rotate/revoke) is admin-scope only
   and never logs or re-shows a secret; the create/rotate response is the sole
-  one-time secret egress.
+  one-time secret egress. All create/rotate inputs are validated before any write
+  (`grace_days` integer `0..365`; ISO non-past `expiry`; charset/length-capped
+  `tenant`/`label`), so a malformed admin request is a `400`, never a stored
+  dead key or a `500`. Oversized bodies hit the global `413` limit.
+- **Key file at rest.** `keys.yaml` (hashes only) is written **atomically** (temp
+  file + `fsync` + `os.replace`) under an exclusive `flock` on a `keys.yaml.lock`
+  sidecar, and created `0600` with any stricter existing mode preserved — a reader
+  never sees a half-written file and the secret hashes aren't world-readable even
+  when several admin calls / CLI runs / replicas write the shared file at once. A
+  reload that hits a corrupt file keeps the last good key set and logs an error
+  (fail closed for new keys; auth is never dropped wholesale at runtime).
 
 ## No silent fallback
 

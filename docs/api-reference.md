@@ -375,11 +375,29 @@ or logged. Requires `BROKER_KEYS_PATH` (else `400` `keys_file_required`).
   **Never** returns secrets or hashes.
 - **`POST /admin/keys`** — create. Body: `label?`, `tenant?`, `scope?`
   (`user`|`admin`), `expiry?`, `limits?` (same schema as `keys.yaml`). Returns
-  `201` with the key view **plus** a one-time `secret`.
+  `201` with the key view **plus** a one-time `secret`. Inputs are validated
+  (`400` `invalid_request_error`): `label` is a string ≤128 chars from
+  `[A-Za-z0-9 ._-@:+/]`; `tenant` is a string ≤64 chars from `[A-Za-z0-9._-]`;
+  `expiry` is an ISO date/datetime (a datetime is reduced to its UTC date) and a
+  **past** date is rejected (`expiry_in_past`) so a key is never born dead.
 - **`POST /admin/keys/{id}/rotate`** — mint a successor inheriting the
-  predecessor's settings; body `grace_days?` (default 7; `0` = revoke old now).
-  Returns `201` with the new one-time `secret`. `404` `key_not_found` if absent.
+  predecessor's settings; body `grace_days?` — an **integer** in `0..365`
+  (default 7; `0` = revoke old now). A non-integer/out-of-range `grace_days` is
+  `400` `invalid_grace_days`. The old key's expiry is set to
+  `min(existing expiry, today + grace_days)` — rotation **never extends** a key's
+  life. Returns `201` with the new one-time `secret`. `404` `key_not_found` if
+  absent; `409` `key_not_active` if the key is already revoked or expired (a dead
+  key is never resurrected — create a fresh key instead). The CLI
+  `python -m broker.keys rotate` enforces the identical rules.
 - **`DELETE /admin/keys/{id}`** — revoke (sets `enabled:false`). `404` if absent.
+
+All `/admin/keys` routes share the global request-size limit: a body over
+`BROKER_MAX_REQUEST_BYTES` is rejected with `413` `request_too_large` before the
+route runs. `keys.yaml` writes are atomic (temp file + `fsync` + `os.replace`),
+hold an exclusive `flock` on a `keys.yaml.lock` sidecar for the whole
+read-modify-write, and create the file `0600` (an existing stricter mode is
+preserved), so concurrent admin calls / CLI runs on a shared file can't lose an
+update or expose a torn file.
 
 ```bash
 curl -s -X POST -H "X-Admin-Key: ***" -H 'Content-Type: application/json' \

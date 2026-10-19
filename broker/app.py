@@ -47,7 +47,15 @@ from .errors import (
     ValidationError,
 )
 from .governance import Governor
-from .keys import KeyLimits, KeyStore, Principal
+from .keys import (
+    KeyLimits,
+    KeyStore,
+    Principal,
+    validate_expiry,
+    validate_grace_days,
+    validate_label,
+    validate_tenant,
+)
 from .manager import ModelManager
 from .metrics import INFLIGHT, LOADED_MODELS, REQUEST_LATENCY, REQUESTS
 from .openai_compat import (
@@ -1249,16 +1257,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         scope = body.get("scope", "user")
         if scope not in ("user", "admin"):
             raise ValidationError("scope must be 'user' or 'admin'")
+        label = validate_label(body.get("label"))
+        tenant = validate_tenant(body.get("tenant"))
+        expiry = validate_expiry(body.get("expiry"))
         try:
             limits = KeyLimits.from_dict(body.get("limits"))
         except Exception as exc:  # noqa: BLE001
             raise ValidationError(f"invalid limits: {exc}") from exc
         rec, secret = key_store.create_key(
-            label=body.get("label"),
-            tenant=body.get("tenant"),
+            label=label,
+            tenant=tenant,
             scope=scope,
             limits=limits,
-            expiry=body.get("expiry"),
+            expiry=expiry,
         )
         actor = _admin_actor(authorization, x_api_key, x_admin_key)
         admin_log.info(
@@ -1290,7 +1301,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             body = json.loads(raw) if raw else {}
         except json.JSONDecodeError as exc:
             raise ValidationError(f"invalid JSON body: {exc}") from exc
-        grace_days = int(body.get("grace_days", 7))
+        grace_days = validate_grace_days(body.get("grace_days", 7))
         result = key_store.rotate_key(key_id, grace_days=grace_days)
         if result is None:
             raise ModelNotFoundError(

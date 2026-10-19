@@ -26,19 +26,27 @@ Keys live in a git-ignored ``keys.yaml`` (``BROKER_KEYS_PATH``); a committed
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
+import fcntl
 import hashlib
 import hmac
+import logging
 import os
+import re
 import secrets
+import stat
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from .errors import ConfigError
+from .errors import BrokerError, ConfigError, ConflictError, ValidationError
+
+_log = logging.getLogger("broker.keys")
 
 _SECRET_PREFIX = "brk"
 # A fixed dummy hash to compare against when no record matches, so verification
@@ -87,6 +95,110 @@ def _key_id_from_secret(secret: str) -> str | None:
     if len(parts) != 3 or parts[0] != _SECRET_PREFIX or not parts[1] or not parts[2]:
         return None
     return parts[1]
+
+
+# --- input validation (admin key API + CLI, ADR 0016) --------------------- #
+# These keep a malformed admin request from writing a silently-dead or torn key
+# record. Every rejection is a 400 ``invalid_request_error`` (ConfigError/
+# ValidationError subclass) rather than a 500 or a stored bad value.
+GRACE_DAYS_MAX = 365  # documented upper bound for a rotation grace window
+LABEL_MAX_LEN = 128
+TENANT_MAX_LEN = 64
+# Documented charsets: label is human-facing (letters/digits/space + a few
+# separators); tenant is an identifier used in counter keys so it is stricter.
+_LABEL_RE = re.compile(r"^[A-Za-z0-9 ._\-@:+/]{1,128}$")
+_TENANT_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def validate_grace_days(value: Any) -> int:
+    """Return a bounded integer grace window or raise ``ValidationError`` (400).
+
+    JSON floats (incl. ``1e999`` → ``inf``), strings, lists and booleans are all
+    rejected: ``grace_days`` is an integer in ``[0, GRACE_DAYS_MAX]``. ``bool`` is
+    excluded explicitly because it is an ``int`` subclass.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(
+            "grace_days must be an integer",
+            code="invalid_grace_days",
+            remediation=f"send an integer between 0 and {GRACE_DAYS_MAX}",
+        )
+    if value < 0 or value > GRACE_DAYS_MAX:
+        raise ValidationError(
+            f"grace_days must be between 0 and {GRACE_DAYS_MAX}",
+            code="invalid_grace_days",
+            remediation=f"send an integer between 0 and {GRACE_DAYS_MAX}",
+        )
+    return value
+
+
+def validate_label(value: Any) -> str | None:
+    """Return a validated label string or ``None``; raise ``ValidationError`` (400)."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _LABEL_RE.match(value):
+        raise ValidationError(
+            "label must be a string of 1–128 chars from [A-Za-z0-9 ._-@:+/]",
+            code="invalid_label",
+            remediation="use a short printable label within the documented charset",
+        )
+    return value
+
+
+def validate_tenant(value: Any) -> str | None:
+    """Return a validated tenant id or ``None``; raise ``ValidationError`` (400)."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _TENANT_RE.match(value):
+        raise ValidationError(
+            "tenant must be a string of 1–64 chars from [A-Za-z0-9._-]",
+            code="invalid_tenant",
+            remediation="use a short identifier within the documented charset",
+        )
+    return value
+
+
+def validate_expiry(value: Any, *, today: _dt.date | None = None) -> str | None:
+    """Normalize an ISO date/datetime expiry or raise ``ValidationError`` (400).
+
+    Accepts an ISO-8601 date (``YYYY-MM-DD``) or datetime; a datetime is reduced to
+    its UTC date. A past date is rejected (a key that is dead on arrival is almost
+    always a mistake); ``None`` means "never expires". Returns the canonical
+    ``YYYY-MM-DD`` string actually stored.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValidationError(
+            "expiry must be an ISO date string (YYYY-MM-DD)",
+            code="invalid_expiry",
+            remediation="send an ISO date/datetime, or omit for no expiry",
+        )
+    text = value.strip()
+    parsed: _dt.date | None = None
+    try:
+        parsed = _dt.date.fromisoformat(text)
+    except ValueError:
+        try:
+            dtv = _dt.datetime.fromisoformat(text)
+        except ValueError:
+            parsed = None
+        else:
+            parsed = dtv.astimezone(_dt.UTC).date() if dtv.tzinfo else dtv.date()
+    if parsed is None:
+        raise ValidationError(
+            "expiry must be an ISO date/datetime (e.g. 2026-12-31)",
+            code="invalid_expiry",
+            remediation="send an ISO date/datetime, or omit for no expiry",
+        )
+    today = today or _dt.datetime.now(_dt.UTC).date()
+    if parsed < today:
+        raise ValidationError(
+            "expiry is in the past",
+            code="expiry_in_past",
+            remediation="use today or a future date, or omit for no expiry",
+        )
+    return parsed.isoformat()
 
 
 @dataclass
@@ -349,11 +461,26 @@ class KeyStore:
             self.records, self.tenants = self._load(keys_path)
 
     def reload(self) -> None:
-        """Re-read the keys file into memory (after a mutation via the admin API)."""
-        if self.keys_path and Path(self.keys_path).exists():
-            self.records, self.tenants = self._load(self.keys_path)
-        else:
+        """Re-read the keys file into memory (after a mutation via the admin API).
+
+        If the file is missing, the store empties (no keys configured). If the file
+        exists but is **unparsable/corrupt**, the last known-good key set is kept in
+        memory and an error is logged — a torn or hand-mangled ``keys.yaml`` must
+        never silently drop every key (fail closed for *new* keys, never open the
+        door by forgetting the existing ones).
+        """
+        if not (self.keys_path and Path(self.keys_path).exists()):
             self.records, self.tenants = {}, {}
+            return
+        try:
+            self.records, self.tenants = self._load(self.keys_path)
+        except Exception as exc:  # noqa: BLE001 - keep the last good set, don't crash auth
+            _log.error(
+                "keys file %r unparsable on reload; keeping the previous %d key(s): %s",
+                self.keys_path,
+                len(self.records),
+                exc,
+            )
 
     @staticmethod
     def _load(path: str) -> tuple[dict[str, KeyRecord], dict[str, TenantLimits]]:
@@ -467,23 +594,24 @@ class KeyStore:
         stored; persistence writes the SHA-256 hash only.
         """
         path = self._require_writable()
-        data = _read_raw(path)
-        existing = {str(k.get("id")) for k in data["keys"]}
-        key_id, secret = generate_secret()
-        while key_id in existing:  # vanishingly unlikely; still avoid a collision
+        with _locked_keys_file(path):
+            data = _read_raw(path)
+            existing = {str(k.get("id")) for k in data["keys"]}
             key_id, secret = generate_secret()
-        rec = KeyRecord(
-            id=key_id,
-            secret_sha256=hash_secret(secret),
-            label=label,
-            tenant=tenant,
-            scope=scope if scope in ("user", "admin") else "user",
-            enabled=True,
-            expiry=expiry,
-            limits=limits or KeyLimits(),
-        )
-        data["keys"].append(rec.to_dict())
-        _write_raw(path, data)
+            while key_id in existing:  # vanishingly unlikely; still avoid a collision
+                key_id, secret = generate_secret()
+            rec = KeyRecord(
+                id=key_id,
+                secret_sha256=hash_secret(secret),
+                label=label,
+                tenant=tenant,
+                scope=scope if scope in ("user", "admin") else "user",
+                enabled=True,
+                expiry=expiry,
+                limits=limits or KeyLimits(),
+            )
+            data["keys"].append(rec.to_dict())
+            _write_raw(path, data)
         self.reload()
         return rec, secret
 
@@ -491,14 +619,16 @@ class KeyStore:
         """Disable a key by id (``brk_xxxx`` or ``xxxx``). Returns True if found."""
         path = self._require_writable()
         target = key_id.split("_", 2)[1] if key_id.startswith(f"{_SECRET_PREFIX}_") else key_id
-        data = _read_raw(path)
-        found = False
-        for item in data["keys"]:
-            if str(item.get("id")) == target:
-                item["enabled"] = False
-                found = True
+        with _locked_keys_file(path):
+            data = _read_raw(path)
+            found = False
+            for item in data["keys"]:
+                if str(item.get("id")) == target:
+                    item["enabled"] = False
+                    found = True
+            if found:
+                _write_raw(path, data)
         if found:
-            _write_raw(path, data)
             self.reload()
         return found
 
@@ -506,34 +636,53 @@ class KeyStore:
         """Mint a successor inheriting the predecessor's settings; return (rec, secret).
 
         The old key is kept valid for ``grace_days`` (its ``expiry`` is set to
-        today+grace so both keys work during cutover); ``grace_days == 0`` revokes
-        it immediately. Returns ``None`` if no such key exists.
+        ``min(existing expiry, today + grace)`` so a rotation can only ever
+        *shorten* a key's life, never extend or resurrect it); ``grace_days == 0``
+        revokes it immediately. Returns ``None`` if no such key exists. Raises
+        :class:`ConflictError` (``key_not_active``) if the key is already revoked or
+        expired — rotation must not mint a working successor for a dead key.
         """
+        grace_days = validate_grace_days(grace_days)
         path = self._require_writable()
         target = key_id.split("_", 2)[1] if key_id.startswith(f"{_SECRET_PREFIX}_") else key_id
-        data = _read_raw(path)
-        old_item = next((it for it in data["keys"] if str(it.get("id")) == target), None)
-        if old_item is None:
-            return None
-        old = KeyRecord.from_dict(old_item)
-        new_id, secret = generate_secret()
-        new_rec = KeyRecord(
-            id=new_id,
-            secret_sha256=hash_secret(secret),
-            label=old.label,
-            tenant=old.tenant,
-            scope=old.scope,
-            enabled=True,
-            expiry=None,
-            limits=old.limits,
-        )
-        if grace_days <= 0:
-            old_item["enabled"] = False
-        else:
-            grace = (_dt.datetime.now(_dt.UTC).date() + _dt.timedelta(days=grace_days)).isoformat()
-            old_item["expiry"] = grace
-        data["keys"].append(new_rec.to_dict())
-        _write_raw(path, data)
+        with _locked_keys_file(path):
+            data = _read_raw(path)
+            old_item = next((it for it in data["keys"] if str(it.get("id")) == target), None)
+            if old_item is None:
+                return None
+            old = KeyRecord.from_dict(old_item)
+            if not old.enabled or old.is_expired():
+                raise ConflictError(
+                    "cannot rotate an inactive key (revoked or expired)",
+                    code="key_not_active",
+                    remediation="rotation only applies to an active key; create a new key instead",
+                )
+            new_id, secret = generate_secret()
+            new_rec = KeyRecord(
+                id=new_id,
+                secret_sha256=hash_secret(secret),
+                label=old.label,
+                tenant=old.tenant,
+                scope=old.scope,
+                enabled=True,
+                expiry=None,
+                limits=old.limits,
+            )
+            if grace_days <= 0:
+                old_item["enabled"] = False
+            else:
+                today = _dt.datetime.now(_dt.UTC).date()
+                grace_date = today + _dt.timedelta(days=grace_days)
+                # Never extend: clamp to the key's existing expiry if it is sooner.
+                if old.expiry:
+                    try:
+                        existing_date = _dt.date.fromisoformat(str(old.expiry))
+                        grace_date = min(existing_date, grace_date)
+                    except ValueError:
+                        pass  # unparsable existing expiry → is_expired() already fail-closed above
+                old_item["expiry"] = grace_date.isoformat()
+            data["keys"].append(new_rec.to_dict())
+            _write_raw(path, data)
         self.reload()
         return new_rec, secret
 
@@ -550,6 +699,33 @@ def _default_path(explicit: str | None) -> str:
     return explicit or os.environ.get("BROKER_KEYS_PATH") or "keys.yaml"
 
 
+def _lock_path(path: str) -> str:
+    return str(path) + ".lock"
+
+
+@contextlib.contextmanager
+def _locked_keys_file(path: str):
+    """Hold an exclusive advisory lock around a keys-file read-modify-write.
+
+    Uses ``fcntl.flock`` on a sidecar ``<path>.lock`` so concurrent admin API calls
+    and CLI runs — in this process (separate fds block each other) and across
+    processes/replicas sharing the directory — serialize their mutations instead of
+    losing updates or exposing a torn file. The data file itself is swapped
+    atomically (see :func:`_write_raw`), so a reader never observes a partial write.
+    """
+    lock_file = _lock_path(path)
+    Path(lock_file).parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def _read_raw(path: str) -> dict[str, Any]:
     p = Path(path)
     if not p.exists():
@@ -563,7 +739,44 @@ def _read_raw(path: str) -> dict[str, Any]:
 
 
 def _write_raw(path: str, data: dict[str, Any]) -> None:
-    Path(path).write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    """Atomically write ``keys.yaml`` with owner-only permissions.
+
+    Writes to a temp file in the *same directory*, ``fsync``s it, then
+    ``os.replace``s it over the target so a concurrent reader always sees either the
+    old or the new complete file — never a torn one. New files are created ``0600``
+    (secret hashes are sensitive); an existing file's mode is tightened to at most
+    ``0600`` while any *stricter* owner restriction already set is preserved
+    (``existing & 0o600``). Call inside :func:`_locked_keys_file`.
+    """
+    p = Path(path)
+    directory = p.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        existing_mode = stat.S_IMODE(os.stat(p).st_mode)
+        mode = existing_mode & 0o600  # never loosen; drop group/other; keep ≤ 0600
+    except FileNotFoundError:
+        mode = 0o600
+    payload = yaml.safe_dump(data, sort_keys=False).encode("utf-8")
+    fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=".keys-", suffix=".tmp")
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+        os.close(fd)
+        os.chmod(tmp, mode)
+        os.replace(tmp, p)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    # Best-effort durability of the rename itself.
+    with contextlib.suppress(OSError):
+        dir_fd = os.open(str(directory), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
 
 def _parse_per_model(specs: list[str] | None) -> dict[str, PerModelLimit]:
@@ -600,21 +813,25 @@ def _limits_from_args(args: argparse.Namespace) -> KeyLimits:
 
 def _cmd_create(args: argparse.Namespace) -> int:
     path = _default_path(args.path)
-    data = _read_raw(path)
-    key_id, secret = generate_secret()
+    label = validate_label(args.label)
+    tenant = validate_tenant(args.tenant)
+    expiry = validate_expiry(args.expiry)
     limits = _limits_from_args(args)
-    rec = KeyRecord(
-        id=key_id,
-        secret_sha256=hash_secret(secret),
-        label=args.label,
-        tenant=args.tenant,
-        scope=args.scope,
-        enabled=True,
-        expiry=args.expiry,
-        limits=limits,
-    )
-    data["keys"].append(rec.to_dict())
-    _write_raw(path, data)
+    with _locked_keys_file(path):
+        data = _read_raw(path)
+        key_id, secret = generate_secret()
+        rec = KeyRecord(
+            id=key_id,
+            secret_sha256=hash_secret(secret),
+            label=label,
+            tenant=tenant,
+            scope=args.scope,
+            enabled=True,
+            expiry=expiry,
+            limits=limits,
+        )
+        data["keys"].append(rec.to_dict())
+        _write_raw(path, data)
     # The secret is printed EXACTLY ONCE and never stored.
     print(f"Created key {rec.prefix} (scope={rec.scope}, tenant={rec.tenant or '-'})")
     print("Secret (shown once — store it now, it cannot be recovered):")
@@ -640,19 +857,20 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
 def _cmd_revoke(args: argparse.Namespace) -> int:
     path = _default_path(args.path)
-    data = _read_raw(path)
     target = args.id
     if target.startswith(f"{_SECRET_PREFIX}_"):
         target = target.split("_", 2)[1]
-    found = False
-    for item in data["keys"]:
-        if str(item.get("id")) == target:
-            item["enabled"] = False
-            found = True
-    if not found:
-        print(f"no key with id {args.id!r} in {path}", file=sys.stderr)
-        return 1
-    _write_raw(path, data)
+    with _locked_keys_file(path):
+        data = _read_raw(path)
+        found = False
+        for item in data["keys"]:
+            if str(item.get("id")) == target:
+                item["enabled"] = False
+                found = True
+        if not found:
+            print(f"no key with id {args.id!r} in {path}", file=sys.stderr)
+            return 1
+        _write_raw(path, data)
     print(f"revoked key {args.id} (enabled=false)")
     return 0
 
@@ -728,7 +946,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except BrokerError as exc:
+        # Validation (400) / conflict (409, e.g. rotating a revoked key) surface as
+        # a clean CLI error + non-zero exit, never a traceback.
+        print(f"error: {exc.message}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via subprocess in tests

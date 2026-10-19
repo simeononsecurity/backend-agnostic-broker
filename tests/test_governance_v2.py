@@ -8,16 +8,26 @@ else skipped). HTTP tests drive the full request path through a ``TestClient``.
 
 from __future__ import annotations
 
+import datetime as dt
+import os
+import stat
 import textwrap
+import threading
 from pathlib import Path
 
 import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+from broker import keys as broker_keys
 from broker.app import create_app
 from broker.config import Settings
-from broker.errors import ConfigError, InsufficientQuotaError, RateLimitExceededError
+from broker.errors import (
+    ConfigError,
+    ConflictError,
+    InsufficientQuotaError,
+    RateLimitExceededError,
+)
 from broker.governance import Governor
 from broker.keys import (
     KeyLimits,
@@ -635,3 +645,306 @@ def test_http_non_ascii_key_still_401(tmp_path: Path):
             json=body,
         )
         assert r2.status_code == 401
+
+
+# --- ADR 0016 follow-up: admin key API hardening ----------------------------
+# One test per defect row from the follow-up card, plus concurrency and a
+# corrupted-reload test. Admin routes are driven through the full request path.
+
+
+@pytest.mark.parametrize("grace", ['"abc"', "1e999", str(10**30), "[1]", "-5", "99999999"])
+def test_admin_rotate_grace_days_invalid_400(tmp_path: Path, grace):
+    # "abc"/[1] (wrong type), 1e999 (inf float), 10**30 & 99999999 (out of range),
+    # -5 (negative): every one must be a clean 400, never a 500.
+    target = _mk_secret("gdkey001")
+    extra = [{"id": "gdkey001", "secret_sha256": hash_secret(target), "scope": "user"}]
+    app = _admin_app(tmp_path, extra_keys=extra)
+    with TestClient(app) as c:
+        r = c.post(
+            "/admin/keys/brk_gdkey001/rotate",
+            headers={"X-Admin-Key": _ADMIN_SECRET, "Content-Type": "application/json"},
+            content=f'{{"grace_days": {grace}}}',
+        )
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] == "invalid_grace_days"
+
+
+def test_admin_rotate_grace_days_valid_bound_ok(tmp_path: Path):
+    target = _mk_secret("gdkey002")
+    extra = [{"id": "gdkey002", "secret_sha256": hash_secret(target), "scope": "user"}]
+    app = _admin_app(tmp_path, extra_keys=extra)
+    with TestClient(app) as c:
+        r = c.post(
+            "/admin/keys/brk_gdkey002/rotate",
+            headers={"X-Admin-Key": _ADMIN_SECRET},
+            json={"grace_days": 365},  # the documented upper bound
+        )
+        assert r.status_code == 201
+
+
+def test_admin_rotate_never_extends_expiry(tmp_path: Path):
+    # A key expiring tomorrow, rotated with grace_days=30, must NOT be extended:
+    # old expiry = min(existing, today+grace) = tomorrow.
+    tomorrow = (dt.datetime.now(dt.UTC).date() + dt.timedelta(days=1)).isoformat()
+    target = _mk_secret("expkey01")
+    extra = [
+        {
+            "id": "expkey01",
+            "secret_sha256": hash_secret(target),
+            "scope": "user",
+            "expiry": tomorrow,
+        }
+    ]
+    app = _admin_app(tmp_path, extra_keys=extra)
+    with TestClient(app) as c:
+        r = c.post(
+            "/admin/keys/brk_expkey01/rotate",
+            headers={"X-Admin-Key": _ADMIN_SECRET},
+            json={"grace_days": 30},
+        )
+        assert r.status_code == 201
+        listed = c.get("/admin/keys", headers={"X-Admin-Key": _ADMIN_SECRET}).json()["keys"]
+        old = next(k for k in listed if k["id"] == "brk_expkey01")
+        assert old["expiry"] == tomorrow  # clamped to existing, not today+30
+
+
+def test_admin_rotate_revoked_key_409(tmp_path: Path):
+    target = _mk_secret("revrot01")
+    extra = [
+        {
+            "id": "revrot01",
+            "secret_sha256": hash_secret(target),
+            "scope": "user",
+            "enabled": False,
+        }
+    ]
+    app = _admin_app(tmp_path, extra_keys=extra)
+    with TestClient(app) as c:
+        r = c.post(
+            "/admin/keys/brk_revrot01/rotate",
+            headers={"X-Admin-Key": _ADMIN_SECRET},
+            json={"grace_days": 1},
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "key_not_active"
+        # No working successor must have been minted.
+        assert "secret" not in r.json()
+
+
+def test_admin_rotate_expired_key_409(tmp_path: Path):
+    target = _mk_secret("exprot01")
+    extra = [
+        {
+            "id": "exprot01",
+            "secret_sha256": hash_secret(target),
+            "scope": "user",
+            "expiry": "2001-01-01",
+        }
+    ]
+    app = _admin_app(tmp_path, extra_keys=extra)
+    with TestClient(app) as c:
+        r = c.post(
+            "/admin/keys/brk_exprot01/rotate",
+            headers={"X-Admin-Key": _ADMIN_SECRET},
+            json={"grace_days": 1},
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "key_not_active"
+
+
+@pytest.mark.parametrize("expiry", ["not-a-date", "2001-01-01", "2026-13-40", 20260101])
+def test_admin_create_bad_expiry_400(tmp_path: Path, expiry):
+    app = _admin_app(tmp_path)
+    with TestClient(app) as c:
+        r = c.post(
+            "/admin/keys",
+            headers={"X-Admin-Key": _ADMIN_SECRET},
+            json={"label": "x", "expiry": expiry},
+        )
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] in ("invalid_expiry", "expiry_in_past")
+
+
+def test_admin_create_future_expiry_ok(tmp_path: Path):
+    future = (dt.datetime.now(dt.UTC).date() + dt.timedelta(days=5)).isoformat()
+    app = _admin_app(tmp_path)
+    with TestClient(app) as c:
+        r = c.post(
+            "/admin/keys",
+            headers={"X-Admin-Key": _ADMIN_SECRET},
+            json={"label": "ok", "expiry": future},
+        )
+        assert r.status_code == 201
+        assert r.json()["expiry"] == future
+
+
+def test_admin_create_iso_datetime_normalized(tmp_path: Path):
+    future = dt.datetime.now(dt.UTC) + dt.timedelta(days=10)
+    app = _admin_app(tmp_path)
+    with TestClient(app) as c:
+        r = c.post(
+            "/admin/keys",
+            headers={"X-Admin-Key": _ADMIN_SECRET},
+            json={"label": "ok", "expiry": future.isoformat()},
+        )
+        assert r.status_code == 201
+        assert r.json()["expiry"] == future.date().isoformat()  # reduced to the UTC date
+
+
+def test_admin_create_bad_tenant_400(tmp_path: Path):
+    app = _admin_app(tmp_path)
+    with TestClient(app) as c:
+        r = c.post(
+            "/admin/keys",
+            headers={"X-Admin-Key": _ADMIN_SECRET},
+            json={"label": "x", "tenant": {"x": 1}},
+        )
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] == "invalid_tenant"
+        # Out-of-charset tenant is also rejected.
+        r2 = c.post(
+            "/admin/keys",
+            headers={"X-Admin-Key": _ADMIN_SECRET},
+            json={"tenant": "bad tenant!"},
+        )
+        assert r2.status_code == 400
+
+
+def test_admin_create_bad_label_400(tmp_path: Path):
+    app = _admin_app(tmp_path)
+    with TestClient(app) as c:
+        r = c.post(
+            "/admin/keys",
+            headers={"X-Admin-Key": _ADMIN_SECRET},
+            json={"label": 123},  # non-string
+        )
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] == "invalid_label"
+        r2 = c.post(
+            "/admin/keys",
+            headers={"X-Admin-Key": _ADMIN_SECRET},
+            json={"label": "a" * 200},  # over the length cap
+        )
+        assert r2.status_code == 400
+
+
+def test_admin_create_keys_file_mode_0600_and_hash_only(tmp_path: Path):
+    app = _admin_app(tmp_path)  # pre-writes keys.yaml (default perms)
+    kp = tmp_path / "keys.yaml"
+    with TestClient(app) as c:
+        r = c.post("/admin/keys", headers={"X-Admin-Key": _ADMIN_SECRET}, json={"label": "m"})
+        assert r.status_code == 201
+        assert stat.S_IMODE(os.stat(kp).st_mode) == 0o600  # tightened to owner-only
+        secret = r.json()["secret"]
+        raw = kp.read_text()
+        assert secret not in raw and hash_secret(secret) in raw
+
+
+def test_write_preserves_stricter_existing_mode(tmp_path: Path):
+    kp = tmp_path / "keys.yaml"
+    ks = KeyStore(str(kp))
+    ks.create_key(label="a")  # new file -> 0600
+    assert stat.S_IMODE(os.stat(kp).st_mode) == 0o600
+    os.chmod(kp, 0o400)  # operator hardens to read-only
+    ks.create_key(label="b")  # must preserve 0400, never loosen to 0600
+    assert stat.S_IMODE(os.stat(kp).st_mode) == 0o400
+    assert len(KeyStore(str(kp)).records) == 2  # update landed despite 0400
+
+
+def test_admin_keys_request_too_large_413(tmp_path: Path):
+    keys = [{"id": "adminky1", "secret_sha256": hash_secret(_ADMIN_SECRET), "scope": "admin"}]
+    app = _app(tmp_path, _ECHO_REGISTRY, keys, admin_enabled=True, max_request_bytes=500)
+    with TestClient(app) as c:
+        r = c.post(
+            "/admin/keys",
+            headers={"X-Admin-Key": _ADMIN_SECRET},
+            json={"label": "x" * 2000},  # body far exceeds the 500-byte cap
+        )
+        assert r.status_code == 413
+        assert r.json()["error"]["type"] == "request_too_large"
+
+
+def test_concurrent_creates_no_lost_updates(tmp_path: Path):
+    # N concurrent creators must all land and the file must stay parseable — the
+    # flock + atomic-replace guards against torn files and lost updates.
+    kp = tmp_path / "keys.yaml"
+    KeyStore(str(kp)).create_key(label="seed")  # ensure the file exists
+    n = 12
+    errors: list[Exception] = []
+
+    def worker(i: int) -> None:
+        try:
+            KeyStore(str(kp)).create_key(label=f"k{i}")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    final = KeyStore(str(kp))
+    assert len(final.records) == n + 1  # seed + n, none lost
+    data = yaml.safe_load(kp.read_text())  # always parseable
+    assert len(data["keys"]) == n + 1
+
+
+def test_corrupted_keys_file_reload_keeps_last_good(tmp_path: Path):
+    kp = tmp_path / "keys.yaml"
+    ks = KeyStore(str(kp))
+    _rec, secret = ks.create_key(label="live", limits=KeyLimits(rpm=5))
+    assert ks.resolve(secret) is not None
+    kp.write_text("keys: [")  # corrupt: unterminated flow sequence
+    ks.reload()  # must not raise and must keep the previous key set
+    assert ks.resolve(secret) is not None
+    assert len(ks.records) == 1
+
+
+def test_rotate_key_revoked_raises_conflict(tmp_path: Path):
+    kp = tmp_path / "keys.yaml"
+    ks = KeyStore(str(kp))
+    rec, _secret = ks.create_key(label="x")
+    ks.revoke_key(rec.id)
+    with pytest.raises(ConflictError):
+        ks.rotate_key(rec.id, grace_days=1)
+
+
+# --- CLI parity (rotate behaves the same as the admin API) ------------------
+
+
+def test_cli_rotate_revoked_key_errors(tmp_path: Path, capsys):
+    kp = tmp_path / "keys.yaml"
+    ks = KeyStore(str(kp))
+    rec, _secret = ks.create_key(label="c")
+    ks.revoke_key(rec.id)
+    rc = broker_keys.main(["--path", str(kp), "rotate", rec.prefix, "--grace-days", "1"])
+    assert rc == 1
+    assert "inactive" in capsys.readouterr().err.lower()
+
+
+def test_cli_rotate_grace_days_out_of_range_errors(tmp_path: Path):
+    kp = tmp_path / "keys.yaml"
+    ks = KeyStore(str(kp))
+    rec, _secret = ks.create_key(label="c")
+    rc = broker_keys.main(["--path", str(kp), "rotate", rec.prefix, "--grace-days", "99999999"])
+    assert rc == 1
+
+
+def test_cli_create_bad_expiry_errors(tmp_path: Path):
+    kp = tmp_path / "keys.yaml"
+    rc = broker_keys.main(["--path", str(kp), "create", "--label", "c", "--expiry", "not-a-date"])
+    assert rc == 1
+    assert not kp.exists() or not KeyStore(str(kp)).records  # nothing stored
+
+
+def test_cli_rotate_active_key_ok_and_clamps_expiry(tmp_path: Path):
+    kp = tmp_path / "keys.yaml"
+    ks = KeyStore(str(kp))
+    tomorrow = (dt.datetime.now(dt.UTC).date() + dt.timedelta(days=1)).isoformat()
+    rec, _secret = ks.create_key(label="c", expiry=tomorrow)
+    rc = broker_keys.main(["--path", str(kp), "rotate", rec.prefix, "--grace-days", "30"])
+    assert rc == 0
+    ks2 = KeyStore(str(kp))
+    assert ks2.records[rec.id].expiry == tomorrow  # not extended past its own expiry
+    assert len(ks2.records) == 2  # predecessor + successor

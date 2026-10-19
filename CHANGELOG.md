@@ -22,10 +22,19 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **Per-key placement** — `limits.placement` unioned (fail-closed) into the
     request placement requirement (`403 placement_denied`).
   - **Key rotation** — `python -m broker.keys rotate <id> --grace-days N`
-    mints a successor with a grace overlap (`0` = revoke now).
+    (integer `0..365`) mints a successor with a grace overlap (`0` = revoke now).
+    Rotation sets the old expiry to `min(existing, today+N)` so it can only
+    **shorten** a key's life, and is **refused on a revoked/expired key**
+    (`409 key_not_active`) so a dead key is never resurrected (CLI parity).
   - **Admin key-management API** — `GET/POST /admin/keys`,
     `POST /admin/keys/{id}/rotate`, `DELETE /admin/keys/{id}` (admin-scope only,
-    secret shown once, never logged).
+    secret shown once, never logged). Create/rotate inputs are validated
+    (`grace_days`, ISO non-past `expiry`, charset/length-capped `tenant`/`label`)
+    → `400` rather than a stored dead key or a `500`; oversized bodies → `413`.
+    `keys.yaml` writes are atomic (temp file + `fsync` + `os.replace`) under an
+    exclusive `flock` on a `keys.yaml.lock` sidecar, created `0600` (stricter
+    existing mode preserved); a reload over a corrupt file keeps the last good key
+    set and logs an error.
   - Governance now **fails closed** on a `StateStore` error (request denied).
   - **Rejected:** retrievable/encrypted keys — hash-only at rest is the security
     property; rotation covers the operational need.

@@ -184,3 +184,15 @@ class ModelBusyError(BrokerError):
 
     http_status = 409
     error_type = "model_busy"
+
+
+class ConflictError(BrokerError):
+    """A mutation was refused because it conflicts with current state (ADR 0016).
+
+    Used by the admin key API when an operation is only valid on an *active* key —
+    e.g. rotating a revoked or already-expired key would otherwise resurrect it.
+    Maps to HTTP ``409`` with a specific ``code`` (e.g. ``key_not_active``).
+    """
+
+    http_status = 409
+    error_type = "conflict"

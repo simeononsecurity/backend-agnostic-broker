@@ -157,15 +157,39 @@ python -m broker.keys revoke brk_1a2b3c4d  # disables without deleting
 - **Rotation (ADR 0016):** `broker.keys rotate <id> --grace-days N` (or
   `POST /admin/keys/{id}/rotate`) mints a successor inheriting the predecessor's
   label/tenant/scope/limits, prints the new secret **once**, and keeps the old key
-  valid for `N` days (`0` = revoke immediately) so callers cut over with no
-  downtime. Secrets are never recoverable — only hashes are stored.
+  valid for `min(its existing expiry, today + N)` days (`0` = revoke immediately) so
+  callers cut over with no downtime. `N` must be an integer in `0..365`. Rotation
+  **never extends** a key's life and **never resurrects** a dead one: rotating a
+  revoked or already-expired key is refused with `409 key_not_active` (CLI: a
+  non-zero exit + `error: cannot rotate an inactive key`) — create a fresh key
+  instead. Secrets are never recoverable — only hashes are stored.
 - **Admin key API (ADR 0016):** with `BROKER_ADMIN_ENABLED=true` and an admin-scope
   key, `GET/POST /admin/keys`, `POST /admin/keys/{id}/rotate`, and
   `DELETE /admin/keys/{id}` manage keys over HTTP; mutations rewrite `keys.yaml` and
-  reload the in-memory store. **Multi-replica:** the admin API writes the local
-  `keys.yaml`, so point every replica at a shared `keys.yaml` (or designate one node
-  as the key-management writer and reload the others) to keep them consistent.
-- **Expiry:** set `--expiry YYYY-MM-DD` (UTC); expired keys fail closed.
+  reload the in-memory store. Create/rotate inputs are validated (`400` for a bad
+  `grace_days`/`expiry`/`tenant`/`label`); a body over `BROKER_MAX_REQUEST_BYTES`
+  is `413`.
+- **Durable, concurrency-safe writes (ADR 0016):** every `keys.yaml` mutation
+  (admin API and CLI) takes an exclusive `flock` on a `keys.yaml.lock` sidecar for
+  the whole read-modify-write and swaps the file atomically (temp file in the same
+  dir + `fsync` + `os.replace`). New files are created `0600` (a stricter existing
+  mode is preserved). So concurrent admin calls and CLI runs — on one host or
+  several replicas sharing the file — never lose an update or expose a torn file.
+  Add `keys.yaml.lock` to any backup/ignore rules (it is git-ignored here).
+- **Corrupted keys file:** if a reload hits an unparsable `keys.yaml` (hand-edit
+  gone wrong, partial copy), the broker **keeps the last good key set in memory**
+  and logs an error rather than dropping every key — fail closed for new keys, never
+  flip auth open or shut everyone out. Fix the file and it reloads on the next
+  mutation; at **startup** an unparsable file still fails fast (`config_error`).
+- **Multi-replica:** the admin API/CLI writes the local `keys.yaml`. Rotation and
+  revocation take effect on a replica only after that replica re-reads the file, so
+  either point every replica at one shared `keys.yaml` (the `flock` makes concurrent
+  writers safe) or designate one node as the key-management writer and reload the
+  others (restart or next local mutation). There is **no** cross-replica cache
+  invalidation for the key set over Redis today — treat the file as the source of
+  truth and plan rollouts accordingly.
+- **Expiry:** set `--expiry YYYY-MM-DD` (UTC, ISO date/datetime; past dates are
+  rejected); expired keys fail closed.
 - **Rate-limit algorithm (ADR 0016):** `BROKER_RATE_LIMIT_ALGO=gcra` switches rpm to
   an atomic token-bucket with per-key burst (`limits.rpm_burst`);
   `BROKER_RATE_LIMIT_TPM_ALGO=sliding` switches tpm to a weighted sliding-window

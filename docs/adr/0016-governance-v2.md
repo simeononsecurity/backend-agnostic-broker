@@ -75,15 +75,26 @@ key comparison.
    hashes of high-entropy secrets) for convenience the show-once model already
    covers. Instead, **rotation**: a `rotate` CLI verb and admin API mint a
    successor inheriting the predecessor's label/tenant/scope/limits, print the new
-   secret **once**, and set the old key's expiry to `today + grace_days`
-   (default 7; `0` = immediate revoke) for zero-downtime cutover.
+   secret **once**, and set the old key's expiry to
+   `min(existing expiry, today + grace_days)` (`grace_days` an integer `0..365`,
+   default 7; `0` = immediate revoke) for zero-downtime cutover. Rotation only
+   ever **shortens** a key's life (never extends it) and is **refused on an
+   inactive key** (`409 key_not_active` for a revoked/expired key) so a dead key is
+   never resurrected; the CLI enforces the identical rules.
 
 7. **Admin key-management API.** `GET /admin/keys` (list; never secrets/hashes),
    `POST /admin/keys` (create; secret shown **once**),
    `POST /admin/keys/{id}/rotate` (secret shown once),
    `DELETE /admin/keys/{id}` (revoke → `enabled:false`). Admin-scope only (reuses
-   `require_admin`), mutates `keys.yaml` + the in-memory store atomically,
-   fail-closed (400 `keys_file_required` with no `BROKER_KEYS_PATH`). The
+   `require_admin`), fail-closed (400 `keys_file_required` with no
+   `BROKER_KEYS_PATH`). All create/rotate inputs are validated before any write
+   (`grace_days`, ISO non-past `expiry`, charset/length-capped `tenant`/`label`) →
+   `400` rather than a stored dead key or a `500`; an oversized body → `413`. Every
+   `keys.yaml` mutation is **atomic + locked**: an exclusive `flock` on a
+   `keys.yaml.lock` sidecar wraps the read-modify-write and the file is swapped via
+   temp-file + `fsync` + `os.replace`, created `0600` (a stricter existing mode is
+   preserved). A reload over a corrupt file keeps the last known-good key set and
+   logs an error (fail closed for new keys; auth never dropped wholesale). The
    create/rotate response is the **only** place a secret appears in HTTP —
    intentional, admin-only, never logged.
 
@@ -152,6 +163,17 @@ Verified by `tests/test_governance_v2.py` (+ `tests/test_state.py`,
 - **Admin key API** — list (no secrets/hashes), create (secret once + usable +
   hash-only on disk), admin-only (401 for a user key), rotate, revoke (then 401),
   unknown-id 404.
+- **Admin key API hardening (ADR 0016 follow-up)** — `grace_days` that is a
+  string/list/float-inf/out-of-range → `400 invalid_grace_days` (never 500);
+  rotation clamps the old expiry to `min(existing, today+grace)` (a
+  key-expiring-tomorrow stays tomorrow under grace 30); rotating a revoked or
+  expired key → `409 key_not_active` with **no** successor minted; `create` with a
+  non-date/past `expiry`, dict `tenant`, or non-string/over-long `label` → `400`;
+  an over-`BROKER_MAX_REQUEST_BYTES` body → `413`. `keys.yaml` is written `0600`
+  (stricter existing mode preserved); 12 concurrent creators all land with the file
+  always parseable (flock + atomic replace); a corrupted `keys.yaml` on reload keeps
+  the previous keys resolvable. The CLI `rotate`/`create` paths enforce the same
+  validation and the `409` (non-zero exit).
 - **Hardening** — non-ASCII / over-long keys still fail closed with a clean 401;
   invalid `BROKER_RATE_LIMIT_ALGO` / `..._TPM_ALGO` fail fast.
 - **Backward compatibility** — defaults (`sliding_log`, `fixed`, no per-model/
