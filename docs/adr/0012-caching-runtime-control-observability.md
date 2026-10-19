@@ -3,6 +3,8 @@
 - Status: Accepted
 - Date: 2026-10-19
 - Supersedes: none
+- Extended by: ADR 0015 (makes the reserved `BROKER_UI_ENABLED` flag real — the
+  deferred web UI in §4 is now implemented)
 - Related: ADR 0009 (StateStore — the cache's backing store); ADR 0008 (per-key
   governance — the admin-scope seam); `docs/roadmap.md` items 10/11/12;
   research: `docs/research/adr-0012-caching-runtime-control-observability.md`.

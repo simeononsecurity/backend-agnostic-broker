@@ -32,7 +32,7 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 |---|------|--------|-----|
 | 10 | Response caching (exact, then optional semantic) | ✅ done — exact cache; semantic deferred | [0012](adr/0012-caching-runtime-control-observability.md) |
 | 11 | Runtime control: manual unload + registry hot-reload | ✅ done — unload/load + transactional reload | [0012](adr/0012-caching-runtime-control-observability.md) |
-| 12 | OpenTelemetry tracing + optional web UI/playground | ✅ done — tracing; web UI deferred | [0012](adr/0012-caching-runtime-control-observability.md) |
+| 12 | OpenTelemetry tracing + optional web UI/playground | ✅ done — tracing ([0012](adr/0012-caching-runtime-control-observability.md)); web UI ([0015](adr/0015-web-ui-playground.md)) | [0012](adr/0012-caching-runtime-control-observability.md) · [0015](adr/0015-web-ui-playground.md) |
 
 ## Notes
 
@@ -41,6 +41,7 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 - Invariants that constrain every item: lazy load, **no silent cross-model
   fallback**, non-loading health, security guards (see `AGENTS.md`).
 - Deferred follow-ups: semantic (embedding-similarity) response cache (item 10);
-  web UI/playground (item 12, `BROKER_UI_ENABLED` reserved); and a **queueing model
-  for `scripts/bench_routing.py`** so the cache-aware TTFT/p95 figures reflect
-  load-imbalance queueing rather than routing-only savings (ADR 0010).
+  and a **queueing model for `scripts/bench_routing.py`** so the cache-aware
+  TTFT/p95 figures reflect load-imbalance queueing rather than routing-only
+  savings (ADR 0010). The web UI/playground (item 12) is now **implemented**
+  (ADR 0015, `BROKER_UI_ENABLED`, default-off).

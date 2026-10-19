@@ -3,7 +3,7 @@
 Run the suite:
 
 ```bash
-make test                 # pytest -q  (368 collected: 342 passed, 26 skipped)
+make test                 # pytest -q  (395 collected: 369 passed, 26 skipped)
 make cov                  # with coverage
 python -m pytest -q tests/test_security.py   # one file
 ```
@@ -13,13 +13,13 @@ so they exercise the real request path, lifecycle, locking, and security
 boundaries without any external runtime. The suite is CPU-only; optional GPU
 tests (if added) should be marked and excluded from CI.
 
-In the default CPU venv, 342 pass and 26 skip — the skips are the Redis-backed
+In the default CPU venv, 369 pass and 26 skip — the skips are the Redis-backed
 `StateStore` paths (counters, prefix index, response cache) and the OpenTelemetry
 span path, which need the optional `redis`/`otel` extras. In a venv with
-`pip install -e '.[dev,redis,otel]'` those run too: **366 passed, 2 skipped**
+`pip install -e '.[dev,redis,otel]'` those run too: **393 passed, 2 skipped**
 (the remaining 2 are import-guard paths that only fire when a package is *absent*).
 
-## Coverage map (368 collected)
+## Coverage map (395 collected)
 
 | File | Tests | Covers |
 |------|-------|--------|
@@ -54,6 +54,7 @@ span path, which need the optional `redis`/`otel` extras. In a venv with
 | `tests/test_cache.py` | 18 | Response cache (ADR 0012): key stability + scope/model/endpoint isolation, sampling/tools/format in key, deterministic-only default, hit/miss/bypass headers, per-key isolation, errors-not-cached, embeddings cached, disabled pass-through, StateStore-backed roundtrip + TTL + LRU eviction + max-bytes. |
 | `tests/test_admin.py` | 19 | Admin runtime control (ADR 0012): disabled blocks, admin-key required, model list, load/unload, refuse/drain/timeout on in-flight, draining member skipped, registry reload add/remove, unchanged-instance kept, invalid-registry rollback; **admin scope reconciliation** — non-ASCII/over-long admin key → 401 (not 500) on every header, and an ADR 0008 admin-scope virtual key authorizes `/admin` while a user-scope key is denied. |
 | `tests/test_tracing.py` | 4 | Tracing (ADR 0012): no-op when disabled, app serves with tracing off, `ConfigError` when enabled without otel (skipped if installed), `gen_ai.*` spans asserted via in-memory exporter with **no content captured** (skipped without the SDK). |
+| `tests/test_ui.py` | 27 | Web UI / playground (ADR 0015): default-off `/ui` + asset 404; enabled serves index (`/ui` and `/ui/`) + `app.js`/`styles.css`/`favicon.svg` with correct content types; **exact** strict security headers on index, assets, and 404s; CSP has no `unsafe-*`/external origin/`*`; shipped-asset hygiene (no external `http(s)://`, no inline `<script>`/`<style>`, no `eval`/`Function`); enabling adds **only** `/ui*` routes and data endpoints still 401; `%2e%2e` path-traversal to `config.py`/`app.py` blocked; unknown/non-allow-listed extension 404; content-type matrix; streaming-chat functional smoke (deltas + `[DONE]` + `x-broker-route`); and the `examples/web-ui` config loads + serves `/ui` + a chat. |
 
 ## Writing new tests
 

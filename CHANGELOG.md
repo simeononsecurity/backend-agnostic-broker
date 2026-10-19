@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Optional web UI / operator playground at `/ui`** (ADR 0015):
+  `BROKER_UI_ENABLED` (default **off**) now serves a hardened, fully-offline
+  single-page app — vanilla HTML/CSS/JS shipped as package data, **no CDN, no
+  external URLs, no build toolchain, no new runtime dependency**. Features: model
+  list (capabilities/pool/candidates), chat playground with SSE streaming over
+  `fetch()` (shows `x-broker-route`/`x-broker-cache`/rate-limit headers),
+  completions/responses/embeddings tabs, a rerank tab that hides itself unless
+  `/v1/rerank` exists, `/status` and scoped `/usage` views, and an admin panel
+  (list/load/unload/reload, with confirmations) shown only when an admin key is
+  supplied. Every `/ui` response carries a strict CSP (`default-src 'self'`, no
+  `unsafe-inline`/`unsafe-eval`, `frame-ancestors 'none'`), `X-Content-Type-
+  Options: nosniff`, and `Referrer-Policy: no-referrer`. The operator's API/admin
+  keys are held in browser memory only (never `localStorage`/`sessionStorage`/
+  cookies). The UI drives the **existing authenticated API** and adds **no new
+  unauthenticated endpoints**. Disabled (the default) → `/ui` 404s and nothing
+  changes vs v0.5.0. Docs: `docs/web-ui.md`; example: `examples/web-ui/`.
+
 ## [0.5.0] - 2026-10-19
 
 ### Added

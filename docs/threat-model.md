@@ -45,6 +45,10 @@ code in `broker/`.
 | **Secret leakage** | Keys in repo/logs | `.env` git-ignored; constant-time key compare; keys never logged; CI secret scan. |
 | **Privilege escalation in container** | Exploit → host | Non-root user, read-only rootfs, dropped capabilities, `no-new-privileges`, minimal image. |
 | **Info disclosure via errors** | Leaking internals | Structured errors expose only backend/model/state/remediation, not stack traces or secrets. |
+| **XSS / key exfiltration (web UI)** | Injected script in the `/ui` page stealing the operator's key or calling out | UI is opt-in/default-off; strict CSP `default-src 'self'` with no `unsafe-inline`/`unsafe-eval` and no external origin (`connect-src 'self'` blocks third-party exfil); no inline script/style; key held in tab memory only, never persisted (ADR 0015). |
+| **Clickjacking (web UI)** | Framing `/ui` to trick an operator into admin actions | `frame-ancestors 'none'` + `X-Frame-Options: DENY` on every `/ui` response. |
+| **Static-asset path traversal (web UI)** | `/ui/../` reading package files | Resolve + confine under the packaged UI dir; extension allow-list; `..`/unknown → 404 (ADR 0015). |
+| **UI widening the API surface** | A new unauthenticated endpoint to feed the UI | None added: the UI drives the existing authenticated API; enabling it registers only static `/ui` routes (tested). |
 
 ## Residual risks and assumptions
 

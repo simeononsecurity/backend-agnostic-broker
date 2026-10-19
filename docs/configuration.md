@@ -288,11 +288,21 @@ a `500`). The admin surface stays locked even when data-plane auth is disabled.
 | `BROKER_ADMIN_API_KEYS` | list[str] | `[]` | Admin keys (presented as `X-Admin-Key`, or `Authorization: Bearer`). When admin + auth are on, you must configure **either** this **or** a `BROKER_KEYS_PATH` holding an `admin`-scope virtual key; startup fails fast otherwise. |
 | `BROKER_ADMIN_DRAIN_TIMEOUT_SECONDS` | float | `30` | How long `unload ?drain=true` / registry reload waits for in-flight requests to finish before giving up. |
 
-## Web UI / playground (ADR 0012) — deferred
+## Web UI / playground (ADR 0015)
+
+Optional, hardened, fully-offline static operator playground served at `/ui`,
+**default off**. When off, `/ui` returns 404 and no route is registered (behavior
+is byte-for-byte v0.5.0). When on, the broker serves plain pre-built static files
+(vanilla HTML/CSS/JS — no CDN, no external URLs, no build step) with a strict CSP
+(`default-src 'self'`, no `unsafe-inline`/`unsafe-eval`, `frame-ancestors 'none'`),
+`X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer`. The UI calls
+the **existing authenticated API** with a key the operator enters at runtime (held
+in browser memory only — never `localStorage`/`sessionStorage`/cookies); it adds
+**no new unauthenticated endpoints**. See [web-ui.md](web-ui.md).
 
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
-| `BROKER_UI_ENABLED` | bool | `false` | Reserved for a future static `/ui`. **Deferred** — currently inert. |
+| `BROKER_UI_ENABLED` | bool | `false` | Serve the static playground at `/ui`. Off → `/ui` 404s (no route). On → hardened static SPA; admin panel appears only when an admin key is supplied. |
 
 ## Observability
 
