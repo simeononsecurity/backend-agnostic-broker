@@ -347,10 +347,18 @@ class Settings(BaseSettings):
                 raise ConfigError("BROKER_RESPONSE_CACHE_MAX_ENTRIES must be >= 0 (0 = unbounded)")
             if self.response_cache_max_bytes < 0:
                 raise ConfigError("BROKER_RESPONSE_CACHE_MAX_BYTES must be >= 0 (0 = no cap)")
-        if self.admin_enabled and self.auth_enabled and not self.admin_api_keys:
+        if (
+            self.admin_enabled
+            and self.auth_enabled
+            and not self.admin_api_keys
+            and not self.keys_path
+        ):
             raise ConfigError(
-                "admin runtime control is enabled but no admin API keys are configured",
-                remediation="set BROKER_ADMIN_API_KEYS (separate from BROKER_API_KEYS)",
+                "admin runtime control is enabled but no admin credentials are configured",
+                remediation=(
+                    "set BROKER_ADMIN_API_KEYS (separate from BROKER_API_KEYS), or configure "
+                    "BROKER_KEYS_PATH with an admin-scope virtual key"
+                ),
             )
         if self.tracing_enabled:
             try:

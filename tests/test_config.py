@@ -28,6 +28,36 @@ def test_auth_satisfied_by_keys_file(fake_registry_file, tmp_path):
     s.validate_runtime()  # must not raise
 
 
+def test_admin_enabled_requires_admin_credentials(fake_registry_file):
+    # Admin + auth enabled with neither admin keys nor a keys file is a dead end
+    # (nothing could ever authorize /admin) → fail fast.
+    s = Settings(
+        auth_enabled=True,
+        api_keys=["user-key"],
+        admin_enabled=True,
+        admin_api_keys=[],
+        registry_path=str(fake_registry_file),
+    )
+    with pytest.raises(ConfigError):
+        s.validate_runtime()
+
+
+def test_admin_enabled_satisfied_by_keys_file(fake_registry_file, tmp_path):
+    # A keys file can carry an admin-scope virtual key (ADR 0008), so admin may be
+    # enabled without BROKER_ADMIN_API_KEYS (ADR 0012 back-compat is optional).
+    kp = tmp_path / "keys.yaml"
+    kp.write_text("keys: []\n")
+    s = Settings(
+        auth_enabled=True,
+        api_keys=["user-key"],
+        admin_enabled=True,
+        admin_api_keys=[],
+        keys_path=str(kp),
+        registry_path=str(fake_registry_file),
+    )
+    s.validate_runtime()  # must not raise
+
+
 def test_bad_rate_limit_window_rejected(settings):
     settings.rate_limit_window_seconds = 0
     with pytest.raises(ConfigError):

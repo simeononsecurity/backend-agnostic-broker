@@ -7,11 +7,13 @@ import textwrap
 from pathlib import Path
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from broker.app import create_app
 from broker.config import Settings
 from broker.errors import ConfigError, ModelBusyError
+from broker.keys import hash_secret
 from broker.manager import ModelManager
 from broker.registry import load_registry
 
@@ -228,3 +230,79 @@ def test_admin_reload_via_http(admin_client):
     assert r.status_code == 200
     body = r.json()
     assert "added" in body and "removed" in body and "changed" in body
+
+
+# --- auth hardening: malformed admin keys fail closed, never 500 -----------
+# Integration regression (ADR 0008 + ADR 0012): hmac.compare_digest raises
+# TypeError on a non-ASCII str, which on the admin auth path previously surfaced
+# as a 500. require_admin now compares byte-wise on every credential source, so a
+# malformed key is a clean 401 — on X-Admin-Key, Authorization, and X-API-Key.
+@pytest.mark.parametrize("header", ["X-Admin-Key", "Authorization", "X-API-Key"])
+def test_admin_non_ascii_key_401_not_500(admin_client, header):
+    # Raw bytes so a latin-1 (non-ASCII) byte goes on the wire, as a real client
+    # could send. Must be a clean 401, never a 500 from hmac.compare_digest.
+    bad = b"Bearer admin-key\xff" if header == "Authorization" else b"admin-key\xff"
+    r = admin_client.get("/admin/models", headers={header: bad})
+    assert r.status_code == 401
+
+
+def test_admin_over_long_key_401(admin_client):
+    r = admin_client.get("/admin/models", headers={"X-Admin-Key": "x" * 100_000})
+    assert r.status_code == 401
+
+
+# --- admin authorization via an ADR 0008 admin-scope virtual key -----------
+_ADMIN_VKEY = "brk_vadmin01_" + "c" * 48
+_USER_VKEY = "brk_vuser001_" + "d" * 48
+
+
+@pytest.fixture
+def vkey_admin_client(fake_registry_file, tmp_models_root, tmp_path):
+    """Admin enabled with NO BROKER_ADMIN_API_KEYS — authorization must come
+    solely from an ADR 0008 virtual key whose scope is ``admin``."""
+    keys = tmp_path / "keys.yaml"
+    keys.write_text(
+        yaml.safe_dump(
+            {
+                "keys": [
+                    {
+                        "id": "vadmin01",
+                        "scope": "admin",
+                        "secret_sha256": hash_secret(_ADMIN_VKEY),
+                        "enabled": True,
+                    },
+                    {
+                        "id": "vuser001",
+                        "scope": "user",
+                        "secret_sha256": hash_secret(_USER_VKEY),
+                        "enabled": True,
+                    },
+                ]
+            }
+        )
+    )
+    s = _admin_settings(
+        fake_registry_file,
+        tmp_models_root,
+        admin_api_keys=[],
+        keys_path=str(keys),
+    )
+    app = create_app(s)
+    with TestClient(app) as c:
+        yield c
+
+
+def test_admin_scope_virtual_key_authorizes(vkey_admin_client):
+    # An admin-scope virtual key is accepted even with no BROKER_ADMIN_API_KEYS.
+    r = vkey_admin_client.get("/admin/models", headers={"X-Admin-Key": _ADMIN_VKEY})
+    assert r.status_code == 200
+    # Presented as a Bearer token too.
+    r2 = vkey_admin_client.get(
+        "/admin/models", headers={"Authorization": f"Bearer {_ADMIN_VKEY}"}
+    )
+    assert r2.status_code == 200
+
+
+def test_user_scope_virtual_key_denied_on_admin(vkey_admin_client):
+    r = vkey_admin_client.get("/admin/models", headers={"X-Admin-Key": _USER_VKEY})
+    assert r.status_code == 401
