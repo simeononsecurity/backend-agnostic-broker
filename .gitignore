@@ -24,6 +24,9 @@ htmlcov/
 
 # Virtual API keys — hashed secrets, local-only (ship only keys.example.yaml)
 /keys.yaml
+keys.yaml
+keys.yaml.lock
+.keys-*.tmp
 
 # OS / editor
 .DS_Store

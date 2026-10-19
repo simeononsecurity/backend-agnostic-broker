@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     # to both rpm (sliding log) and tpm (windowed counter).
     keys_path: str | None = None
     rate_limit_window_seconds: float = 60.0
+    # rpm algorithm (ADR 0016): "sliding_log" (exact, default, = v0.5.0) or "gcra"
+    # (atomic token-bucket with per-key burst). tpm counter: "fixed" (windowed,
+    # default, = v0.5.0) or "sliding" (weighted two-bucket sliding-window counter).
+    rate_limit_algo: str = "sliding_log"
+    rate_limit_tpm_algo: str = "fixed"
 
     # --- Registry / models ---
     registry_path: str = "registry.yaml"
@@ -396,6 +401,16 @@ class Settings(BaseSettings):
             )
         if self.rate_limit_window_seconds <= 0:
             raise ConfigError("BROKER_RATE_LIMIT_WINDOW_SECONDS must be > 0")
+        if self.rate_limit_algo not in ("sliding_log", "gcra"):
+            raise ConfigError(
+                f"invalid BROKER_RATE_LIMIT_ALGO {self.rate_limit_algo!r}",
+                remediation="use 'sliding_log' (default) or 'gcra'",
+            )
+        if self.rate_limit_tpm_algo not in ("fixed", "sliding"):
+            raise ConfigError(
+                f"invalid BROKER_RATE_LIMIT_TPM_ALGO {self.rate_limit_tpm_algo!r}",
+                remediation="use 'fixed' (default) or 'sliding'",
+            )
         if self.port < 1 or self.port > 65535:
             raise ConfigError("BROKER_PORT out of range")
         if self.max_loaded_models < 1:

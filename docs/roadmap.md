@@ -18,13 +18,19 @@ links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 p
 
 | # | Item | Status | ADR |
 |---|------|--------|-----|
-| 3 | Per-key rate limits (rpm/tpm) + virtual keys + budgets | ✅ done | [0008](adr/0008-per-key-governance.md) |
+| 3 | Per-key rate limits (rpm/tpm) + virtual keys + budgets | ✅ done — extended by [0016](adr/0016-governance-v2.md) | [0008](adr/0008-per-key-governance.md) |
 | 4 | Retries w/ exponential backoff + member cooldowns | ✅ done | [0009](adr/0009-routing-reliability-and-scale.md), [0017](adr/0017-reliability-v2.md) |
 | 5 | Optional Redis shared state (multi-replica) | ✅ done | [0009](adr/0009-routing-reliability-and-scale.md), [0017](adr/0017-reliability-v2.md) |
 | 6 | Prefix/cache-aware pool routing + load-aware scoring | ✅ done | [0010](adr/0010-cache-aware-pool-routing.md), extended by [0018](adr/0018-cache-aware-v2.md) |
 | 7 | Cascade mode for `auto` (cheap→escalate) | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
 | 8 | Latency-budget fallback + privacy/placement pinning | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
 | 9 | Router eval harness (CPT/APGR) | ✅ done | [0011](adr/0011-auto-router-evolution.md) |
+
+**Governance v2 ([ADR 0016](adr/0016-governance-v2.md))** resolved every ADR 0008 / ADR 0011 governance deferral:
+
+- ✅ Selectable **GCRA/token-bucket** rpm (atomic in-process + Redis Lua, per-key burst) and a **sliding-window** tpm counter.
+- ✅ **Per-model** rpm/tpm per key (enforced on the resolved model incl. auto + cascade hops) and **hierarchical tenant** token/cost budgets; **per-key placement** policy (unioned, fail-closed).
+- ✅ Key **rotation** with a grace overlap and an admin **key-management API** (`/admin/keys`, secret shown once); ❌ retrievable/encrypted keys **rejected** (hash-only is the security property).
 
 ## P2 — ops & experience
 

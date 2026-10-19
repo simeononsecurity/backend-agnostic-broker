@@ -52,6 +52,38 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   KV-event index, and Preble autoscaling (all **Rejected** with rationale/data).
 - **`examples/cache-aware-routing/`**: a runnable 3-member pool example (registry,
   `.env`, README with bench + `/status` walkthrough), tested against the fake backend.
+- **Governance v2** (ADR 0016) — resolves every deferred per-key governance item:
+  - **Selectable rate-limit algorithms.** `BROKER_RATE_LIMIT_ALGO` =
+    `sliding_log` (exact, default) or `gcra` (atomic GCRA/token-bucket with
+    per-key burst via `limits.rpm_burst`), backed by a new atomic
+    `StateStore.gcra` primitive (in-process + Redis Lua, single round-trip).
+    `BROKER_RATE_LIMIT_TPM_ALGO` = `fixed` (default) or `sliding` (weighted
+    two-bucket sliding-window counter).
+  - **Per-model limits** — `limits.per_model: {model: {rpm, tpm}}` enforced on
+    the resolved model incl. the `auto` pick and every cascade hop.
+  - **Hierarchical tenant budgets** — a `tenants:` block in `keys.yaml` caps
+    aggregate daily/monthly token + cost across all keys of a tenant.
+  - **Per-key placement** — `limits.placement` unioned (fail-closed) into the
+    request placement requirement (`403 placement_denied`).
+  - **Key rotation** — `python -m broker.keys rotate <id> --grace-days N`
+    (integer `0..365`) mints a successor with a grace overlap (`0` = revoke now).
+    Rotation sets the old expiry to `min(existing, today+N)` so it can only
+    **shorten** a key's life, and is **refused on a revoked/expired key**
+    (`409 key_not_active`) so a dead key is never resurrected (CLI parity).
+  - **Admin key-management API** — `GET/POST /admin/keys`,
+    `POST /admin/keys/{id}/rotate`, `DELETE /admin/keys/{id}` (admin-scope only,
+    secret shown once, never logged). Create/rotate inputs are validated
+    (`grace_days`, ISO non-past `expiry`, charset/length-capped `tenant`/`label`)
+    → `400` rather than a stored dead key or a `500`; oversized bodies → `413`.
+    `keys.yaml` writes are atomic (temp file + `fsync` + `os.replace`) under an
+    exclusive `flock` on a `keys.yaml.lock` sidecar, created `0600` (stricter
+    existing mode preserved); a reload over a corrupt file keeps the last good key
+    set and logs an error.
+  - Governance now **fails closed** on a `StateStore` error (request denied).
+  - **Rejected:** retrievable/encrypted keys — hash-only at rest is the security
+    property; rotation covers the operational need.
+- CLI `broker.keys create` gains `--rpm-burst`, `--placement`, `--per-model`;
+  new `rotate` subcommand.
 
 ### Changed
 
@@ -91,6 +123,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `BROKER_CACHE_AWARE_MAX_ENTRIES` bound, so N replicas sharing Redis keep one shared
   bound instead of N× it (the in-process backend is unchanged). The TTL remains a
   second, time-based bound.
+
+### Notes
+
+- **Defaults reproduce v0.5.0 byte-for-byte** (`sliding_log` rpm, `fixed` tpm, no
+  per-model/tenant limits, no per-key placement; governance inert with no keys
+  file). The `[dev]` extra now pulls `fakeredis[lua]` to exercise the Redis Lua
+  path in tests.
 
 ## [0.5.0] - 2026-10-19
 

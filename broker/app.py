@@ -25,6 +25,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -41,11 +42,20 @@ from .errors import (
     AuthError,
     AuthorizationError,
     BrokerError,
+    ModelNotFoundError,
     RequestTooLargeError,
     ValidationError,
 )
 from .governance import Governor
-from .keys import KeyStore, Principal
+from .keys import (
+    KeyLimits,
+    KeyStore,
+    Principal,
+    validate_expiry,
+    validate_grace_days,
+    validate_label,
+    validate_tenant,
+)
 from .manager import ModelManager
 from .metrics import INFLIGHT, LOADED_MODELS, REQUEST_LATENCY, REQUESTS
 from .openai_compat import (
@@ -194,6 +204,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         manager.state,
         window_seconds=settings.rate_limit_window_seconds,
         pricing=registry.pricing,
+        algo=settings.rate_limit_algo,
+        tpm_algo=settings.rate_limit_tpm_algo,
     )
 
     @asynccontextmanager
@@ -393,6 +405,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             chars = sum(len(str(t)) for t in texts)
         return chars // 4 + int(max_tokens or 0)
 
+    def _effective_placement(request: Request, principal: Principal) -> frozenset[str]:
+        """Placement requirement = request (default ∪ header) ∪ the key's own labels.
+
+        Per-key placement (ADR 0016) is unioned in, never able to loosen the
+        request's requirement, so a key is pinned to its labels fail-closed; an
+        unsatisfiable union surfaces as the existing 403 ``placement_denied``.
+        """
+        req = _placement_requirement(request, settings)
+        key_placement = principal.limits.placement
+        if key_placement:
+            return req | frozenset(key_placement)
+        return req
+
+    def _make_model_guard(
+        principal: Principal, est_tokens: int
+    ) -> Callable[[str], Awaitable[None]] | None:
+        """Per-model rpm/tpm guard (ADR 0016) run at each resolved hop, or None."""
+        if not principal.limits.per_model:
+            return None
+
+        async def guard(model: str) -> None:
+            await governor.check_model(principal, model, est_tokens)
+
+        return guard
+
     # --- ops endpoints ---------------------------------------------------
     @app.get("/healthz")
     async def healthz() -> dict:
@@ -505,7 +542,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         # Placement requirement + latency budget (ADR 0011). Parsed/validated up
         # front so a bad header or a placement denial fails before any routing.
-        placement = _placement_requirement(request, settings)
+        placement = _effective_placement(request, principal)
         budget = _latency_budget_ms(request)
 
         alias = req.model
@@ -517,6 +554,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             [m.get("content") for m in payload["messages"]], req.max_tokens
         )
         admission = await governor.admit(principal, est_tokens)
+        model_guard = _make_model_guard(principal, est_tokens)
 
         # Sticky-routing session key: explicit header wins, else the OpenAI
         # `user` field, else the client IP. Keeps a conversation pinned to one
@@ -548,6 +586,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         route_key=session_key,
                         required_placement=placement,
                         allowed_models=allowed,
+                        model_guard=model_guard,
                     ):
                         yield chunk
                     REQUESTS.labels("chat_stream", alias, "ok").inc()
@@ -598,6 +637,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     required_placement=placement,
                     latency_budget_ms=budget,
                     allowed_models=allowed,
+                    model_guard=model_guard,
                 )
 
             result, cache_state = await _cached_serve(
@@ -645,6 +685,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 completion_tokens=completion_tokens,
                 model=served_model,
             )
+            await governor.reconcile_model(
+                principal,
+                served_model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
 
     @app.get("/usage")
     async def usage_summary(
@@ -684,7 +730,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not model or not isinstance(model, str):
             raise ValidationError("`model` is required")
         reject_request_flags(model, "model")
-        placement = _placement_requirement(request, settings)
+        placement = _effective_placement(request, principal)
         budget = _latency_budget_ms(request)
         _precheck_model(principal, model)
         allowed = _allowed_models(principal)
@@ -695,6 +741,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session_key = _session_key(request, body)
         est_tokens = _estimate_tokens(body.get("prompt"), body.get("max_tokens"))
         admission = await governor.admit(principal, est_tokens)
+        model_guard = _make_model_guard(principal, est_tokens)
         start = time.monotonic()
 
         if stream:
@@ -713,6 +760,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         route_key=session_key,
                         required_placement=placement,
                         allowed_models=allowed,
+                        model_guard=model_guard,
                     )
                     async for out in chat_sse_to_text_sse(aiter, model):
                         yield out
@@ -766,6 +814,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     required_placement=placement,
                     latency_budget_ms=budget,
                     allowed_models=allowed,
+                    model_guard=model_guard,
                 )
 
             result, cache_state = await _cached_serve(
@@ -814,6 +863,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 completion_tokens=completion_tokens,
                 model=served_model,
             )
+            await governor.reconcile_model(
+                principal,
+                served_model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
 
     @app.post("/v1/responses")
     async def responses(
@@ -836,7 +891,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not model or not isinstance(model, str):
             raise ValidationError("`model` is required")
         reject_request_flags(model, "model")
-        placement = _placement_requirement(request, settings)
+        placement = _effective_placement(request, principal)
         budget = _latency_budget_ms(request)
         _precheck_model(principal, model)
         allowed = _allowed_models(principal)
@@ -856,6 +911,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             [body.get("input"), body.get("instructions")], passthrough.get("max_tokens")
         )
         admission = await governor.admit(principal, est_tokens)
+        model_guard = _make_model_guard(principal, est_tokens)
         start = time.monotonic()
 
         if stream:
@@ -874,6 +930,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         route_key=session_key,
                         required_placement=placement,
                         allowed_models=allowed,
+                        model_guard=model_guard,
                     )
                     async for out in chat_sse_to_responses_sse(aiter, model):
                         yield out
@@ -927,6 +984,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     required_placement=placement,
                     latency_budget_ms=budget,
                     allowed_models=allowed,
+                    model_guard=model_guard,
                 )
 
             result, cache_state = await _cached_serve(
@@ -975,6 +1033,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 completion_tokens=completion_tokens,
                 model=served_model,
             )
+            await governor.reconcile_model(
+                principal,
+                served_model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
 
     @app.post("/v1/embeddings")
     async def embeddings(
@@ -997,7 +1061,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not model or not isinstance(model, str):
             raise ValidationError("`model` is required")
         reject_request_flags(model, "model")
-        placement = _placement_requirement(request, settings)
+        placement = _effective_placement(request, principal)
         _precheck_model(principal, model)
         allowed = _allowed_models(principal)
         if body.get("input") is None:
@@ -1009,6 +1073,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session_key = _session_key(request, body)
         est_tokens = _estimate_tokens(body.get("input"), None)
         admission = await governor.admit(principal, est_tokens)
+        model_guard = _make_model_guard(principal, est_tokens)
         start = time.monotonic()
         INFLIGHT.inc()
         prompt_tokens = 0
@@ -1023,6 +1088,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     route_key=session_key,
                     required_placement=placement,
                     allowed_models=allowed,
+                    model_guard=model_guard,
                 )
 
             result, cache_state = await _cached_serve(
@@ -1067,6 +1133,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 prompt_tokens=prompt_tokens,
                 completion_tokens=0,
                 model=served_model,
+            )
+            await governor.reconcile_model(
+                principal,
+                served_model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=0,
             )
 
     # --- admin runtime control (ADR 0012) --------------------------------
@@ -1136,6 +1208,147 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         result = await manager.admin_reload_registry()
         admin_log.info("admin registry reload result: %s", result)
         return result
+
+    # --- admin key management (ADR 0016) ---------------------------------
+    def _safe_key_view(rec) -> dict:
+        """Serialize a key record for the admin API — never the secret or its hash."""
+        return {
+            "id": rec.prefix,
+            "label": rec.label,
+            "tenant": rec.tenant,
+            "scope": rec.scope,
+            "enabled": rec.enabled,
+            "expiry": rec.expiry,
+            "limits": rec.to_dict().get("limits", {}),
+        }
+
+    @app.get("/admin/keys")
+    async def admin_keys_list(
+        request: Request,
+        authorization: str | None = Header(None),
+        x_api_key: str | None = Header(None),
+        x_admin_key: str | None = Header(None),
+    ):
+        """List virtual keys (admin). Never returns secrets or hashes (ADR 0016)."""
+        require_admin(authorization, x_api_key, x_admin_key)
+        return {"keys": [_safe_key_view(r) for r in key_store.list_records()]}
+
+    @app.post("/admin/keys")
+    async def admin_keys_create(
+        request: Request,
+        authorization: str | None = Header(None),
+        x_api_key: str | None = Header(None),
+        x_admin_key: str | None = Header(None),
+    ):
+        """Create a virtual key (admin). The secret is returned EXACTLY ONCE here
+        and never stored or logged; only its SHA-256 hash is persisted (ADR 0016)."""
+        require_admin(authorization, x_api_key, x_admin_key)
+        if not settings.keys_path:
+            raise ValidationError(
+                "key management requires a keys file",
+                remediation="set BROKER_KEYS_PATH to a writable keys.yaml",
+                code="keys_file_required",
+            )
+        raw = await request.body()
+        try:
+            body = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as exc:
+            raise ValidationError(f"invalid JSON body: {exc}") from exc
+        scope = body.get("scope", "user")
+        if scope not in ("user", "admin"):
+            raise ValidationError("scope must be 'user' or 'admin'")
+        label = validate_label(body.get("label"))
+        tenant = validate_tenant(body.get("tenant"))
+        expiry = validate_expiry(body.get("expiry"))
+        try:
+            limits = KeyLimits.from_dict(body.get("limits"))
+        except Exception as exc:  # noqa: BLE001
+            raise ValidationError(f"invalid limits: {exc}") from exc
+        rec, secret = key_store.create_key(
+            label=label,
+            tenant=tenant,
+            scope=scope,
+            limits=limits,
+            expiry=expiry,
+        )
+        actor = _admin_actor(authorization, x_api_key, x_admin_key)
+        admin_log.info(
+            "admin action", extra={"action": "key_create", "target": rec.prefix, "actor": actor}
+        )
+        view = _safe_key_view(rec)
+        view["secret"] = secret  # shown once; never persisted or logged
+        return JSONResponse(status_code=201, content=view)
+
+    @app.post("/admin/keys/{key_id}/rotate")
+    async def admin_keys_rotate(
+        key_id: str,
+        request: Request,
+        authorization: str | None = Header(None),
+        x_api_key: str | None = Header(None),
+        x_admin_key: str | None = Header(None),
+    ):
+        """Rotate a key (admin): mint a successor, grace-overlap the old one. The new
+        secret is returned once; never stored or logged (ADR 0016)."""
+        require_admin(authorization, x_api_key, x_admin_key)
+        if not settings.keys_path:
+            raise ValidationError(
+                "key management requires a keys file",
+                remediation="set BROKER_KEYS_PATH to a writable keys.yaml",
+                code="keys_file_required",
+            )
+        raw = await request.body()
+        try:
+            body = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as exc:
+            raise ValidationError(f"invalid JSON body: {exc}") from exc
+        grace_days = validate_grace_days(body.get("grace_days", 7))
+        result = key_store.rotate_key(key_id, grace_days=grace_days)
+        if result is None:
+            raise ModelNotFoundError(
+                f"no virtual key with id {key_id!r}",
+                code="key_not_found",
+                remediation="list keys via GET /admin/keys",
+            )
+        rec, secret = result
+        actor = _admin_actor(authorization, x_api_key, x_admin_key)
+        admin_log.info(
+            "admin action",
+            extra={"action": "key_rotate", "target": rec.prefix, "actor": actor},
+        )
+        view = _safe_key_view(rec)
+        view["secret"] = secret  # shown once; never persisted or logged
+        view["rotated_from"] = key_id
+        view["grace_days"] = grace_days
+        return JSONResponse(status_code=201, content=view)
+
+    @app.delete("/admin/keys/{key_id}")
+    async def admin_keys_revoke(
+        key_id: str,
+        request: Request,
+        authorization: str | None = Header(None),
+        x_api_key: str | None = Header(None),
+        x_admin_key: str | None = Header(None),
+    ):
+        """Revoke a key (admin): sets ``enabled=false`` (ADR 0016)."""
+        require_admin(authorization, x_api_key, x_admin_key)
+        if not settings.keys_path:
+            raise ValidationError(
+                "key management requires a keys file",
+                remediation="set BROKER_KEYS_PATH to a writable keys.yaml",
+                code="keys_file_required",
+            )
+        found = key_store.revoke_key(key_id)
+        if not found:
+            raise ModelNotFoundError(
+                f"no virtual key with id {key_id!r}",
+                code="key_not_found",
+                remediation="list keys via GET /admin/keys",
+            )
+        actor = _admin_actor(authorization, x_api_key, x_admin_key)
+        admin_log.info(
+            "admin action", extra={"action": "key_revoke", "target": key_id, "actor": actor}
+        )
+        return {"revoked": key_id, "enabled": False}
 
     @app.exception_handler(BrokerError)
     async def broker_error_handler(request: Request, exc: BrokerError):

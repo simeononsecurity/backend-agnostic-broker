@@ -1,0 +1,44 @@
+# Example virtual-keys file for the governance walkthrough (ADR 0008 + ADR 0016).
+#
+# All values are FAKE placeholders for documentation. Copy to keys.yaml (git-
+# ignored), then MANAGE WITH THE CLI — never hand-edit a secret_sha256. The secret
+# is shown exactly once at creation; only its SHA-256 hash is ever stored.
+#
+# Point the broker at it:  export BROKER_KEYS_PATH=keys.yaml
+# See ./README.md for the end-to-end CLI + curl walkthrough.
+
+keys:
+  # Per-model + placement + tenant-bound team key (FAKE hash).
+  - id: aaaa1111
+    label: team-alpha
+    tenant: alpha
+    scope: user
+    secret_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    enabled: true
+    expiry: null
+    limits:
+      rpm: 60               # 60 requests/min
+      rpm_burst: 10         # GCRA burst (only when BROKER_RATE_LIMIT_ALGO=gcra)
+      tpm: 100000           # 100k tokens/min
+      max_concurrency: 4
+      daily_cost_usd: 5.0
+      allowed_models: [chat, auto]
+      placement: [local]    # fail-closed: only `local`-labelled members
+      per_model:
+        chat:               # stricter cap just for the `chat` pool
+          rpm: 30
+          tpm: 50000
+
+  # Admin key for the /admin/keys management API (FAKE hash).
+  - id: bbbb2222
+    label: ops-admin
+    scope: admin
+    secret_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
+    enabled: true
+
+# Aggregate budgets shared by EVERY key with `tenant: alpha`, enforced in addition
+# to each key's own budget (a request must pass all budgets that apply).
+tenants:
+  alpha:
+    daily_token_budget: 5000000
+    monthly_cost_usd: 400.0

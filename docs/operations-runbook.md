@@ -174,20 +174,62 @@ Manage keys with the CLI (run from the worktree / container):
 ```bash
 # Create a limited key — the secret is printed ONCE; store it immediately.
 python -m broker.keys create --label team-alpha --tenant alpha --scope user \
-    --rpm 60 --tpm 100000 --max-concurrency 4 \
+    --rpm 60 --rpm-burst 10 --tpm 100000 --max-concurrency 4 \
     --daily-tokens 1000000 --monthly-tokens 20000000 \
-    --daily-cost 5 --monthly-cost 100 --allowed-models chat,auto
+    --daily-cost 5 --monthly-cost 100 --allowed-models chat,auto \
+    --placement local --per-model chat:30:50000
 
 python -m broker.keys list                 # ids/labels/scopes only — no secrets
+python -m broker.keys rotate brk_1a2b3c4d --grace-days 7  # successor + grace overlap
 python -m broker.keys revoke brk_1a2b3c4d  # disables without deleting
 ```
 
-- **Rotation:** create a new key, migrate the caller, then `revoke` the old id.
-  The secret cannot be recovered — only its hash is stored. Reload the broker (or
-  rely on process restart) to pick up `keys.yaml` changes.
-- **Expiry:** set `--expiry YYYY-MM-DD` (UTC); expired keys fail closed.
+- **Rotation (ADR 0016):** `broker.keys rotate <id> --grace-days N` (or
+  `POST /admin/keys/{id}/rotate`) mints a successor inheriting the predecessor's
+  label/tenant/scope/limits, prints the new secret **once**, and keeps the old key
+  valid for `min(its existing expiry, today + N)` days (`0` = revoke immediately) so
+  callers cut over with no downtime. `N` must be an integer in `0..365`. Rotation
+  **never extends** a key's life and **never resurrects** a dead one: rotating a
+  revoked or already-expired key is refused with `409 key_not_active` (CLI: a
+  non-zero exit + `error: cannot rotate an inactive key`) — create a fresh key
+  instead. Secrets are never recoverable — only hashes are stored.
+- **Admin key API (ADR 0016):** with `BROKER_ADMIN_ENABLED=true` and an admin-scope
+  key, `GET/POST /admin/keys`, `POST /admin/keys/{id}/rotate`, and
+  `DELETE /admin/keys/{id}` manage keys over HTTP; mutations rewrite `keys.yaml` and
+  reload the in-memory store. Create/rotate inputs are validated (`400` for a bad
+  `grace_days`/`expiry`/`tenant`/`label`); a body over `BROKER_MAX_REQUEST_BYTES`
+  is `413`.
+- **Durable, concurrency-safe writes (ADR 0016):** every `keys.yaml` mutation
+  (admin API and CLI) takes an exclusive `flock` on a `keys.yaml.lock` sidecar for
+  the whole read-modify-write and swaps the file atomically (temp file in the same
+  dir + `fsync` + `os.replace`). New files are created `0600` (a stricter existing
+  mode is preserved). So concurrent admin calls and CLI runs — on one host or
+  several replicas sharing the file — never lose an update or expose a torn file.
+  Add `keys.yaml.lock` to any backup/ignore rules (it is git-ignored here).
+- **Corrupted keys file:** if a reload hits an unparsable `keys.yaml` (hand-edit
+  gone wrong, partial copy), the broker **keeps the last good key set in memory**
+  and logs an error rather than dropping every key — fail closed for new keys, never
+  flip auth open or shut everyone out. Fix the file and it reloads on the next
+  mutation; at **startup** an unparsable file still fails fast (`config_error`).
+- **Multi-replica:** the admin API/CLI writes the local `keys.yaml`. Rotation and
+  revocation take effect on a replica only after that replica re-reads the file, so
+  either point every replica at one shared `keys.yaml` (the `flock` makes concurrent
+  writers safe) or designate one node as the key-management writer and reload the
+  others (restart or next local mutation). There is **no** cross-replica cache
+  invalidation for the key set over Redis today — treat the file as the source of
+  truth and plan rollouts accordingly.
+- **Expiry:** set `--expiry YYYY-MM-DD` (UTC, ISO date/datetime; past dates are
+  rejected); expired keys fail closed.
+- **Rate-limit algorithm (ADR 0016):** `BROKER_RATE_LIMIT_ALGO=gcra` switches rpm to
+  an atomic token-bucket with per-key burst (`limits.rpm_burst`);
+  `BROKER_RATE_LIMIT_TPM_ALGO=sliding` switches tpm to a weighted sliding-window
+  counter. Defaults (`sliding_log`/`fixed`) reproduce v0.5.0. A governance store
+  error **fails closed** (requests are denied) — if Redis is down with governance
+  on, expect 5xx/denied rather than an uncapped free-for-all.
 - **Cost budgets** require a registry `pricing` block (USD/million tokens); keys
   without priced models only accrue token budgets.
+- **Tenant budgets (ADR 0016):** a `tenants:` block in `keys.yaml` caps aggregate
+  token/cost across all keys of a tenant, enforced alongside per-key budgets.
 - **Counters & resets:** `rpm`/`tpm` reset on a rolling
   `BROKER_RATE_LIMIT_WINDOW_SECONDS` window; token/cost budgets reset at the UTC
   day/month boundary automatically (period-bucketed `StateStore` keys with TTL).

@@ -25,12 +25,13 @@ counters stay exact; prices come from the registry ``pricing`` block
 from __future__ import annotations
 
 import datetime as _dt
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from .errors import InsufficientQuotaError, RateLimitExceededError
-from .keys import KeyLimits, Principal
+from .keys import KeyLimits, Principal, TenantLimits
 from .state import StateStore
 
 
@@ -42,6 +43,8 @@ class Reservation:
     limits: KeyLimits
     reserved_concurrency: bool
     now: float
+    tenant: str | None = None
+    tenant_limits: TenantLimits | None = None
 
 
 @dataclass
@@ -73,6 +76,11 @@ def _seconds_to_month_end(now_dt: _dt.datetime) -> int:
     return max(1, int((nxt - now_dt).total_seconds()))
 
 
+def _ceil_pos(seconds: float) -> int:
+    """Retry-After seconds: ceil of a positive float, at least 1."""
+    return max(1, int(math.ceil(seconds)))
+
+
 class Governor:
     """Enforces per-key limits on the ADR 0009 ``StateStore``."""
 
@@ -82,11 +90,17 @@ class Governor:
         *,
         window_seconds: float = 60.0,
         pricing: dict[str, Any] | None = None,
+        algo: str = "sliding_log",
+        tpm_algo: str = "fixed",
     ) -> None:
         self.state = state
         self.window = float(window_seconds)
         # model public name -> object with .input_per_million / .output_per_million
         self.pricing = pricing or {}
+        # rpm algorithm: "sliding_log" (exact, default) | "gcra" (token bucket).
+        self.algo = algo
+        # tpm counter: "fixed" (windowed, default) | "sliding" (weighted 2-bucket).
+        self.tpm_algo = tpm_algo
 
     # --- key helpers -----------------------------------------------------
     def _rpm_key(self, uid: str) -> str:
@@ -98,6 +112,40 @@ class Governor:
     def _tpm_key(self, uid: str, now: float) -> str:
         bucket = int(now // self.window)
         return f"gov:tpm:{uid}:{bucket}"
+
+    def _tpm_sw_keys(self, uid: str, now: float) -> tuple[str, str, float]:
+        """Sliding-window-counter keys: (current_bucket, previous_bucket, prev_weight).
+
+        ``prev_weight`` is the fraction of the previous window still inside the
+        rolling window — the Cloudflare/Kong weighted-counter estimate.
+        """
+        bucket = int(now // self.window)
+        progress = (now - bucket * self.window) / self.window
+        prev_weight = max(0.0, 1.0 - progress)
+        return (f"gov:tpmsw:{uid}:{bucket}", f"gov:tpmsw:{uid}:{bucket - 1}", prev_weight)
+
+    async def _tpm_estimate(self, uid: str, now: float) -> float:
+        """Current tpm usage estimate under the configured tpm algorithm."""
+        if self.tpm_algo == "sliding":
+            cur_k, prev_k, w = self._tpm_sw_keys(uid, now)
+            cur = await self.state.get_counter(cur_k)
+            prev = await self.state.get_counter(prev_k)
+            return cur + prev * w
+        return float(await self.state.get_counter(self._tpm_key(uid, now)))
+
+    async def _tpm_charge(self, uid: str, total: int, now: float) -> None:
+        if self.tpm_algo == "sliding":
+            cur_k, _prev_k, _w = self._tpm_sw_keys(uid, now)
+            await self.state.incr(cur_k, total, ttl=self.window * 2)
+        else:
+            await self.state.incr(self._tpm_key(uid, now), total, ttl=self.window * 2)
+
+    def _model_rpm_key(self, uid: str, model: str) -> str:
+        return f"gov:mrpm:{uid}:{model}"
+
+    def _model_tpm_key(self, uid: str, model: str, now: float) -> str:
+        bucket = int(now // self.window)
+        return f"gov:mtpm:{uid}:{model}:{bucket}"
 
     def _tok_budget_key(self, uid: str, period: str, now_dt: _dt.datetime) -> str:
         stamp = now_dt.strftime("%Y%m%d") if period == "d" else now_dt.strftime("%Y%m")
@@ -142,16 +190,19 @@ class Governor:
         :class:`Reservation` to pass to :meth:`reconcile`.
         """
         lim = principal.limits
-        if principal.unlimited or not lim.any_limit:
+        metered = (not principal.unlimited) and lim.any_limit
+        tenant_gov = principal.tenant_governed
+        if not metered and not tenant_gov:
             return Admission(headers={}, reservation=None)
 
         uid = self._uid(principal)
         now = time.time()
         now_dt = _utc_now()
         reserved_concurrency = False
+        rpm_remaining: int | None = None
         try:
             # 1) concurrency cap
-            if lim.max_concurrency is not None:
+            if metered and lim.max_concurrency is not None:
                 cur = await self.state.incr(self._conc_key(uid), 1)
                 reserved_concurrency = True
                 if cur > lim.max_concurrency:
@@ -164,47 +215,75 @@ class Governor:
                         headers={"retry-after": "1"},
                     )
 
-            # 2) requests per minute (sliding-window log)
-            if lim.rpm is not None:
-                cnt = await self.state.window_count(self._rpm_key(uid), self.window, now=now)
-                if cnt >= lim.rpm:
-                    raise RateLimitExceededError(
-                        f"request rate limit of {lim.rpm}/min reached",
-                        code="rate_limit_exceeded",
-                        remediation="slow down; see Retry-After and x-ratelimit headers",
-                        headers=self._rate_headers(lim, cnt, None, retry_after=int(self.window)),
+            # 2) requests per minute — sliding-window log (default) or GCRA.
+            if metered and lim.rpm is not None:
+                if self.algo == "gcra":
+                    emission = self.window / lim.rpm
+                    burst = lim.rpm_burst or lim.rpm
+                    res = await self.state.gcra(
+                        self._rpm_key(uid), emission_interval=emission, burst=burst, now=now
                     )
-                await self.state.window_incr(self._rpm_key(uid), self.window, 1, now=now)
+                    if not res.allowed:
+                        raise RateLimitExceededError(
+                            f"request rate limit of {lim.rpm}/min reached",
+                            code="rate_limit_exceeded",
+                            remediation="slow down; see Retry-After and x-ratelimit headers",
+                            headers=self._rate_headers(
+                                lim, lim.rpm, None, retry_after=_ceil_pos(res.retry_after)
+                            ),
+                        )
+                    rpm_remaining = res.remaining
+                else:
+                    cnt = await self.state.window_count(self._rpm_key(uid), self.window, now=now)
+                    if cnt >= lim.rpm:
+                        raise RateLimitExceededError(
+                            f"request rate limit of {lim.rpm}/min reached",
+                            code="rate_limit_exceeded",
+                            remediation="slow down; see Retry-After and x-ratelimit headers",
+                            headers=self._rate_headers(
+                                lim, cnt, None, retry_after=int(self.window)
+                            ),
+                        )
+                    await self.state.window_incr(self._rpm_key(uid), self.window, 1, now=now)
 
-            # 3) tokens per minute (windowed counter) — pre-dispatch estimate gate
-            if lim.tpm is not None:
-                cur_tpm = await self.state.get_counter(self._tpm_key(uid, now))
+            # 3) tokens per minute — fixed (default) or sliding-window counter.
+            if metered and lim.tpm is not None:
+                cur_tpm = await self._tpm_estimate(uid, now)
                 if cur_tpm + max(0, est_tokens) > lim.tpm:
                     raise RateLimitExceededError(
                         f"token rate limit of {lim.tpm}/min reached",
                         code="rate_limit_exceeded",
                         remediation="slow down or lower max_tokens; see x-ratelimit headers",
                         headers=self._rate_headers(
-                            lim, None, cur_tpm, retry_after=int(self.window)
+                            lim, None, int(cur_tpm), retry_after=int(self.window)
                         ),
                     )
 
-            # 4) daily/monthly token + cost budgets (pre-dispatch)
-            await self._check_budgets(principal, now_dt)
+            # 4) daily/monthly token + cost budgets (pre-dispatch): per-key then tenant.
+            if metered:
+                await self._check_budgets(uid, lim, now_dt)
+            if tenant_gov:
+                assert principal.tenant is not None and principal.tenant_limits is not None
+                await self._check_tenant_budgets(principal.tenant, principal.tenant_limits, now_dt)
 
-            headers = await self._headers(principal, now, now_dt)
+            headers = await self._headers(principal, now, now_dt, rpm_remaining=rpm_remaining)
             return Admission(
                 headers=headers,
-                reservation=Reservation(uid, lim, reserved_concurrency, now),
+                reservation=Reservation(
+                    uid,
+                    lim,
+                    reserved_concurrency,
+                    now,
+                    tenant=principal.tenant if tenant_gov else None,
+                    tenant_limits=principal.tenant_limits if tenant_gov else None,
+                ),
             )
         except Exception:
             if reserved_concurrency:
                 await self.state.incr(self._conc_key(uid), -1)
             raise
 
-    async def _check_budgets(self, principal: Principal, now_dt: _dt.datetime) -> None:
-        lim = principal.limits
-        uid = self._uid(principal)
+    async def _check_budgets(self, uid: str, lim: KeyLimits, now_dt: _dt.datetime) -> None:
         if lim.daily_token_budget is not None:
             spent = await self.state.get_counter(self._tok_budget_key(uid, "d", now_dt))
             if spent >= lim.daily_token_budget:
@@ -242,6 +321,129 @@ class Governor:
                     headers={"retry-after": str(_seconds_to_month_end(now_dt))},
                 )
 
+    @staticmethod
+    def _tenant_uid(tenant: str) -> str:
+        return f"t:{tenant}"
+
+    async def _check_tenant_budgets(
+        self, tenant: str, tl: TenantLimits, now_dt: _dt.datetime
+    ) -> None:
+        """Aggregate tenant token/cost budgets, enforced across all keys of a tenant."""
+        uid = self._tenant_uid(tenant)
+        if tl.daily_token_budget is not None:
+            spent = await self.state.get_counter(self._tok_budget_key(uid, "d", now_dt))
+            if spent >= tl.daily_token_budget:
+                raise InsufficientQuotaError(
+                    f"tenant {tenant!r} daily token budget of {tl.daily_token_budget} exhausted",
+                    code="insufficient_quota",
+                    remediation="wait for the daily reset or raise the tenant budget",
+                    headers={"retry-after": str(_seconds_to_midnight(now_dt))},
+                )
+        if tl.monthly_token_budget is not None:
+            spent = await self.state.get_counter(self._tok_budget_key(uid, "m", now_dt))
+            if spent >= tl.monthly_token_budget:
+                raise InsufficientQuotaError(
+                    f"tenant {tenant!r} monthly token budget of {tl.monthly_token_budget} exhausted",
+                    code="insufficient_quota",
+                    remediation="wait for the monthly reset or raise the tenant budget",
+                    headers={"retry-after": str(_seconds_to_month_end(now_dt))},
+                )
+        if tl.daily_cost_usd is not None:
+            spent = await self.state.get_counter(self._cost_budget_key(uid, "d", now_dt))
+            if spent >= int(round(tl.daily_cost_usd * 1_000_000)):
+                raise InsufficientQuotaError(
+                    f"tenant {tenant!r} daily cost budget of ${tl.daily_cost_usd} exhausted",
+                    code="insufficient_quota",
+                    remediation="wait for the daily reset or raise the tenant cost budget",
+                    headers={"retry-after": str(_seconds_to_midnight(now_dt))},
+                )
+        if tl.monthly_cost_usd is not None:
+            spent = await self.state.get_counter(self._cost_budget_key(uid, "m", now_dt))
+            if spent >= int(round(tl.monthly_cost_usd * 1_000_000)):
+                raise InsufficientQuotaError(
+                    f"tenant {tenant!r} monthly cost budget of ${tl.monthly_cost_usd} exhausted",
+                    code="insufficient_quota",
+                    remediation="wait for the monthly reset or raise the tenant cost budget",
+                    headers={"retry-after": str(_seconds_to_month_end(now_dt))},
+                )
+
+    # --- per-model limits (ADR 0016) -------------------------------------
+    async def check_model(self, principal: Principal, model: str, est_tokens: int = 0) -> None:
+        """Enforce the key's per-model rpm/tpm for ``model`` (pre-dispatch).
+
+        Called by the manager at *each* resolved hop (auto pick + every cascade
+        hop), so a per-model cap cannot be bypassed via ``auto`` or an escalation.
+        A no-op when the key has no per-model entry for this model. rpm is consumed
+        here; tpm is a pre-dispatch estimate gate reconciled against actual usage in
+        :meth:`reconcile_model`.
+        """
+        pm = principal.limits.per_model.get(model)
+        if pm is None or principal.usage_id is None:
+            return
+        uid = principal.usage_id
+        now = time.time()
+        if pm.rpm is not None:
+            if self.algo == "gcra":
+                emission = self.window / pm.rpm
+                burst = pm.rpm_burst or pm.rpm
+                res = await self.state.gcra(
+                    self._model_rpm_key(uid, model),
+                    emission_interval=emission,
+                    burst=burst,
+                    now=now,
+                )
+                if not res.allowed:
+                    raise RateLimitExceededError(
+                        f"request rate limit of {pm.rpm}/min for model {model!r} reached",
+                        code="rate_limit_exceeded",
+                        remediation="slow down or use another model; see Retry-After",
+                        headers={"retry-after": str(_ceil_pos(res.retry_after))},
+                    )
+            else:
+                cnt = await self.state.window_count(
+                    self._model_rpm_key(uid, model), self.window, now=now
+                )
+                if cnt >= pm.rpm:
+                    raise RateLimitExceededError(
+                        f"request rate limit of {pm.rpm}/min for model {model!r} reached",
+                        code="rate_limit_exceeded",
+                        remediation="slow down or use another model; see Retry-After",
+                        headers={"retry-after": str(int(self.window))},
+                    )
+                await self.state.window_incr(
+                    self._model_rpm_key(uid, model), self.window, 1, now=now
+                )
+        if pm.tpm is not None:
+            cur = await self.state.get_counter(self._model_tpm_key(uid, model, now))
+            if cur + max(0, est_tokens) > pm.tpm:
+                raise RateLimitExceededError(
+                    f"token rate limit of {pm.tpm}/min for model {model!r} reached",
+                    code="rate_limit_exceeded",
+                    remediation="slow down or lower max_tokens for this model",
+                    headers={"retry-after": str(int(self.window))},
+                )
+
+    async def reconcile_model(
+        self,
+        principal: Principal,
+        model: str | None,
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+    ) -> None:
+        """Charge actual tokens into the per-model tpm counter for ``model``."""
+        if model is None or principal.usage_id is None:
+            return
+        pm = principal.limits.per_model.get(model)
+        if pm is None or pm.tpm is None:
+            return
+        total = max(0, int(prompt_tokens)) + max(0, int(completion_tokens))
+        if total > 0:
+            now = time.time()
+            await self.state.incr(
+                self._model_tpm_key(principal.usage_id, model, now), total, ttl=self.window * 2
+            )
+
     # --- reconcile -------------------------------------------------------
     async def reconcile(
         self,
@@ -270,7 +472,7 @@ class Governor:
             await self.state.incr(self._conc_key(uid), -1)
 
         if total > 0 and lim.tpm is not None:
-            await self.state.incr(self._tpm_key(uid, now), total, ttl=self.window * 2)
+            await self._tpm_charge(uid, total, now)
         if total > 0 and lim.daily_token_budget is not None:
             await self.state.incr(
                 self._tok_budget_key(uid, "d", now_dt), total, ttl=_seconds_to_midnight(now_dt) + 60
@@ -295,6 +497,35 @@ class Governor:
                 cost_micro,
                 ttl=_seconds_to_month_end(now_dt) + 60,
             )
+
+        # Tenant aggregate budgets: charge the same actual usage to the tenant.
+        tl = reservation.tenant_limits
+        if reservation.tenant is not None and tl is not None:
+            tuid = self._tenant_uid(reservation.tenant)
+            if total > 0 and tl.daily_token_budget is not None:
+                await self.state.incr(
+                    self._tok_budget_key(tuid, "d", now_dt),
+                    total,
+                    ttl=_seconds_to_midnight(now_dt) + 60,
+                )
+            if total > 0 and tl.monthly_token_budget is not None:
+                await self.state.incr(
+                    self._tok_budget_key(tuid, "m", now_dt),
+                    total,
+                    ttl=_seconds_to_month_end(now_dt) + 60,
+                )
+            if cost_micro > 0 and tl.daily_cost_usd is not None:
+                await self.state.incr(
+                    self._cost_budget_key(tuid, "d", now_dt),
+                    cost_micro,
+                    ttl=_seconds_to_midnight(now_dt) + 60,
+                )
+            if cost_micro > 0 and tl.monthly_cost_usd is not None:
+                await self.state.incr(
+                    self._cost_budget_key(tuid, "m", now_dt),
+                    cost_micro,
+                    ttl=_seconds_to_month_end(now_dt) + 60,
+                )
 
     # --- headers ---------------------------------------------------------
     def _rate_headers(
@@ -321,14 +552,30 @@ class Governor:
         return h
 
     async def _headers(
-        self, principal: Principal, now: float, now_dt: _dt.datetime
+        self,
+        principal: Principal,
+        now: float,
+        now_dt: _dt.datetime,
+        *,
+        rpm_remaining: int | None = None,
     ) -> dict[str, str]:
         lim = principal.limits
         uid = self._uid(principal)
-        rpm_count = None
-        tpm_count = None
+        h: dict[str, str] = {}
         if lim.rpm is not None:
-            rpm_count = await self.state.window_count(self._rpm_key(uid), self.window, now=now)
+            if rpm_remaining is not None:
+                remaining = rpm_remaining
+            elif self.algo == "gcra":
+                remaining = lim.rpm
+            else:
+                cnt = await self.state.window_count(self._rpm_key(uid), self.window, now=now)
+                remaining = max(0, lim.rpm - cnt)
+            h["x-ratelimit-limit-requests"] = str(lim.rpm)
+            h["x-ratelimit-remaining-requests"] = str(max(0, remaining))
+            h["x-ratelimit-reset-requests"] = str(int(self.window))
         if lim.tpm is not None:
-            tpm_count = await self.state.get_counter(self._tpm_key(uid, now))
-        return self._rate_headers(lim, rpm_count, tpm_count)
+            used = await self._tpm_estimate(uid, now)
+            h["x-ratelimit-limit-tokens"] = str(lim.tpm)
+            h["x-ratelimit-remaining-tokens"] = str(max(0, lim.tpm - int(used)))
+            h["x-ratelimit-reset-tokens"] = str(int(self.window))
+        return h

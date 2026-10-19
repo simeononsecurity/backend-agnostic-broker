@@ -32,6 +32,27 @@ type `authentication_error`.
   key requests a model outside its `allowed_models`; this also applies to the
   model the `auto` router selects (fail-closed).
 
+**Governance v2 (ADR 0016).** The same contract extends to:
+
+- **Per-model limits** — `limits.per_model: {model: {rpm, tpm}}` yields `429`
+  `rate_limit_exceeded` (message names the model) when a key exceeds a model's cap.
+  Enforced on the **resolved** model — the `auto` pick and every cascade hop — so
+  it cannot be bypassed via `auto` or an escalation.
+- **Tenant budgets** — a `tenants:` block caps aggregate token/cost across all keys
+  of a tenant; exhaustion is `429` `insufficient_quota` (message names the tenant),
+  enforced in addition to per-key budgets.
+- **Per-key placement** — `limits.placement: [labels]` is unioned into the request
+  placement requirement (it can only tighten it); an unsatisfiable requirement is
+  `403` `placement_denied`, intersecting with the `x-broker-placement` header.
+- **Rate-limit algorithm** — `rpm` uses the exact sliding-log by default or an
+  atomic **GCRA** token-bucket (`BROKER_RATE_LIMIT_ALGO=gcra`) with per-key burst
+  (`limits.rpm_burst`); `tpm` uses a fixed window by default or a weighted
+  **sliding-window counter** (`BROKER_RATE_LIMIT_TPM_ALGO=sliding`). The header
+  contract is unchanged.
+
+A governance store error **fails closed** (the request is denied) rather than
+silently removing the cap.
+
 **Rate-limit headers.** Responses to limited keys carry OpenAI-style headers so
 clients can self-pace: `x-ratelimit-limit-requests` / `-remaining-requests` /
 `-reset-requests` and the `-tokens` equivalents. `Retry-After` (seconds) is set on
@@ -363,6 +384,47 @@ unchanged models keep serving; added models are registered (not loaded).
 ```bash
 curl -s -X POST -H "X-Admin-Key: ***" http://127.0.0.1:8080/admin/registry/reload
 # -> {"added":["echo3"],"removed":["echo2"],"changed":[],"unchanged":["echo"],"models":2}
+```
+
+### Admin key management (ADR 0016)
+
+Manage virtual keys over HTTP (admin-scope only; same `require_admin` gate). The
+secret appears **exactly once**, in the create/rotate response, and is never stored
+or logged. Requires `BROKER_KEYS_PATH` (else `400` `keys_file_required`).
+
+- **`GET /admin/keys`** — list keys (id/label/tenant/scope/enabled/expiry/limits).
+  **Never** returns secrets or hashes.
+- **`POST /admin/keys`** — create. Body: `label?`, `tenant?`, `scope?`
+  (`user`|`admin`), `expiry?`, `limits?` (same schema as `keys.yaml`). Returns
+  `201` with the key view **plus** a one-time `secret`. Inputs are validated
+  (`400` `invalid_request_error`): `label` is a string ≤128 chars from
+  `[A-Za-z0-9 ._-@:+/]`; `tenant` is a string ≤64 chars from `[A-Za-z0-9._-]`;
+  `expiry` is an ISO date/datetime (a datetime is reduced to its UTC date) and a
+  **past** date is rejected (`expiry_in_past`) so a key is never born dead.
+- **`POST /admin/keys/{id}/rotate`** — mint a successor inheriting the
+  predecessor's settings; body `grace_days?` — an **integer** in `0..365`
+  (default 7; `0` = revoke old now). A non-integer/out-of-range `grace_days` is
+  `400` `invalid_grace_days`. The old key's expiry is set to
+  `min(existing expiry, today + grace_days)` — rotation **never extends** a key's
+  life. Returns `201` with the new one-time `secret`. `404` `key_not_found` if
+  absent; `409` `key_not_active` if the key is already revoked or expired (a dead
+  key is never resurrected — create a fresh key instead). The CLI
+  `python -m broker.keys rotate` enforces the identical rules.
+- **`DELETE /admin/keys/{id}`** — revoke (sets `enabled:false`). `404` if absent.
+
+All `/admin/keys` routes share the global request-size limit: a body over
+`BROKER_MAX_REQUEST_BYTES` is rejected with `413` `request_too_large` before the
+route runs. `keys.yaml` writes are atomic (temp file + `fsync` + `os.replace`),
+hold an exclusive `flock` on a `keys.yaml.lock` sidecar for the whole
+read-modify-write, and create the file `0600` (an existing stricter mode is
+preserved), so concurrent admin calls / CLI runs on a shared file can't lose an
+update or expose a torn file.
+
+```bash
+curl -s -X POST -H "X-Admin-Key: ***" -H 'Content-Type: application/json' \
+  -d '{"label":"ci","tenant":"alpha","limits":{"rpm":10,"allowed_models":["chat"]}}' \
+  http://127.0.0.1:8080/admin/keys
+# -> 201 {"id":"brk_1a2b3c4d","scope":"user",...,"secret":"brk_1a2b3c4d_<shown once>"}
 ```
 
 ## OpenAPI

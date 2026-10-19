@@ -48,29 +48,41 @@ scoping; counters live on the ADR 0009 `StateStore` (in-process or Redis).
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
 | `BROKER_KEYS_PATH` | str? | `None` | Path to a git-ignored `keys.yaml` of HASHED virtual keys. Manage with `python -m broker.keys`. See `keys.example.yaml`. |
-| `BROKER_RATE_LIMIT_WINDOW_SECONDS` | float | `60.0` | Window for per-key `rpm` (sliding log) and `tpm` (windowed counter). |
+| `BROKER_RATE_LIMIT_WINDOW_SECONDS` | float | `60.0` | Window for per-key `rpm` and `tpm`. |
+| `BROKER_RATE_LIMIT_ALGO` | str | `sliding_log` | rpm algorithm (ADR 0016): `sliding_log` (exact, = v0.5.0) or `gcra` (atomic token-bucket with per-key burst via `limits.rpm_burst`). |
+| `BROKER_RATE_LIMIT_TPM_ALGO` | str | `fixed` | tpm counter (ADR 0016): `fixed` (windowed, = v0.5.0) or `sliding` (weighted two-bucket sliding-window counter). |
 
 Each key in `keys.yaml` carries an `id`, `label`, `tenant`, `scope`
 (`user`|`admin`), the SHA-256 **hash** of its secret (never the secret), an
 `enabled` flag, an optional `expiry` (ISO date, UTC), and a `limits` block — any
-subset of: `rpm`, `tpm` (input+output tokens), `max_concurrency`,
-`daily_token_budget`, `monthly_token_budget`, `daily_cost_usd`,
-`monthly_cost_usd`, and `allowed_models` (fail-closed; applies to the model the
-`auto` router selects too). Cost budgets require a registry `pricing` block (see
-`docs/model-registry.md` / `registry.example.yaml`). Keys/limits are enforced
-before dispatch; see `docs/api-reference.md` for the error/header contract.
+subset of: `rpm`, `rpm_burst` (GCRA burst, ADR 0016), `tpm` (input+output tokens),
+`max_concurrency`, `daily_token_budget`, `monthly_token_budget`, `daily_cost_usd`,
+`monthly_cost_usd`, `allowed_models` (fail-closed; applies to the `auto`-selected
+model too), `placement` (ADR 0016; fail-closed labels **unioned** with the request
+requirement), and `per_model` (ADR 0016; `{model: {rpm, tpm}}` enforced on the
+resolved model incl. auto + each cascade hop). Cost budgets require a registry
+`pricing` block (see `docs/model-registry.md` / `registry.example.yaml`).
+
+A top-level `tenants:` block (ADR 0016) defines per-tenant aggregate `daily_/
+monthly_token_budget` and `daily_/monthly_cost_usd`, enforced across **all** keys
+of a tenant in addition to each key's own budget. Keys/limits are enforced before
+dispatch; see `docs/api-reference.md` for the error/header contract.
 
 Manage keys:
 
 ```bash
 python -m broker.keys create --label team-alpha --tenant alpha \
-    --rpm 60 --tpm 100000 --max-concurrency 4 \
-    --daily-tokens 1000000 --daily-cost 5 --allowed-models chat,auto
+    --rpm 60 --rpm-burst 10 --tpm 100000 --max-concurrency 4 \
+    --daily-tokens 1000000 --daily-cost 5 --allowed-models chat,auto \
+    --placement local --per-model chat:30:50000
 python -m broker.keys list              # never prints secrets or hashes
+python -m broker.keys rotate brk_1a2b3c4d --grace-days 7   # successor + grace overlap
 python -m broker.keys revoke brk_1a2b3c4d
 ```
 
-The CLI prints the new secret **exactly once**; only its hash is written.
+The CLI prints the new secret **exactly once**; only its hash is written. Keys can
+also be managed over HTTP via the admin key API (`/admin/keys`, ADR 0016 — see
+`docs/api-reference.md`) and the end-to-end walkthrough in `examples/governance/`.
 
 ## Registry / models
 
