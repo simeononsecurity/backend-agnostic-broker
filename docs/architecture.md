@@ -73,12 +73,18 @@ auto/cascade — `/v1/embeddings`):
    (`x-broker-placement` ∪ `BROKER_DEFAULT_PLACEMENT`) is resolved up front; only
    models/pool members carrying **every** required label are eligible, else
    `403 placement_denied` (never spills to a non-compliant model).
-5. **Response cache lookup (ADR 0012)** — if the cache is enabled and the request
-   is cacheable (deterministic-by-default; embeddings always), a key over
-   *(API-key/tenant + placement scope, resolved public model, normalized
-   payload + sampling + tools)* is looked up; a hit returns immediately with
-   `x-broker-cache: hit` and no inference. Bypass via `Cache-Control: no-cache`/
-   `no-store` or `x-broker-cache: bypass`.
+5. **Response cache lookup (ADR 0012/0014)** — if the cache is enabled and the
+   request is cacheable (deterministic-by-default; embeddings always), a key over
+   *(API-key/tenant + placement + namespace scope, resolved public model,
+   normalized payload + sampling + tools)* is looked up; an exact hit returns
+   immediately with `x-broker-cache: hit` and no inference. On an exact miss, if
+   the **semantic cache** (ADR 0014) is enabled and its embedding model is already
+   **resident**, the prompt text is embedded and matched (cosine ≥ threshold)
+   within the same strict non-prompt bucket → `x-broker-cache: semantic-hit` +
+   `x-broker-cache-similarity`. **Streaming** hits are replayed as well-formed SSE.
+   Bypass via `Cache-Control: no-cache`/`no-store`/`max-age=0` or
+   `x-broker-cache: bypass`; per-request `x-broker-cache-ttl` /
+   `x-broker-cache-namespace` tune storage/scope.
 6. **Resolve + auto/cascade (ADR 0011)** — for `auto`, the `AutoRouter` picks a
    concrete public model or a two-hop **cascade** plan (serve cheap, escalate once
    on a quality signal). The resolved model — and each cascade hop — is re-checked
@@ -112,7 +118,8 @@ auto/cascade — `/v1/embeddings`):
     relabeled to the public name requested. On success the usage log records the
     request and the response cache **stores** the result (keyed as in step 5); a
     cascade is stored under its final served model, with `x-broker-route` showing
-    the path. Streaming responses are never cached.
+    the path. **Only non-streaming** responses populate the cache; a streaming
+    request reads (and can replay a stored result) but never writes (ADR 0014).
 11. **Idle unload** — a background sweep (`_sweep_once`, every
     `idle_sweep_interval_seconds`) unloads any `ready` model idle beyond its
     timeout. A separate **health probe** (`_health_probe_once`, every
@@ -176,6 +183,28 @@ stored result on a hit, else serve and store. The scope-first key guarantees
 per-key isolation; only deterministic (or embedding) requests are cached by
 default; errors and streams are never stored. Backed by the same StateStore as
 routing state, so it is in-process by default or shared via Redis.
+
+## Semantic cache + cache extensions (ADR 0014)
+
+`broker/cache.py` (`SemanticCache`) is a second, opt-in layer the API consults
+**after an exact miss** for chat/completions/responses. It partitions stored
+responses into **buckets** keyed by every *non-prompt* field (scope, resolved
+model, endpoint, sampling/tools/`response_format`/..., plus namespace), so only
+the prompt text is fuzzy — a semantic hit can never cross a scope, model, or
+param. Within a bucket it embeds the prompt via the broker's own `/v1/embeddings`
+path and compares to each stored embedding by **pure-Python cosine** (no numpy),
+returning the best match ≥ threshold (default 0.95). To honor lazy loading, the
+API embeds/consults **only when the embedding model is already resident**
+(`manager.is_resident`), so a chat request never silently loads an extra model
+(`BROKER_SEMANTIC_CACHE_REQUIRE_RESIDENT=false` opts out). Only non-streaming
+responses populate either cache; a **streaming** hit is replayed as a well-formed
+SSE stream (`openai_compat.chat_result_to_sse_chunks` fed through the existing
+text/Responses translators). Per-request `x-broker-cache-ttl` and
+`x-broker-cache-namespace` tune storage and scope; `max-age=0` is a bypass;
+`s-maxage`/request `max-age>0` freshness are rejected (no stored-age/revalidation).
+When `BROKER_TRACING_CAPTURE_CONTENT` is set, the `inference` span additionally
+carries truncated `gen_ai.input.messages`/`gen_ai.output.messages` (OTel GenAI
+`spanOnly`, opt-in; off by default).
 
 ## Admin runtime control (ADR 0012)
 

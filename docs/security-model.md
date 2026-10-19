@@ -130,6 +130,34 @@ StateStore (in-process or Redis) — treat that store with the same confidential
 the responses themselves, and scope `BROKER_REDIS_PREFIX` per deployment when
 sharing one Redis.
 
+## Semantic-cache isolation + false-positive risk (ADR 0014)
+
+The semantic cache (off by default) inherits the same scope-first isolation: its
+bucket key hashes the caller's key/tenant + placement + namespace scope **and**
+the resolved model, endpoint, and every non-prompt parameter, so only the prompt
+*text* is matched fuzzily and a semantic hit can **never** cross a key, tenant,
+placement, model, or parameter boundary. The residual risk is a *false positive*
+— two different prompts within one scope whose embeddings are close enough to
+share an answer. This is mitigated by a high default cosine threshold (**0.95**,
+precision-favoring per the research survey) and the deterministic-only default;
+raise the threshold toward `0.99` to further reduce false hits (lower hit rate),
+or lower it only after measuring your own false-positive rate. Stored embeddings
+and response bodies live in the StateStore — treat them as confidential as the
+responses. The embedding model is the broker's own registry alias; with
+`BROKER_SEMANTIC_CACHE_REQUIRE_RESIDENT=true` (default) a chat request never loads
+it, preserving the lazy-load invariant.
+
+## Span content capture (ADR 0014) — PII risk
+
+Tracing captures **metadata only** by default. `BROKER_TRACING_CAPTURE_CONTENT`
+is an explicit opt-in that writes truncated prompt/response content to the
+`inference` span (`gen_ai.input.messages` / `gen_ai.output.messages`). **Prompts
+and responses routinely contain PII and secrets**, and span data is visible to
+anyone with trace-backend access and subject to its retention. Leave it off unless
+you have a specific debugging need and have reviewed the trust boundary of your
+OTLP collector/backend; prefer per-request `BROKER_TRACING_CONTENT_MAX_CHARS`
+truncation and short retention when enabled.
+
 ## Container hardening
 
 The image (`Dockerfile`) and Compose files apply defense in depth:

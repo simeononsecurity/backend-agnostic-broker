@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Semantic (embedding-similarity) response cache** (ADR 0014):
+  `BROKER_SEMANTIC_CACHE_*`, default **off**. A second cache layer consulted after
+  an exact miss for chat/completions/responses — it embeds the prompt via the
+  broker's own `/v1/embeddings` path and serves the closest stored response whose
+  cosine similarity clears `BROKER_SEMANTIC_CACHE_THRESHOLD` (default **0.95**,
+  precision-favoring). **Strict scoping**: key/tenant + placement + namespace +
+  resolved model + endpoint + every non-prompt param must match exactly — only the
+  prompt text is fuzzy — so a semantic hit never crosses a scope. Pure-Python
+  cosine over a bounded per-bucket index (no numpy); in-process or Redis via the
+  StateStore. A semantic hit returns `x-broker-cache: semantic-hit` +
+  `x-broker-cache-similarity`. **Lazy-load invariant preserved**: with
+  `BROKER_SEMANTIC_CACHE_REQUIRE_RESIDENT=true` (default) the cache is consulted
+  only when the embedding model is already resident, so a chat request never
+  silently loads an extra model (`false` allows on-demand loading).
+- **Streaming cache replay** (ADR 0014): `stream: true` requests now consult the
+  cache (exact + semantic) and, on a hit, return a well-formed SSE replay
+  (`chat.completion.chunk` / `text_completion` / Responses events + `[DONE]`)
+  instead of bypassing. Only fully-successful **non-streaming** responses populate
+  the cache; streaming reads but never writes.
+- **Per-request cache controls** (ADR 0014): `x-broker-cache-ttl: <seconds>`
+  overrides this request's stored TTL; `x-broker-cache-namespace: <token>`
+  partitions/invalidates the caller's cache scope; `Cache-Control: max-age=0` is a
+  bypass. `s-maxage` and request `max-age>0` freshness are rejected (no stored-age
+  /revalidation protocol).
+- **Opt-in span content capture** (ADR 0014): `BROKER_TRACING_CAPTURE_CONTENT`
+  (default off) + `BROKER_TRACING_CONTENT_MAX_CHARS` (default 2000). When tracing
+  is enabled and this is set, the `inference` span carries truncated
+  `gen_ai.input.messages` / `gen_ai.output.messages` (OTel GenAI `spanOnly` mode).
+  Off by default — prompts/responses may contain PII; disabled is byte-for-byte
+  v0.5.0.
+
+### Notes
+
+- All four capabilities are **opt-in and default-off**; defaults reproduce v0.5.0.
+  No new mandatory dependency (semantic cosine is pure Python). ADR 0014 resolves
+  every deferred item from ADR 0012 (now marked *Extended by ADR 0014*).
+
 ## [0.5.0] - 2026-10-19
 
 ### Added
