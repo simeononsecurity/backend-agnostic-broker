@@ -302,7 +302,7 @@ carry **all** required labels; if none qualify the broker returns
 
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
-| `BROKER_CACHE_DIR` | str | `/var/cache/broker` | Writable cache dir (tmpfs/volume in Docker). |
+| `BROKER_CACHE_DIR` | str | `/var/cache/broker` | Writable cache dir (tmpfs/volume in Docker); holds the default usage DB. For local runs use e.g. `./.cache` (created on demand). |
 | `BROKER_TMP_DIR` | str | `/tmp/broker` | Writable tmp dir. |
 
 ## Response cache (ADR 0012)

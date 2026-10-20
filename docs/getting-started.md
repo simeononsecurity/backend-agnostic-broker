@@ -70,6 +70,7 @@ YAML
 ```bash
 BROKER_AUTH_ENABLED=true BROKER_API_KEYS='["YOUR_API_KEY"]' \
   BROKER_ENABLED_BACKENDS='["fake"]' BROKER_REGISTRY_PATH=registry.yaml \
+  BROKER_CACHE_DIR=./.cache \
   .venv/bin/python -m broker
 ```
 

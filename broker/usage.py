@@ -18,6 +18,7 @@ import hashlib
 import logging
 import sqlite3
 import threading
+from pathlib import Path
 import time
 from typing import Any
 
@@ -77,12 +78,21 @@ class UsageLog:
         if not enabled:
             return
         try:
+            if self.path != ":memory:" and not self.path.startswith("file:"):
+                # The default lives under BROKER_CACHE_DIR (/var/cache/broker in the
+                # image); create the parent so a fresh local checkout works too.
+                Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(self.path, check_same_thread=False)
             self._conn.executescript(_SCHEMA)
             self._migrate(self._conn)
             self._conn.commit()
         except Exception as exc:  # noqa: BLE001 - never block startup on the log
-            log.warning("usage log init failed (%s): disabling", exc)
+            log.warning(
+                "usage log init failed for %r (%s): disabling; set BROKER_CACHE_DIR to a "
+                "writable directory or BROKER_USAGE_LOG_PATH to a writable file",
+                self.path,
+                exc,
+            )
             self.enabled = False
             self._conn = None
 

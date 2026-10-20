@@ -43,3 +43,6 @@ models/
 *.safetensors
 *.bin
 cache/
+
+# local runtime cache (BROKER_CACHE_DIR=./.cache in the tutorial)
+.cache/

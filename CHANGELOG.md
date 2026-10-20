@@ -266,6 +266,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Usage log on a fresh local checkout:** the usage DB's parent directory is now created on demand, and an unwritable path logs a warning naming `BROKER_CACHE_DIR` / `BROKER_USAGE_LOG_PATH` instead of silently disabling the log. The tutorial sets `BROKER_CACHE_DIR=./.cache`.
 - **`/v1/rerank` strict upstream validation** (ADR 0013 follow-up): a malformed
   reply from a vLLM/llama.cpp reranker is now a `502` (`backend_unavailable`)
   instead of being passed through (`200`) or crashing (`500`). The broker

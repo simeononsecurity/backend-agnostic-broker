@@ -51,3 +51,23 @@ def test_write_failure_is_swallowed(tmp_path):
     u.close()  # close the connection out from under record()
     # record after close must not raise (best-effort logging)
     u.record(endpoint="chat", model="echo", total_tokens=1)
+
+
+def test_default_path_parent_dir_is_created(tmp_path):
+    """A fresh checkout has no cache dir; the log must create it, not disable itself."""
+    from broker.usage import UsageLog
+
+    path = tmp_path / "missing" / "nested" / "usage.sqlite3"
+    log = UsageLog(str(path))
+    assert log.enabled
+    assert path.parent.is_dir()
+
+
+def test_unwritable_path_disables_with_remediation(tmp_path, caplog):
+    from broker.usage import UsageLog
+
+    blocker = tmp_path / "file-not-dir"
+    blocker.write_text("x")
+    log = UsageLog(str(blocker / "usage.sqlite3"))  # parent is a regular file
+    assert not log.enabled
+    assert "BROKER_CACHE_DIR" in caplog.text
