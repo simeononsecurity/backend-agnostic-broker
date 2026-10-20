@@ -80,9 +80,10 @@ too (the remaining 2 skips are import-guard paths that only fire when a package 
 
 **Total: `pytest -q` reports 890 passed, 61 skipped in the shared CPU venv** (the
 skips are the optional redis/otel paths — see the note above; `tests/test_cache_redis_ttl.py`
-collects only with the `[redis]` extra). The all-extras venv
-(`pip install -e '.[dev,redis,otel]'`) runs those paths too, leaving only the 2
-import-guard skips. Per-file counts above are the extras-inclusive collected numbers.
+collects only with the `[redis]` extra). The all-extras venv / Python 3.11 container
+(`pip install -e '.[dev,redis,otel]'`) runs those paths too: **952 passed, 2 skipped**
+(only the 2 import-guard paths that fire when a package is *absent*). Per-file counts
+above are the extras-inclusive collected numbers.
 
 ## Live rerank verification (ADR 0013)
 
