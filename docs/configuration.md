@@ -149,7 +149,7 @@ the algorithm, `beta` tuning, and the benchmark.
 
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
-| `BROKER_RETRY_MAX_ATTEMPTS` | int | `0` | Total serve attempts per request. `0` = legacy (one attempt per pool member — a single failover pass). A positive value caps attempts and enables re-trying members after a backoff delay. |
+| `BROKER_RETRY_MAX_ATTEMPTS` | int | `0` | Total serve attempts per request. `0` = legacy (one attempt per pool member — a single failover pass). A positive value caps attempts and enables re-trying members after a backoff delay. **Note:** this counts *total* attempts, so `1` means one attempt and **no failover**; use `0` (one pass over the pool) or ≥ the pool size. |
 | `BROKER_RETRY_BACKOFF_BASE_MS` | float | `0` | Backoff base. `0` = no sleep (legacy). |
 | `BROKER_RETRY_BACKOFF_MAX_MS` | float | `2000` | Backoff cap. |
 
