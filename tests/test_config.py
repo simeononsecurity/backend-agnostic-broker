@@ -172,3 +172,31 @@ def test_rerank_max_documents_must_be_positive(settings):
     settings.rerank_max_documents = 0
     with pytest.raises(ConfigError):
         settings.validate_runtime()
+
+
+# --- Config/env/docs completeness (integration gate) --------------------
+#
+# Every BROKER_* setting must be discoverable by an operator: it must appear in
+# BOTH .env.example and docs/configuration.md. This catches the common drift where
+# a new Settings field lands in code but never in the two files operators read.
+
+import pathlib  # noqa: E402
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _env_var_names() -> list[str]:
+    prefix = Settings.model_config.get("env_prefix", "")
+    return [f"{prefix}{name}".upper() for name in Settings.model_fields]
+
+
+def test_every_setting_is_in_env_example():
+    env_text = (_REPO_ROOT / ".env.example").read_text()
+    missing = [v for v in _env_var_names() if v not in env_text]
+    assert not missing, f"Settings missing from .env.example: {missing}"
+
+
+def test_every_setting_is_in_configuration_docs():
+    cfg_text = (_REPO_ROOT / "docs" / "configuration.md").read_text()
+    missing = [v for v in _env_var_names() if v not in cfg_text]
+    assert not missing, f"Settings missing from docs/configuration.md: {missing}"
