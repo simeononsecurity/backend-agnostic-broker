@@ -2,8 +2,8 @@
 
 Derived from the competitive analysis in
 [research/competitive-landscape.md](research/competitive-landscape.md). Each item
-links the ADR that records the decision. Status: ✅ done · 🔜 next · 📋 planned
-(proposed ADR draft).
+links the ADR that records the decision. Every item below is resolved: ✅ done or
+❌ rejected (with its ADR link) — nothing is planned or deferred.
 
 ## P0 — close the "drop-in OpenAI" gap
 

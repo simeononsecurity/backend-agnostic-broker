@@ -285,6 +285,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   defaults reproduce v0.5.0. No new mandatory dependency (semantic cosine is pure
   Python). ADR 0014 resolves every deferred item from ADR 0012 (now marked
   *Extended by ADR 0014*).
+- **Integration (ADRs 0013–0019 reconciled on one branch):** the `auto`-router
+  accuracy headline is now the **blind** eval set (`tests/data/router_eval_blind.jsonl`,
+  44 prompts the implementer never saw; code 0.75 / math 0.70 / reasoning 0.44,
+  chat & creative 1.0) — the earlier "independent" set is relabeled *seen during fix*
+  and kept as a lower-trust column (`docs/auto-router.md`). Added a combined
+  fake-backend end-to-end test across every feature 0006–0019
+  (`tests/test_e2e_all_features.py`) and a config/env/docs completeness test (every
+  `BROKER_*` setting appears in `.env.example` and `docs/configuration.md`). No
+  version bump and no behavior change — docs/tests only.
 
 ## [0.5.0] - 2026-10-19
 
