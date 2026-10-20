@@ -434,6 +434,10 @@ def test_stream_mode_validation():
 # =====================================================================
 
 INDEP = DATA / "router_eval_independent.jsonl"
+# BLIND: authored by the integration orchestrator; the implementer never saw it
+# while fixing the heuristic, so it is the HEADLINE generalization measure (INDEP
+# was seen during the fix). Frozen; floors are below INDEP's seen-during-fix numbers.
+BLIND = DATA / "router_eval_blind.jsonl"
 
 
 def test_train_is_in_sample_and_not_saturated():
@@ -488,6 +492,37 @@ def test_independent_set_is_frozen_and_disjoint():
     assert indep.isdisjoint(prompts(TRAIN))
     assert indep.isdisjoint(prompts(HELDOUT))
     tasks = {json.loads(ln)["task"] for ln in INDEP.read_text().splitlines() if ln.strip()}
+    assert {"code", "math", "reasoning", "chat", "creative"} <= tasks
+
+
+def test_blind_set_is_the_headline_generalization():
+    """Blind set (orchestrator-authored, never seen during the fix) — the HEADLINE.
+
+    These floors sit below the INDEP numbers because INDEP was seen while fixing
+    the heuristic; the blind set is the honest generalization measure. Floors:
+    code >= 0.70, math >= 0.60, reasoning >= 0.40, protected chat/creative == 1.0.
+    """
+    m = router_eval.run_eval(dataset_path=BLIND)
+    bt = m["by_task"]
+    assert bt["code"]["accuracy"] >= 0.70
+    assert bt["math"]["accuracy"] >= 0.60
+    assert bt["reasoning"]["accuracy"] >= 0.40
+    assert bt["chat"]["accuracy"] == 1.0
+    assert bt["creative"]["accuracy"] == 1.0
+
+
+def test_blind_set_is_frozen_and_disjoint():
+    def prompts(p):
+        return {json.loads(ln)["prompt"] for ln in p.read_text().splitlines() if ln.strip()}
+
+    blind = prompts(BLIND)
+    assert len(blind) >= 40
+    # The blind set must never have been used for tuning: disjoint from train, the
+    # author held-out split, AND the (seen-during-fix) independent set.
+    assert blind.isdisjoint(prompts(TRAIN))
+    assert blind.isdisjoint(prompts(HELDOUT))
+    assert blind.isdisjoint(prompts(INDEP))
+    tasks = {json.loads(ln)["task"] for ln in BLIND.read_text().splitlines() if ln.strip()}
     assert {"code", "math", "reasoning", "chat", "creative"} <= tasks
 
 

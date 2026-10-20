@@ -1,0 +1,44 @@
+{"prompt": "what's the weather usually like in Lisbon in spring", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "any tips for falling asleep faster", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "how many ounces are in a cup", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "recommend a podcast about history", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "what's a good gift for a 10 year old who likes dinosaurs", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "can I freeze cooked rice", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "who won the world cup in 2014", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "what does 'carpe diem' mean", "flags": {}, "acceptable": ["tiny", "coder", "tooly", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "chat"}
+{"prompt": "write a two-sentence horror story", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "creative"}
+{"prompt": "draft a cheerful out-of-office message for my vacation", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "creative"}
+{"prompt": "make up a name and backstory for a fantasy innkeeper", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "creative"}
+{"prompt": "write a short apology note to my neighbor for the loud party", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "creative"}
+{"prompt": "give me three slogans for a bike repair shop", "flags": {}, "acceptable": ["tiny", "coder", "reasoner"], "cheapest_capable": "tiny", "quality_tier": 1, "task": "creative"}
+{"prompt": "TypeError: 'NoneType' object is not subscriptable \u2014 line 42 in parse_config", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "how can I make my pandas groupby faster on 50M rows", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "nginx returns 502 bad gateway behind gunicorn, where do I look", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "translate this java stream pipeline into idiomatic kotlin", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "my terraform plan wants to destroy and recreate the database, why", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "write a github actions workflow that runs pytest on push", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "what's wrong with `for i in range(len(lst)): lst.remove(lst[i])`", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "how do I set up a websocket server in node with authentication", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "explain what `git reset --hard HEAD~1` does and how to undo it", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "optimize this postgres query: SELECT * FROM orders WHERE date(created_at) = '2024-01-01'", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "how do I write a unit test for an async function in jest", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "convert a nested JSON response into a flat CSV with jq", "flags": {}, "acceptable": ["coder", "reasoner"], "cheapest_capable": "coder", "quality_tier": 3, "task": "code"}
+{"prompt": "what's 12.5% of 480", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "a recipe needs 3/4 cup of sugar for 6 servings, how much for 10", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "if I invest $5000 at 4% compounded annually, what is it worth in 7 years", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "what's the derivative of sin(x) * e^x", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "how many diagonals does a decagon have", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "the probability of drawing two aces in a row without replacement", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "solve 3x + 7 = 2x - 5", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "what is the area of a circle with circumference 31.4", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "what's the median of 3, 9, 4, 12, 7, 1", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "how many trailing zeros does 50! have", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "math"}
+{"prompt": "I have a 3 gallon jug and a 5 gallon jug, how do I measure exactly 4 gallons", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "should a startup with 6 months runway hire a salesperson or an engineer first, walk through the trade-offs", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "there are 100 lockers and 100 students toggling them, which end up open and why", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "evaluate this argument: most rich people went to college, so going to college makes you rich", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "how would you decide between two job offers with different salary, commute and growth", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "a farmer must cross a river with a wolf, a goat and a cabbage \u2014 how", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "if every swan I've seen is white, can I conclude all swans are white? explain", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "rank these risks for a small web shop and justify: DDoS, card fraud, data breach, supplier failure", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}
+{"prompt": "figure out who owns the zebra given five houses and these clues: the Englishman lives in the red house, the Spaniard owns the dog", "flags": {}, "acceptable": ["reasoner", "coder"], "cheapest_capable": "coder", "quality_tier": 3, "task": "reasoning"}

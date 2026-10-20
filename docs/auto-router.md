@@ -337,7 +337,7 @@ red flag, not a win — see below.)
 > cascade** (serve cheap, verify the real answer, escalate), which inspect far
 > more signal than any word list. The numbers below are measured, not aspired to.
 
-Three sets, labeled by how independent they are from the tuning:
+Four sets, labeled by how independent they are from the tuning:
 
 - **Train** (`tests/data/router_eval.jsonl`, 82) — the set the heuristic was tuned
   against. **In-sample**; an optimistic upper bound.
@@ -345,30 +345,43 @@ Three sets, labeled by how independent they are from the tuning:
   same author in the **same commit** with the **same vocabulary**. It is *adjacent*
   to the training data, **not independent**; it saturates and should be read as
   such, not as validation.
-- **Independent** (`tests/data/router_eval_independent.jsonl`, 44) — written
-  separately by the orchestrator, disjoint phrasing and vocabulary. **This is the
-  only set that measures generalization.**
+- **Independent (seen during fix)** (`tests/data/router_eval_independent.jsonl`, 44)
+  — written separately by the orchestrator, but the implementer *saw it while
+  fixing the heuristic*, so it reflects some tuning-to-the-set and is **not** a
+  clean generalization measure.
+- **Blind** (`tests/data/router_eval_blind.jsonl`, 44) — authored by the integration
+  orchestrator and **never seen by the implementer during the fix**. Disjoint from
+  train, author held-out, and the independent set. **This is the headline
+  generalization measure.**
 
-Per-task accuracy, v0.5.0 heuristic → ADR 0019 structural heuristic:
+Per-task accuracy, v0.5.0 heuristic → ADR 0019 structural heuristic. The **Blind**
+column is the honest headline; the independent column is kept for continuity but is
+lower-trust (it was visible during the fix):
 
-| Task | Train v0.5.0 → now | Author held-out v0.5.0 → now | **Independent** v0.5.0 → now |
-|------|--------------------|------------------------------|------------------------------|
-| code | 0.636 → **0.955** | 0.500 → 1.000 | 0.250 → **0.917** |
-| math | 0.091 → **1.000** | 0.000 → 1.000 | 0.100 → **0.900** |
-| reasoning | 0.833 → 0.833 | 1.000 → 1.000 | 0.000 → **1.000** |
-| chat | 1.000 → 1.000 | 1.000 → 1.000 | 1.000 → 1.000 |
-| creative | 1.000 → 1.000 | 1.000 → 1.000 | 1.000 → 1.000 |
-| tools / json | 1.000 → 1.000 | 1.000 → 1.000 | — (not in set) |
-| vision / long-context | 1.000 → 1.000 | 1.000 → 1.000 | — (not in set) |
-| **overall** | 0.768 → **0.976** | 0.667 → 1.000 | 0.386 → **0.955** |
+| Task | Train v0.5.0 → now | Author held-out v0.5.0 → now | Independent (seen during fix) v0.5.0 → now | **Blind** v0.5.0 → now |
+|------|--------------------|------------------------------|--------------------------------------------|------------------------|
+| code | 0.636 → **0.955** | 0.500 → 1.000 | 0.250 → 0.917 | 0.083 → **0.750** |
+| math | 0.091 → **1.000** | 0.000 → 1.000 | 0.100 → 0.900 | 0.000 → **0.700** |
+| reasoning | 0.833 → 0.833 | 1.000 → 1.000 | 0.000 → 1.000 | 0.000 → **0.444** |
+| chat | 1.000 → 1.000 | 1.000 → 1.000 | 1.000 → 1.000 | 1.000 → 1.000 |
+| creative | 1.000 → 1.000 | 1.000 → 1.000 | 1.000 → 1.000 | 1.000 → 1.000 |
+| tools / json | 1.000 → 1.000 | 1.000 → 1.000 | — (not in set) | — (not in set) |
+| vision / long-context | 1.000 → 1.000 | 1.000 → 1.000 | — (not in set) | — (not in set) |
+| **overall** | 0.768 → **0.976** | 0.667 → 1.000 | 0.386 → 0.955 | 0.32 → **0.750** |
 
-Read the **Independent** column: code/math/reasoning rise from near-zero to
-0.9+ on prompts the heuristic never saw, and no protected task type (chat,
-creative, tools, json, vision, long-context) drops below v0.5.0. Train and
-Independent are now **close** (0.976 vs 0.955) — the signature of genuine
-generalization. (A previous ADR 0019 iteration scored Train 1.000 / Independent
-0.43 — a large gap that is the classic sign of over-fitting; it reported a
-"perfect" held-out 1.000 that did **not** hold on independent prompts.)
+Read the **Blind** column — the honest headline: code/math/reasoning rise from
+near-zero to 0.750 / 0.700 / 0.444 on prompts the implementer never saw, and no
+protected task type (chat, creative) drops below v0.5.0. These are materially lower
+than the "independent (seen during fix)" numbers (0.917 / 0.900 / 1.000), which is
+exactly the point — the independent set was visible while the heuristic was tuned,
+so it over-reports. The blind set measures true generalization: real gains on
+structure the scorer never saw, but a keyword+structure heuristic stays a *cheap
+default*, not a strong classifier (reasoning in particular is only 0.444). (The
+`now`/ADR-0019 blind figures are measured by `scripts/router_eval.py --dataset
+tests/data/router_eval_blind.jsonl`; the v0.5.0 blind baseline was measured by the
+integration orchestrator against the same frozen set.) An earlier ADR 0019
+iteration scored Train 1.000 / blind ~0.43 — a large gap that is the classic sign
+of over-fitting.
 
 **How it generalizes: structure, not vocabulary.** Instead of growing keyword
 lists, the scorer reads the *shape* of a request (`broker/router.py`): code-like
@@ -382,11 +395,12 @@ instruction prefix) was removed because it mis-stole `"write a python function �
 code prompts for the cheap generalist.
 
 The accuracy floors are pinned by `tests/test_router_v2.py`: in-sample PGR **< 1.0**
-(not saturated), and on the independent set **code ≥ 0.6, math ≥ 0.5,
-reasoning ≥ 0.3**, with chat/creative no lower than v0.5.0. The independent set is
-frozen and enforced disjoint from both train and the author held-out split. The
-cost of capability-first routing is a higher mean cost_tier (2.57 → 2.83 on train);
-the swept cost–quality curve still spans the full range, so APGR/CPT stay
+(not saturated); on the independent (seen-during-fix) set **code ≥ 0.6, math ≥ 0.5,
+reasoning ≥ 0.3**; and on the **blind** set (the headline) **code ≥ 0.70, math ≥ 0.60,
+reasoning ≥ 0.40**, with chat/creative at 1.0 on both. Both the independent and blind
+sets are frozen and enforced disjoint from train, the author held-out split, and each
+other. The cost of capability-first routing is a higher mean cost_tier (2.57 → 2.83 on
+train); the swept cost–quality curve still spans the full range, so APGR/CPT stay
 meaningful.
 
 #### What the metrics mean (and the limits of label-based evaluation)
