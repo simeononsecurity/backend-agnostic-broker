@@ -96,9 +96,12 @@ left pending, and the two we only partly adopt are explicitly bounded here.
    chat/creative unchanged at 1.0; train/independent are now close (0.98 / 0.96),
    the signature of real generalization rather than memorization. The in-sample PGR
    is **0.97 — strictly below the oracle ceiling** (the guard the overfit cut had to
-   loosen). The `cost_normalized` term is retained **as an opt-in** (`router.weights
-   .cost_normalized`, default **false** = v0.5.0) because it made **no difference on
-   the independent set** — it only lifted the author's in-sample numbers. Honest
+   loosen). The `cost_normalized` term (`router.weights.cost_normalized`) is the
+   **default (true)**. *Amended before release:* it made no difference on the cold
+   eval, but a live test against real Ollama models showed that once the cheapest
+   model is warm, the un-normalized term plus `prefer_loaded` sends
+   code/math/reasoning to it (blind accuracy 0.75 → 0.36); normalized cost keeps
+   0.75 warm or cold (see auto-router.md "Warm-state evaluation"). Honest
    caveat recorded in the docs: a keyword+structural heuristic generalizes only
    partially; for reliable code/math/reasoning routing prefer the LLM router backend
    or the calibrated cascade. The cost sweep still traces the full curve.
@@ -124,9 +127,10 @@ default-off, and a request with none of the new knobs reproduces v0.5.0 exactly.
   fix code/math — the first cut of this ADR did exactly this (normalized cost on by
   default). On the independent set it changed **nothing** (identical accuracy); it
   only lifted the author's in-sample numbers and silently altered v0.5.0 default
-  behavior. Rejected as the default; kept as an **opt-in** `cost_normalized` knob
-  (default false = v0.5.0). Generalization is carried instead by structural
-  features, which move the independent-set numbers.
+  behavior. Not sufficient on its own (structural features carry cold generalization), but
+  *amended before release:* adopted as the **default** because it is what keeps
+  accuracy when a cheap model is warm (0.36 → 0.75 on the blind set); `false`
+  restores v0.5.0 scoring.
 - **Status quo (end-to-end latency, booleans, no streaming cascade)** — leaves the
   streaming latency signal wrong, the escalation un-tunable, and streaming cascades
   unserved. Rejected.

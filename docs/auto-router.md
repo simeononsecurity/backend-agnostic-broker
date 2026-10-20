@@ -113,10 +113,9 @@ build must too.
 # registry.yaml
 router:
   default: small-chat            # deterministic fallback
-  # capability/cost/prefer_loaded/priority weights, plus cost_normalized (ADR 0019,
-  # default false = v0.5.0: cost can outweigh capability; set true to make a single
-  # capability match always beat price — see "Honest accuracy" §4).
-  weights: { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0, cost_normalized: false }
+  # capability/cost/prefer_loaded/priority weights, plus cost_normalized (ADR 0019;
+  # default true since v0.6.0 — see "Warm-state evaluation" below; false = v0.5.0).
+  weights: { capability: 3.0, cost: 1.0, prefer_loaded: 1.0, priority: 1.0, cost_normalized: true }
   overrides:
     - when: { has_images: true }      # always send images to the vision model
       use: llava
@@ -138,6 +137,30 @@ models:
 An override whose target is **not** a valid Stage-1 candidate (e.g. it can't do
 vision for an image request) is skipped, so overrides can never force an
 incapable model.
+
+
+## Warm-state evaluation (why `cost_normalized` defaults to true)
+
+The offline eval normally runs **cold** (no model loaded). A live broker is almost
+never cold: the cheapest model is usually resident, and `prefer_loaded` rewards it.
+Measured on the frozen **blind** set (44 prompts) with `scripts/router_eval.py
+--preload <alias>`:
+
+| state / weights | overall | code | math | reasoning | chat | creative |
+|---|---|---|---|---|---|---|
+| cold, any weights | 0.75 | 9/12 | 7/10 | 4/9 | 8/8 | 5/5 |
+| `tiny` warm, `cost_normalized: false` (v0.5.0 scoring) | **0.36** | 1/12 | 2/10 | 0/9 | 8/8 | 5/5 |
+| `tiny` warm, `prefer_loaded: 0.5` | 0.45 | 5/12 | 2/10 | 0/9 | 8/8 | 5/5 |
+| `tiny` warm, `cost_normalized: true` (**default**) | **0.75** | 9/12 | 7/10 | 4/9 | 8/8 | 5/5 |
+
+Found by a live test against real Ollama models: after a chat warmed the small
+model, a Python `SyntaxError` prompt was routed to it. With the un-normalized cost
+term, the cheap tier's cost bonus plus `prefer_loaded` outweighs one capability
+match. Normalizing cost fixes the warm case with no chat/creative regression and
+leaves cold results unchanged. `tests/test_router_v2.py::
+test_blind_set_holds_when_a_model_is_already_loaded` pins the floors for several
+warm states. Evaluate your own catalogue warm with
+`python scripts/router_eval.py --registry registry.yaml --preload <cheap-alias>`.
 
 ## Settings
 

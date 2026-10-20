@@ -60,7 +60,7 @@ Data-driven policy for the `auto` alias (see [auto-router.md](auto-router.md)):
 | `default` | str? | _(none)_ | Deterministic fallback model id when the classifier returns an invalid choice. |
 | `policy` | str? | _(none)_ | System-prompt / routing-policy override for the LLM classifier. |
 | `overrides` | list | `[]` | Hard `when → use` rules, first match bypasses the LLM (skipped if the target isn't a valid candidate). |
-| `weights` | object | _(see below)_ | Heuristic scoring weights: `capability` (3.0), `cost` (1.0), `prefer_loaded` (1.0), `priority` (1.0), `cost_normalized` (false). `cost_normalized: false` (default = v0.5.0) keeps the un-normalized cost term `(5 − cost_tier)·cost`, where a large price gap can outweigh a single capability match; `true` (ADR 0019 opt-in) normalizes it to `[0,1]·cost` so one capability match always beats price. |
+| `weights` | object | _(see below)_ | Heuristic scoring weights: `capability` (3.0), `cost` (1.0), `prefer_loaded` (1.0), `priority` (1.0), `cost_normalized` (true). `cost_normalized: true` (default since v0.6.0) normalizes the cost term to `[0,1]·cost` so a single capability match always beats price — required so a warm cheap model doesn't receive code/math/reasoning prompts; `false` restores v0.5.0's un-normalized `(5 − cost_tier)·cost`. See auto-router.md "Warm-state evaluation". |
 | `mode` | str | `single` | `single` (one-shot, default) or `cascade` (cheapest-capable first, escalate once on a signal — ADR 0011). |
 | `cascade` | object | _(see below)_ | Escalation signals for `mode: cascade`. |
 | `latency_budget_ms` | float? | _(none)_ | Default latency budget (ms); the `x-broker-latency-budget-ms` header wins, then this, then `BROKER_ROUTER_LATENCY_BUDGET_MS`. |

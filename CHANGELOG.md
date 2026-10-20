@@ -140,10 +140,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     generalize only partially — the docs point to the LLM router backend / cascade
     for hard routing; per-feature unit tests, the frozen disjoint sets, and the
     honest per-task floors are enforced in tests.
-  - **`router.weights.cost_normalized`** (opt-in, default **false** = v0.5.0). The
-    ADR 0019 normalized-cost term is gated behind this knob because it made **no
-    difference on the independent set** (it only lifted in-sample numbers); the
-    unjustified default change is reverted.
+  - **`router.weights.cost_normalized`** (default **true**; `false` = v0.5.0
+    scoring) and a `--preload` option for `scripts/router_eval.py` (warm-state
+    evaluation).
   - Example: `examples/auto-router/` (registry with tags/cost tiers + cascade +
     scorer + buffer + latency budget + placement, a README, and a tested pytest).
 - **`POST /v1/rerank`** (ADR 0013): a Cohere/Jina-compatible reranking endpoint.
@@ -221,6 +220,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`auto` scoring: `router.weights.cost_normalized` now defaults to `true`** (ADR 0019).
+  With the cheapest model already loaded (the normal live state), v0.5.0's
+  un-normalized cost term plus `prefer_loaded` sent code/math/reasoning prompts to
+  it — blind-set accuracy 0.36 vs 0.75 cold. Normalized cost keeps 0.75 warm or
+  cold with no chat/creative regression. Set it `false` to restore v0.5.0 scoring.
 - **Cache-aware p95-SLO capacity wording corrected to be seed-honest**
   (`docs/routing-and-health.md`): `cache_aware` trails `least_busy` by ~2–8%
   depending on the seed and is roughly on par with `round_robin` (they tie in

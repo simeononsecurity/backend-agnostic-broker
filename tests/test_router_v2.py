@@ -593,12 +593,28 @@ def test_structural_routes_unseen_code_math_without_keywords():
 # =====================================================================
 
 
-def test_cost_normalized_default_is_v050_unnormalized():
+def test_cost_normalized_default_is_on():
     from broker.registry import RouterWeights
 
-    # The ADR 0019 normalized-cost term made NO difference on the independent set,
-    # so its default was reverted to v0.5.0's un-normalized behavior and gated.
-    assert RouterWeights().cost_normalized is False
+    # v0.6.0: normalized cost is the default because, with the cheapest model warm
+    # (the normal live state), the un-normalized v0.5.0 term routes code/math to it.
+    assert RouterWeights().cost_normalized is True
+
+
+@pytest.mark.parametrize("warm", [["tiny"], ["tiny", "tooly"], ["coder"]])
+def test_blind_set_holds_when_a_model_is_already_loaded(warm):
+    """Warm-state guard: a loaded model must not pull capability-gated prompts.
+
+    Same floors as the cold headline. Before the default flip, with 'tiny' warm the
+    blind set fell to code 1/12, math 2/10, reasoning 0/9.
+    """
+    m = router_eval.run_eval(dataset_path=BLIND, preload=warm)
+    bt = m["by_task"]
+    assert bt["code"]["accuracy"] >= 0.70
+    assert bt["math"]["accuracy"] >= 0.60
+    assert bt["reasoning"]["accuracy"] >= 0.40
+    assert bt["chat"]["accuracy"] == 1.0
+    assert bt["creative"]["accuracy"] == 1.0
 
 
 def test_cost_normalized_is_opt_in_and_changes_scoring():

@@ -385,10 +385,19 @@ def run_eval(
     registry_path: str | None = None,
     backend: str = "heuristic",
     sweep: list[float] = DEFAULT_COST_SWEEP,
+    preload: list[str] | None = None,
 ) -> dict:
-    """Run the router over the labeled set and return a metrics dict."""
+    """Run the router over the labeled set and return a metrics dict.
+
+    ``preload`` marks those aliases as already loaded (warm), so the
+    ``prefer_loaded`` term is exercised the way it is in a live broker, where a
+    model is almost always resident. Default: nothing loaded (cold).
+    """
     items = load_dataset(dataset_path)
     mgr = _build_manager(registry_path, backend)
+    for m in mgr.models.values():
+        if m.entry.alias in (preload or []):
+            m.machine.is_active = lambda: True  # type: ignore[method-assign]
     router = mgr.router
     if router is None:
         raise RuntimeError("router is disabled; set router_backend != 'off'")
@@ -570,9 +579,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--backend", default="heuristic", choices=["heuristic", "llm", "auto"])
     ap.add_argument("--format", default="md", choices=["md", "json"])
     ap.add_argument("--out", default=None, help="write the report to this file")
+    ap.add_argument(
+        "--preload",
+        default="",
+        help="comma-separated aliases to treat as already loaded (warm-state eval)",
+    )
     args = ap.parse_args(argv)
 
-    metrics = run_eval(args.dataset, args.registry, args.backend)
+    preload = [a.strip() for a in args.preload.split(",") if a.strip()]
+    metrics = run_eval(args.dataset, args.registry, args.backend, preload=preload)
     if args.format == "json":
         text = json.dumps({k: v for k, v in metrics.items() if k != "rows"}, indent=2)
     else:

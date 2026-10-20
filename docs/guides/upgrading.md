@@ -5,7 +5,7 @@ cache, web UI, governance v2, reliability v2, cache-aware v2, router v2) is
 **opt-in and default-off**, and the v0.5.0 configuration reproduces v0.5.0 behavior
 byte-for-byte. Upgrading is: update the package/image, keep your config, done.
 
-This guide lists the only two behavior changes you should be aware of, and how to
+This guide lists the only three behavior changes you should be aware of, and how to
 adopt the new features when you want them.
 
 ## Upgrade steps
@@ -19,7 +19,7 @@ docker pull ghcr.io/simeononsecurity/backend-agnostic-broker:latest
 
 Your existing `registry.yaml`, `keys.yaml`, and `.env` keep working unchanged.
 
-## The two behavior changes to know
+## The three behavior changes to know
 
 These are the **only** non-default-off changes since v0.5.0. Both are documented in
 `CHANGELOG.md`.
@@ -47,6 +47,18 @@ Only affects deployments that opted into `BROKER_ROUTE_STRATEGY=cache_aware`
 queueing benchmark (see [routing-and-health.md](../routing-and-health.md)). To keep
 the old value, set `BROKER_CACHE_AWARE_BETA=0.25` explicitly. `sticky` remains the
 default **strategy**, so most deployments are unaffected.
+
+### 3. `auto` scoring: `cost_normalized` defaults to true (ADR 0019)
+
+`router.weights.cost_normalized` is now `true`. In v0.5.0, once the cheapest model
+was warm, its cost bonus plus `prefer_loaded` could outweigh a capability match, so
+`auto` sent code/math/reasoning prompts to it. You may see **more** such prompts go
+to capable (pricier) models. To keep v0.5.0 scoring:
+
+```yaml
+router:
+  weights: { cost_normalized: false }
+```
 
 ### If you run the frozen v0.5.0 test suite against this branch
 
