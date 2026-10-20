@@ -1,0 +1,8 @@
+# Observability example registry: one offline fake chat model is enough to emit
+# gen_ai.* spans for every request. Swap for real backends in production.
+models:
+  - alias: echo-fake
+    backend: fake
+    runtime_model_id: fake-echo-v1
+    idle_timeout_seconds: 60
+    supports_streaming: true

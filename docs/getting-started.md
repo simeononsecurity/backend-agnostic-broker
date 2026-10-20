@@ -1,189 +1,154 @@
 # Getting Started
 
-A hands-on walkthrough: install the broker, run it with the built-in **fake**
-backend (no GPU or external runtime needed), make real requests, then point it
-at a **remote Ollama** backend over your network. Every command below is
-copy-pasteable.
+A hands-on, ~10-minute walkthrough from zero to your first chat. Pick the track
+that matches what you have:
 
-> **Redaction note:** real host IPs and hostnames in this guide are shown as
-> placeholders like `<OLLAMA_HOST>`, `<TAILNET_HOST_OR_IP>`, and `YOUR_API_KEY`.
-> Never commit real endpoints or keys — they belong in a gitignored `.env`
-> (see [Step 5](#step-5--connect-a-real-backend-ollama-over-the-network)).
+- **[Track C — no GPU, no backend](#track-c--no-gpu-no-backend-fake)** — runs
+  anywhere using the built-in **fake** backend. Start here if you just want to see
+  the broker work; every command is runnable as written.
+- **[Track A — local Python + Ollama](#track-a--local-python--ollama)** — your
+  first **real** model, run from source.
+- **[Track B — Docker (lean image) + Ollama](#track-b--docker-lean-image--ollama)**
+  — the same, containerized.
+
+All three show the OpenAI-compatible surface: `auto` routing, streaming,
+embeddings, and the OpenAI Python SDK.
+
+> **Redaction note:** real hosts and keys are shown as placeholders
+> (`<OLLAMA_HOST>`, `${OLLAMA_BASE_URL}`, `YOUR_API_KEY`). Never commit real
+> endpoints or keys — they belong in a gitignored `.env`.
+
+## Prerequisites (all tracks)
+
+- **Python 3.11+** (`python3 --version`) and `git`, `curl` — for Tracks A and C.
+- **Docker** — for Track B.
+- A real backend (e.g. an **Ollama** daemon) — for Tracks A and B only.
 
 ---
 
-## Prerequisites
+## Track C — no GPU, no backend (fake)
 
-- **Python 3.11+** (`python3 --version`)
-- **git**, `make`, and `curl`
-- Optional: **Docker** (for the container quickstart)
-- Optional: a real backend to route to (e.g. an **Ollama** daemon on your LAN or
-  tailnet) — only needed for [Step 5](#step-5--connect-a-real-backend-ollama-over-the-network)
+The **fake** backend is a real in-process adapter that echoes your input. It
+exercises the full request path — auth, lifecycle, streaming, embeddings, `auto`,
+`/status` — with no model download, GPU, or network. Perfect for a first look and
+for CI.
 
----
-
-## Step 1 — Install
+### 1. Install
 
 ```bash
 git clone <YOUR_REPO_URL> backend-agnostic-broker
 cd backend-agnostic-broker
-
-make venv && make install     # creates .venv/ and installs runtime + dev deps
-# equivalent to:
-#   python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[dev]"
-```
-
-Verify the install:
-
-```bash
+make venv && make install        # creates .venv/ and installs runtime + dev deps
 .venv/bin/python -c "import broker; print('broker', broker.__version__)"
-# -> broker 0.3.0
+# -> broker 0.5.0
 ```
 
----
+### 2. Write a tiny fake-only registry
 
-## Step 2 — Create local config
+<!-- runnable -->
+```bash
+cat > registry.yaml <<'YAML'
+router:
+  default: echo-fake            # used if the classifier returns an invalid choice
+models:
+  - alias: echo-fake
+    backend: fake
+    runtime_model_id: fake-echo-v1
+    supports_streaming: true
+    tags: [general, cheap, fast]
+    cost_tier: 1
+  - alias: echo-embed
+    backend: fake
+    runtime_model_id: fake-embed
+    router_eligible: false       # an embedding model is never a router target
+    tags: [embedding]
+YAML
+```
 
-Two files drive the broker. Both are **gitignored** so your real values never
-get committed; starter templates are checked in with `.example` suffixes.
+### 3. Run the broker (fake backend only)
 
 ```bash
-cp .env.example .env                      # server + secrets + endpoints
-cp registry.example.yaml registry.yaml    # the models you can call
+BROKER_AUTH_ENABLED=true BROKER_API_KEYS='["YOUR_API_KEY"]' \
+  BROKER_ENABLED_BACKENDS='["fake"]' BROKER_REGISTRY_PATH=registry.yaml \
+  .venv/bin/python -m broker
 ```
 
-Open `.env` and set at least an API key (or disable auth for quick local dev):
-
-```ini
-# .env
-BROKER_AUTH_ENABLED=true
-BROKER_API_KEYS=["YOUR_API_KEY"]          # pick any string for local use
-BROKER_PORT=8080
-BROKER_REGISTRY_PATH=registry.yaml
-```
-
-> To skip auth entirely while experimenting, set `BROKER_AUTH_ENABLED=false` and
-> drop the `Authorization` header from the examples below.
-
-The registry (`registry.yaml`) already contains an `echo-fake` model from the
-template — that's all you need for the next step.
-
----
-
-## Step 3 — Run with the fake backend (no GPU, no external runtime)
-
-The **fake** backend is a real in-process adapter that echoes your input. It
-exercises the full request path — auth, lifecycle, streaming, `/status` — without
-any model download or GPU.
-
-```bash
-# Enable only the fake backend for this run:
-BROKER_ENABLED_BACKENDS='["fake"]' make run
-# (make run just calls: .venv/bin/python -m broker)
-```
-
-You should see a startup log like:
-
-```
-broker 0.3.0 started; 1 model registered (none loaded)
-Uvicorn running on http://0.0.0.0:8080
-```
-
-Leave it running and open a second terminal for Step 4.
-
----
-
-## Step 4 — Make your first requests
-
-Set up two shell variables so the examples stay clean:
+You should see a startup log and `Uvicorn running on http://0.0.0.0:8080`. Leave it
+running; open a second terminal for the requests below.
 
 ```bash
 BASE=http://127.0.0.1:8080
-KEY=YOUR_API_KEY          # must match a value in BROKER_API_KEYS
+KEY=YOUR_API_KEY                 # must match a value in BROKER_API_KEYS
 ```
 
-### Health & readiness (no auth required)
+### 4. Health and models
 
+<!-- runnable -->
 ```bash
-curl -s $BASE/healthz   # -> {"status":"ok"}
-curl -s $BASE/readyz    # -> {"status":"ready","models_registered":1}
+curl -s $BASE/healthz            # -> {"status":"ok"}
+curl -s $BASE/readyz             # -> {"status":"ready", ...}
 ```
 
-### List models
-
+<!-- runnable -->
 ```bash
-# With auth -> 200 and a model list:
 curl -s -H "Authorization: Bearer $KEY" $BASE/v1/models | python3 -m json.tool
-
-# Without auth -> 401 (proves auth is enforced):
-curl -s -o /dev/null -w "%{http_code}\n" $BASE/v1/models    # -> 401
 ```
 
-Expected (trimmed):
+Expected (trimmed): a `list` containing `echo-fake` and `echo-embed`. A request
+**without** the key returns `401` — auth is enforced.
 
-```json
-{
-  "object": "list",
-  "data": [
-    { "id": "echo-fake", "object": "model", "backend": "fake",
-      "capabilities": { "streaming": true, "tools": false } }
-  ]
-}
-```
+### 5. Chat (non-streaming)
 
-### Chat — non-streaming
-
+<!-- runnable -->
 ```bash
 curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d '{
-    "model": "echo-fake",
-    "messages": [{"role":"user","content":"Hello, broker!"}]
-  }' \
+  -d '{"model":"echo-fake","messages":[{"role":"user","content":"Hello, broker!"}]}' \
   $BASE/v1/chat/completions | python3 -m json.tool
 ```
 
-Expected (trimmed):
+Expected: a `chat.completion` whose `choices[0].message.content` is
+`echo: echo-fake`, with a `usage` block.
 
-```json
-{
-  "object": "chat.completion",
-  "model": "echo-fake",
-  "choices": [{ "index": 0, "message": {"role":"assistant","content":"Hello, broker!"},
-                "finish_reason": "stop" }],
-  "usage": { "prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6 }
-}
-```
+### 6. Let `auto` pick the model
 
-### Chat — streaming (SSE)
-
+<!-- runnable -->
 ```bash
-curl -N -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d '{
-    "model": "echo-fake",
-    "messages": [{"role":"user","content":"stream this"}],
-    "stream": true
-  }' \
+curl -s -D - -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"model":"auto","messages":[{"role":"user","content":"hi"}]}' \
   $BASE/v1/chat/completions
 ```
 
-You'll see a sequence of `data: {...}` `chat.completion.chunk` frames, each with an
-incremental `delta.content`, a final frame with `"finish_reason":"stop"`, and
-exactly one terminating `data: [DONE]`.
+Expected: the `x-broker-route` response header names the served model (`echo-fake`
+here). You send `"model":"auto"` and the broker chooses from the registry.
 
-### Watch the lifecycle
+### 7. Streaming (SSE)
 
+<!-- runnable -->
 ```bash
-curl -s -H "Authorization: Bearer $KEY" $BASE/status | python3 -m json.tool
+curl -N -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"model":"echo-fake","messages":[{"role":"user","content":"stream this"}],"stream":true}' \
+  $BASE/v1/chat/completions
 ```
 
-`/status` shows each model's lifecycle state (`unloaded → loading → ready → …`),
-when it was loaded, and GPU allocation. The fake backend loads on first request
-and unloads after its idle timeout.
+Expected: a sequence of `data: {...}` `chat.completion.chunk` frames with
+incremental `delta.content`, a final frame with `"finish_reason":"stop"`, and one
+terminating `data: [DONE]`.
 
-### Call it from the OpenAI Python SDK
+### 8. Embeddings
 
-The broker is OpenAI-compatible, so existing clients work unchanged — just point
-`base_url` at the broker:
+<!-- runnable -->
+```bash
+curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"model":"echo-embed","input":"embed me"}' \
+  $BASE/v1/embeddings | python3 -m json.tool
+```
+
+Expected: `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[...]}], "usage":{...}}`.
+
+### 9. From the OpenAI Python SDK
+
+The broker is OpenAI-compatible, so existing clients work unchanged — only
+`base_url` and `api_key` change:
 
 ```python
 # pip install openai
@@ -191,13 +156,11 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="YOUR_API_KEY")
 
-resp = client.chat.completions.create(
+print(client.chat.completions.create(
     model="echo-fake",
     messages=[{"role": "user", "content": "Hello from the SDK"}],
-)
-print(resp.choices[0].message.content)
+).choices[0].message.content)        # -> echo: echo-fake
 
-# Streaming:
 for chunk in client.chat.completions.create(
     model="echo-fake",
     messages=[{"role": "user", "content": "stream from the SDK"}],
@@ -206,107 +169,137 @@ for chunk in client.chat.completions.create(
     print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
 
+### What just happened
+
+You ran the full broker — auth, lazy lifecycle, `auto` routing, streaming,
+embeddings — with no GPU or external runtime. The fake backend stands in for a real
+model; the request path is identical to production.
+
+### Next steps
+
+Swap the fake backend for a real one: continue to **Track A** (Ollama from source)
+or **Track B** (Docker). Then explore the [how-to guides](guides/README.md).
+
 ---
 
-## Step 5 — Connect a real backend (Ollama) over the network
+## Track A — local Python + Ollama
 
-Now route to a real **Ollama** daemon. The daemon can be local or on another host
-(LAN, VPN, or tailnet). **The host address stays out of git** — you set it in
-`.env` as `OLLAMA_BASE_URL`, and `registry.yaml` references it as
-`${OLLAMA_BASE_URL}`.
+Run your first **real** model from source against an **Ollama** daemon (local, LAN,
+or tailnet).
 
-### 5a. Point the broker at your Ollama host
+### Prerequisites
 
-```ini
-# .env  — use YOUR host; shown redacted here.
-# Local daemon:
-OLLAMA_BASE_URL=http://127.0.0.1:11434
-# Remote daemon (LAN / tailnet) — replace the placeholder with your host or IP:
-# OLLAMA_BASE_URL=http://<OLLAMA_HOST>:11434
-# OLLAMA_BASE_URL=http://<TAILNET_HOST_OR_IP>:11434
-```
+- Track C's install done (`.venv` ready).
+- An Ollama daemon with a model pulled: `ollama pull llama3.1:8b`.
 
-The template `registry.yaml` already has an Ollama entry that consumes it:
-
-```yaml
-# registry.yaml (from registry.example.yaml) — no host IP is committed
-- alias: llama3-ollama
-  backend: ollama
-  runtime_model_id: llama3.1:8b          # must exist on the daemon
-  base_url: ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}
-  readiness: { kind: http, path: /api/tags, expect_status: 200 }
-  idle_timeout_seconds: 300
-  keep_alive: "5m"
-  supports_streaming: true
-  supports_tools: true
-```
-
-Make sure the model exists on the daemon (run this where Ollama lives, or against
-the remote: `OLLAMA_HOST=<OLLAMA_HOST>:11434 ollama pull llama3.1:8b`).
-
-### 5b. Sanity-check connectivity (optional)
+### 1. Point the broker at Ollama (host stays out of git)
 
 ```bash
-# Replace <OLLAMA_HOST> with your real host/IP. Expect a JSON model list.
-curl -s http://<OLLAMA_HOST>:11434/api/tags | python3 -m json.tool
+cp .env.example .env
+cp registry.example.yaml registry.yaml
 ```
 
-### 5c. Restart the broker with the Ollama backend enabled
+In `.env`, set your host and a key:
+
+```ini
+BROKER_AUTH_ENABLED=true
+BROKER_API_KEYS=["YOUR_API_KEY"]
+OLLAMA_BASE_URL=http://<OLLAMA_HOST>:11434     # local: http://127.0.0.1:11434
+```
+
+The template `registry.yaml` already has an Ollama entry (`llama3-ollama`) that
+reads `${OLLAMA_BASE_URL}`, plus an embedding model (`nomic-embed-text`).
+
+### 2. Run with the Ollama backend enabled
 
 ```bash
 BROKER_ENABLED_BACKENDS='["fake","ollama"]' make run
 ```
 
-### 5d. Use the Ollama-backed model
+### 3. Use the real model
 
 ```bash
-BASE=http://127.0.0.1:8080
-KEY=YOUR_API_KEY
-
-# It now appears in the model list:
-curl -s -H "Authorization: Bearer $KEY" $BASE/v1/models | python3 -m json.tool
-
-# Real completion routed to your Ollama host:
+BASE=http://127.0.0.1:8080; KEY=YOUR_API_KEY
+curl -s -H "Authorization: Bearer $KEY" $BASE/v1/models | python3 -m json.tool   # llama3-ollama appears
 curl -s -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d '{"model":"llama3-ollama",
-       "messages":[{"role":"user","content":"Say hello in one short sentence."}]}' \
+  -d '{"model":"llama3-ollama","messages":[{"role":"user","content":"Say hi in one sentence."}]}' \
   $BASE/v1/chat/completions | python3 -m json.tool
 ```
 
-### 5e. See lazy-load and idle-unload in action
+Streaming, embeddings (`nomic-embed-text`), `auto`, and the OpenAI SDK all work the
+same as in Track C — just use the real model names.
+
+### 4. See lazy-load and idle-unload
 
 ```bash
-# BEFORE any request: llama3-ollama is "unloaded".
 curl -s -H "Authorization: Bearer $KEY" $BASE/status | python3 -m json.tool
-
-# Send one chat request (5d), then check again: it's now "ready" with loaded_at set,
-# while echo-fake stays "unloaded" — only the selected model loads (no fallback).
-curl -s -H "Authorization: Bearer $KEY" $BASE/status | python3 -m json.tool
-
-# Wait past idle_timeout_seconds (300s above, or lower it in registry.yaml for a
-# quick demo). The idle sweeper unloads it; /status shows "unloaded" again, and
-# the next request transparently reloads it.
 ```
+
+Before any request `llama3-ollama` is `unloaded`; after one chat it's `ready` with
+`loaded_at` set, while `echo-fake` stays `unloaded` — **only the selected model
+loads, never a fallback**. Past `idle_timeout_seconds` the idle sweeper unloads it,
+and the next request reloads it transparently.
+
+### What just happened
+
+The broker lazily loaded a real Ollama model on first use, kept the host out of git
+via `${OLLAMA_BASE_URL}`, and exposed it through the same OpenAI API.
+
+### Next steps
+
+[backends guide](guides/backends.md) · [pools & routing](guides/pools-and-routing.md) ·
+[auto-router](guides/auto-router.md).
 
 ---
 
-## Step 6 — Run in Docker (optional)
+## Track B — Docker (lean image) + Ollama
+
+The same real setup, containerized with the hardened **lean** image.
+
+### Prerequisites
+
+- Docker installed; an Ollama daemon reachable from the container.
+
+### 1. Pull (or build) the image
 
 ```bash
-make docker-build          # build the hardened image
-make docker-smoke          # build + container smoke test (healthz, auth, chat)
-
-# Or the full stack via Compose (reads .env):
-docker compose up -d --build
-docker compose logs -f broker
+docker pull ghcr.io/simeononsecurity/backend-agnostic-broker:latest
+# or build locally: make docker-build
 ```
 
-Releases are published to GHCR in two variants: **lean** (`:latest`) and a
-self-contained **`-llm`** image (`:latest-llm`) that bundles the CPU `auto`-router
-classifier. Pull and run them per [docs/docker.md](docker.md).
+### 2. Run it
 
-For GPU passthrough and the remote-backend-from-container networking notes, see
-[docs/docker.md](docker.md) and [docs/docker-compose.md](docker-compose.md).
+Mount a registry and pass config as env. The host stays in `OLLAMA_BASE_URL`:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e BROKER_AUTH_ENABLED=true \
+  -e BROKER_API_KEYS='["YOUR_API_KEY"]' \
+  -e BROKER_ENABLED_BACKENDS='["fake","ollama"]' \
+  -e OLLAMA_BASE_URL='http://<OLLAMA_HOST>:11434' \
+  -e BROKER_REGISTRY_PATH=/config/registry.yaml \
+  -v "$PWD/registry.example.yaml:/config/registry.yaml:ro" \
+  ghcr.io/simeononsecurity/backend-agnostic-broker:latest
+```
+
+For a full stack (plus an Ollama service on the same network, so you use
+`http://ollama:11434` instead of a host IP), use
+[examples/ollama-quickstart/docker-compose.yml](../examples/ollama-quickstart/docker-compose.yml).
+
+### 3. Use it
+
+Identical requests to Track A — `curl http://127.0.0.1:8080/v1/chat/completions`
+with `"model":"llama3-ollama"` (or `"auto"`), streaming, embeddings, and the SDK.
+
+### What just happened
+
+You ran the broker as a non-root, read-only-root-fs container and reached a real
+Ollama model over the network, with no code checkout.
+
+### Next steps
+
+[Docker guide](docker.md) · [production deployment](guides/production-deployment.md) ·
+[auto-router `-llm` image](guides/auto-router.md).
 
 ---
 
@@ -314,13 +307,11 @@ For GPU passthrough and the remote-backend-from-container networking notes, see
 
 | Symptom | Likely cause / fix |
 |---|---|
-| `401` on `/v1/*` | Missing/!wrong key. Header must be `Authorization: Bearer <key>` (or `X-API-Key`) and match `BROKER_API_KEYS`. |
-| `model not found` | The `model` in the request must match a registry `alias`, and that backend must be in `BROKER_ENABLED_BACKENDS`. No silent fallback is by design. |
-| Ollama model errors | `runtime_model_id` must be pulled on the daemon; confirm with `curl http://<OLLAMA_HOST>:11434/api/tags`. |
-| Can't reach remote Ollama | Usually networking, not SSRF: the broker auto-allows each registry entry's own `base_url`, so `${OLLAMA_BASE_URL}` is trusted by default. Check the URL/port and that the daemon binds a reachable interface (`OLLAMA_HOST=0.0.0.0:11434`). `BROKER_EXTRA_ALLOWED_BACKEND_URLS` is only for upstreams *not* declared in the registry; `BROKER_ALLOW_LOOPBACK_BACKENDS` governs loopback targets — see [configuration.md](configuration.md). |
-| Startup fails fast with a config error | That's intentional — fix the reported env/registry field. See [configuration.md](configuration.md). |
+| `401` on `/v1/*` | Missing/wrong key. Header must be `Authorization: Bearer <key>` (or `X-API-Key`) and match `BROKER_API_KEYS`. |
+| `model not found` | The `model` must match a registry `alias`, and its backend must be in `BROKER_ENABLED_BACKENDS`. No silent fallback is by design. |
+| Ollama model errors | `runtime_model_id` must be pulled on the daemon (`ollama pull ...`). |
+| Can't reach remote Ollama | Usually networking, not SSRF — the entry's own `base_url` is auto-trusted. Check URL/port and that the daemon binds a reachable interface. |
+| Startup fails with a config error | Intentional — fix the reported env/registry field. See [configuration](configuration.md). |
 
-More: [docs/troubleshooting.md](troubleshooting.md) ·
-[docs/configuration.md](configuration.md) ·
-[docs/model-registry.md](model-registry.md) ·
-[docs/api-reference.md](api-reference.md)
+More: [how-to guides](guides/README.md) · [troubleshooting](troubleshooting.md) ·
+[configuration](configuration.md) · [API reference](api-reference.md).

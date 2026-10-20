@@ -1,0 +1,31 @@
+# RAG pipeline example registry: a chat model, an embedding model, and a reranker
+# — all on the dependency-free `fake` backend so the full embed -> retrieve ->
+# rerank -> chat flow runs with no GPU or downloads. In production, point each at
+# a real model (e.g. Ollama llama3.1 + nomic-embed-text, llama.cpp bge-reranker).
+#
+# Guide: ../../docs/guides/embeddings-and-rerank.md
+
+models:
+  - alias: chat
+    backend: fake
+    runtime_model_id: fake-chat
+    context_limit: 8192
+    supports_streaming: true
+    tags: [general]
+    description: fake chat model (RAG answer generation)
+
+  - alias: embed
+    backend: fake
+    runtime_model_id: fake-embed
+    idle_timeout_seconds: 300
+    router_eligible: false
+    tags: [embedding]
+    description: fake 16-dim embedding model (retrieval)
+
+  - alias: rerank
+    backend: fake
+    runtime_model_id: fake-rerank
+    supports_rerank: true
+    router_eligible: false
+    tags: [rerank]
+    description: fake lexical-overlap reranker (precision reordering)

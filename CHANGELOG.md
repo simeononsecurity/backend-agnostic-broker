@@ -8,6 +8,26 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Getting Started tutorial rewritten into three tracks** (`docs/getting-started.md`):
+  no-GPU fake backend, local Python + Ollama, and the Docker lean image — each
+  showing `auto`, streaming, embeddings, and the OpenAI Python SDK. Track C's
+  commands are marked `<!-- runnable -->` and executed by `tests/test_docs_examples.py`.
+- **How-to guides for every feature** (`docs/guides/`): backends, pools & routing,
+  reliability, Redis multi-replica, auto-router, virtual keys, response cache, admin
+  API, web UI, observability, embeddings & rerank, production deployment, and
+  upgrading — each with when-to-use, minimal/full config, a verify step, and
+  troubleshooting, cross-linked to its reference page and ADR. Added `docs/README.md`
+  and `docs/guides/README.md` indexes; the top-level README points at both.
+- **Examples library completed** (`examples/`): new `ollama-quickstart`,
+  `docker-compose-redis` (two replicas + Redis + nginx), `otel`
+  (Collector → Jaeger), and `rag-pipeline` (embed → retrieve → rerank → chat)
+  examples, plus an `examples/README.md` index. Placeholders only.
+- **Examples are tested, not decorative**: `tests/test_examples.py` loads every
+  example's registry/keys/env through the real loaders, validates every
+  `docker-compose*.yml` against an image allow-list, and runs the new examples'
+  requests against the fake backend. `tests/test_links.py` checks every relative
+  link in `docs/` and `examples/`.
+
 - **Reliability v2** (ADR 0017) — resolves every item ADR 0009 deferred. All knobs
   are opt-in and default to v0.5.0 behavior (the v0.5.0 test suite passes unchanged).
   - **Ejection cap** `BROKER_MAX_EJECTION_PERCENT` (Envoy `max_ejection_percent`):
@@ -201,6 +221,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Cache-aware p95-SLO capacity wording corrected to be seed-honest**
+  (`docs/routing-and-health.md`): `cache_aware` trails `least_busy` by ~2–8%
+  depending on the seed and is roughly on par with `round_robin` (they tie in
+  `cache_pressure`/`long_lived` under some seeds), well ahead of `sticky`. The
+  earlier "~2–5%" / strict-ordering claim did not hold across seeds; figures are
+  now labeled as seed-dependent simulations.
 - **Upstream HTTP errors are surfaced by status instead of collapsed to `502`**
   (ADR 0017). A backend 4xx (e.g. a context-length `400`) now returns that `4xx`
   with `error.type` `upstream_client_error`, is called exactly once, and never

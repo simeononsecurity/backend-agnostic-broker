@@ -11,9 +11,10 @@ lifetime, and caching are all **configurable**.
 > URLs pass an SSRF allow-list, and there is **no silent fallback** to another
 > model.
 
-**New here? → [Getting Started guide](docs/getting-started.md)** — install, make
-your first request against the built-in fake backend, then connect a real Ollama
-backend over the network, all with copy-paste examples.
+**New here? → [Getting Started tutorial](docs/getting-started.md)** — zero → first
+chat in three tracks (no-GPU fake backend, local Python + Ollama, or Docker), all
+copy-paste. Then pick a **[how-to guide](docs/guides/README.md)** for the feature
+you need, and a matching **[runnable example](examples/README.md)**.
 
 ## Features
 
@@ -124,7 +125,10 @@ See [docs/docker.md](docs/docker.md) for running/configuring the `-llm` image an
 | Topic | Doc |
 |---|---|
 | **AI-agent rules** | [AGENTS.md](AGENTS.md) (read first) |
-| **Getting started** | [docs/getting-started.md](docs/getting-started.md) |
+| **Getting started (tutorial)** | [docs/getting-started.md](docs/getting-started.md) |
+| **How-to guides** | [docs/guides/](docs/guides/README.md) |
+| **Examples (runnable, tested)** | [examples/](examples/README.md) |
+| **Documentation index** | [docs/](docs/README.md) |
 | Architecture overview | [docs/architecture.md](docs/architecture.md) |
 | ADRs | [docs/adr/](docs/adr/) |
 | Roadmap | [docs/roadmap.md](docs/roadmap.md) |

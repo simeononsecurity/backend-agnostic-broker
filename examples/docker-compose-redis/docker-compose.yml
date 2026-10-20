@@ -1,0 +1,45 @@
+# Two broker replicas behind an nginx load balancer, sharing one Redis so sticky
+# routing, rate-limit counters, cooldowns, and cache state are consistent across
+# both (ADR 0009). Scale by adding replicas — all point at the same REDIS_URL.
+#
+# Guide: ../../docs/guides/redis-multi-replica.md
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    restart: unless-stopped
+
+  broker-1: &broker
+    image: ghcr.io/simeononsecurity/backend-agnostic-broker:latest
+    depends_on: [redis]
+    environment: &broker-env
+      BROKER_AUTH_ENABLED: "true"
+      BROKER_API_KEYS: '["YOUR_API_KEY"]'
+      BROKER_REGISTRY_PATH: "/config/registry.yaml"
+      BROKER_ENABLED_BACKENDS: '["fake"]'
+      BROKER_REDIS_URL: "redis://redis:6379/0"
+      BROKER_REDIS_PREFIX: "broker"
+      # Bound the global sticky map so one Redis can't grow unbounded.
+      BROKER_REDIS_STICKY_MAX_ENTRIES: "100000"
+    volumes:
+      - ./registry.example.yaml:/config/registry.yaml:ro
+    read_only: true
+    tmpfs: ["/tmp/broker", "/var/cache/broker"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    restart: unless-stopped
+
+  broker-2:
+    <<: *broker
+    environment:
+      <<: *broker-env
+
+  lb:
+    image: nginx:1.27-alpine
+    depends_on: [broker-1, broker-2]
+    ports:
+      - "${BROKER_PORT:-8080}:8080"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped

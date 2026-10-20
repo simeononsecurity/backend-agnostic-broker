@@ -1,0 +1,36 @@
+# Ollama quickstart stack: the broker + an Ollama daemon, on one Compose network.
+# The broker reaches Ollama by its service name (http://ollama:11434) — no host
+# IP is committed. Pull a model into the daemon once it is up:
+#   docker compose exec ollama ollama pull llama3.1:8b
+#
+# Guide: ../../docs/guides/backends.md
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama:/root/.ollama
+    # Expose only if you want host access; the broker uses the internal network.
+    # ports: ["11434:11434"]
+
+  broker:
+    image: ghcr.io/simeononsecurity/backend-agnostic-broker:latest
+    depends_on: [ollama]
+    ports:
+      - "${BROKER_PORT:-8080}:8080"
+    environment:
+      BROKER_AUTH_ENABLED: "true"
+      BROKER_API_KEYS: '["YOUR_API_KEY"]'
+      BROKER_REGISTRY_PATH: "/config/registry.yaml"
+      BROKER_ENABLED_BACKENDS: '["fake","ollama"]'
+      OLLAMA_BASE_URL: "http://ollama:11434"
+    volumes:
+      - ./registry.example.yaml:/config/registry.yaml:ro
+    read_only: true
+    tmpfs: ["/tmp/broker", "/var/cache/broker"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    restart: unless-stopped
+
+volumes:
+  ollama:

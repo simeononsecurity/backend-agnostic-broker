@@ -360,9 +360,13 @@ service floor, so capacity reflects the onset of *queueing*, not the service flo
 | cross_session | 13.0 | **14.3** | 12.7 | 13.6 |
 | skewed_bursty | 11.8 | **12.7** | 7.9 | 12.1 |
 
-On **p95-SLO capacity** the order is `least_busy` ≥ `cache_aware` > `round_robin` >
-`sticky` in every scenario: `least_busy` leads, `cache_aware` trails it by only ~2–5%
-(and beats `sticky` by 15–55%). `cache_aware`'s distinct advantage is the **prefill
+On **p95-SLO capacity** `least_busy` leads in every scenario; `cache_aware` trails it
+by ~2–8% depending on the seed, lands roughly on par with `round_robin` (they tie in
+`cache_pressure` and `long_lived` under some seeds — e.g. `--sweep --seed 7` gives 11.4
+vs 11.4), and stays well ahead of `sticky` (by ~15–55%). These are seed-dependent
+simulations — the exact ordering of the middle strategies shifts run to run, so treat
+the figures as approximate and reproduce with your own seed. `cache_aware`'s distinct
+advantage is the **prefill
 work it saves** (20–48% fewer uncached tokens in reuse-heavy scenarios): if your
 bottleneck is prefill compute (GPU FLOPs/energy) rather than batch slots, that work
 saved *is* extra capacity — but this slot-bound simulation does not turn it into higher

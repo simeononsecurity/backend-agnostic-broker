@@ -1,0 +1,10 @@
+# Multi-replica registry: a single pooled model `chat` over three fake members so
+# you can watch sticky routing stay consistent across both broker replicas. Swap
+# the fake members for real Ollama/vLLM hosts (host IPs via env) in production.
+#
+# Guide: ../../docs/guides/redis-multi-replica.md
+
+models:
+  - { alias: chat-node-1, backend: fake, runtime_model_id: shared-model, pool: chat, supports_streaming: true }
+  - { alias: chat-node-2, backend: fake, runtime_model_id: shared-model, pool: chat, supports_streaming: true }
+  - { alias: chat-node-3, backend: fake, runtime_model_id: shared-model, pool: chat, supports_streaming: true }

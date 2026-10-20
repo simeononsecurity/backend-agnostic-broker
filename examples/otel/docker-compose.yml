@@ -1,0 +1,43 @@
+# OpenTelemetry tracing stack: the broker exports OTLP spans to an OpenTelemetry
+# Collector, which forwards them to Jaeger for viewing (ADR 0012). The broker
+# sets BROKER_TRACING_ENABLED=true; the exporter target is the standard
+# OTEL_EXPORTER_OTLP_ENDPOINT env var. Spans carry gen_ai.* metadata only — no
+# prompt/response content unless BROKER_TRACING_CAPTURE_CONTENT=true (opt-in).
+#
+# Guide: ../../docs/guides/observability.md
+
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    ports:
+      - "16686:16686"   # Jaeger UI
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.109.0
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    depends_on: [jaeger]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+
+  broker:
+    image: ghcr.io/simeononsecurity/backend-agnostic-broker:latest
+    depends_on: [otel-collector]
+    ports:
+      - "${BROKER_PORT:-8080}:8080"
+    environment:
+      BROKER_AUTH_ENABLED: "true"
+      BROKER_API_KEYS: '["YOUR_API_KEY"]'
+      BROKER_REGISTRY_PATH: "/config/registry.yaml"
+      BROKER_ENABLED_BACKENDS: '["fake"]'
+      BROKER_TRACING_ENABLED: "true"
+      BROKER_TRACING_SERVICE_NAME: "backend-agnostic-broker"
+      # Standard OTel env: send OTLP/HTTP to the collector service.
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
+    volumes:
+      - ./registry.example.yaml:/config/registry.yaml:ro
+    read_only: true
+    tmpfs: ["/tmp/broker", "/var/cache/broker"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    restart: unless-stopped

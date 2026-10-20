@@ -1,0 +1,38 @@
+# Ollama quickstart registry.
+#
+# Ships a dependency-free `fake` chat model so the example runs (and its test
+# passes) with no GPU, no download, and no daemon. Below it, a commented Ollama
+# entry shows the real production shape: the host comes from ${OLLAMA_BASE_URL}
+# so no real endpoint is ever committed. Copy this to registry.yaml (gitignored),
+# uncomment the Ollama entry, and add "ollama" to BROKER_ENABLED_BACKENDS.
+#
+# Full guide: ../../docs/guides/backends.md
+
+models:
+  # --- Runs offline: the fake echo backend (used by this example's test) ------
+  - alias: echo-fake
+    backend: fake
+    runtime_model_id: fake-echo-v1
+    context_limit: 8192
+    output_limit: 2048
+    idle_timeout_seconds: 60
+    supports_streaming: true
+    tags: [general, cheap, fast]
+    description: fake echo backend for local trials + CI
+
+  # --- Real Ollama model (uncomment for a real daemon) ------------------------
+  # Point OLLAMA_BASE_URL at a local or remote Ollama daemon in a gitignored .env;
+  # the registry only ever stores the ${OLLAMA_BASE_URL} placeholder.
+  # - alias: llama3
+  #   backend: ollama
+  #   runtime_model_id: llama3.1:8b          # must be pulled on the daemon
+  #   base_url: ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}
+  #   context_limit: 8192
+  #   output_limit: 2048
+  #   idle_timeout_seconds: 300
+  #   keep_alive: "5m"
+  #   supports_streaming: true
+  #   supports_tools: true
+  #   tags: [general, code, reasoning]
+  #   description: general-purpose 8B chat/code model
+  #   readiness: { kind: http, path: /api/tags, expect_status: 200 }
