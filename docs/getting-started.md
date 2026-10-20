@@ -40,7 +40,7 @@ git clone <YOUR_REPO_URL> backend-agnostic-broker
 cd backend-agnostic-broker
 make venv && make install        # creates .venv/ and installs runtime + dev deps
 .venv/bin/python -c "import broker; print('broker', broker.__version__)"
-# -> broker 0.5.0
+# -> broker 0.6.0
 ```
 
 ### 2. Write a tiny fake-only registry
