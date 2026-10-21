@@ -49,7 +49,14 @@ def argv_hash(argv: list[str] | None) -> str:
 
 @dataclass
 class RuntimeRecord:
-    """One spawned runtime. ``start_time`` is the durable identity anchor."""
+    """One spawned runtime. ``start_time`` is the durable identity anchor.
+
+    ``broker_pid`` / ``broker_start_time`` identify the broker process that
+    spawned (and therefore owns) this runtime. Reconcile uses them as a
+    per-record ownership gate: a record whose owning broker is still alive is
+    never signalled or adopted by a *different* broker — only an orphan whose
+    owner is dead may be acted on (ADR 0021, multi-replica safety).
+    """
 
     alias: str
     pid: int
@@ -60,6 +67,8 @@ class RuntimeRecord:
     broker_instance_id: str
     base_url: str | None = None
     spawned_at: float = 0.0
+    broker_pid: int | None = None
+    broker_start_time: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> RuntimeRecord:
@@ -73,6 +82,10 @@ class RuntimeRecord:
             broker_instance_id=str(d.get("broker_instance_id", "")),
             base_url=(str(d["base_url"]) if d.get("base_url") is not None else None),
             spawned_at=float(d.get("spawned_at", 0.0)),
+            broker_pid=(int(d["broker_pid"]) if d.get("broker_pid") is not None else None),
+            broker_start_time=(
+                str(d["broker_start_time"]) if d.get("broker_start_time") is not None else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -197,3 +210,108 @@ class RuntimeLedger:
             return
         with self._locked():
             self._write_raw([])
+
+
+@dataclass
+class LockOwner:
+    """The broker process that currently holds the ledger ownership lock."""
+
+    pid: int
+    start_time: str | None
+    instance_id: str
+    acquired_at: float = 0.0
+
+    @classmethod
+    def from_json(cls, data: bytes | str) -> LockOwner | None:
+        try:
+            d = json.loads(data or "{}")
+            if not isinstance(d, dict) or "pid" not in d:
+                return None
+            return cls(
+                pid=int(d["pid"]),
+                start_time=(str(d["start_time"]) if d.get("start_time") is not None else None),
+                instance_id=str(d.get("instance_id", "")),
+                acquired_at=float(d.get("acquired_at", 0.0)),
+            )
+        except (ValueError, TypeError):
+            return None
+
+
+class LedgerOwnerLock:
+    """Exclusive, broker-lifetime advisory lock on the runtime ledger (ADR 0021).
+
+    Only one *live* broker per ``BROKER_CACHE_DIR`` may own the ledger. Ownership
+    is a non-blocking ``flock(LOCK_EX | LOCK_NB)`` on a sidecar lock file held for
+    the broker's entire life (the fd stays open until clean shutdown). Because an
+    advisory ``flock`` is released by the kernel when the last fd referencing it
+    is closed — including on process death — a crashed owner's lock frees itself,
+    so a restart (or any stale lock) is taken over automatically with no manual
+    liveness check. The lock file's body records the owner's PID + start time +
+    instance id purely for diagnostics and the startup error message.
+    """
+
+    def __init__(self, path: str | None) -> None:
+        self.path = path
+        self._fd: int | None = None
+
+    def acquire(self, owner: LockOwner) -> LockOwner | None:
+        """Try to take the lock non-blocking.
+
+        Returns ``None`` on success (we now own it, fd held until
+        :meth:`release`). If a live sibling broker already holds it, returns that
+        owner (read from the lock file; a best-effort placeholder if unreadable).
+        """
+        if not self.path:
+            return None
+        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Held by another process. flock frees on owner death, so reaching
+            # here means that owner is alive. Read who it is for the message.
+            existing = self._read_owner(fd)
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            return existing or LockOwner(pid=-1, start_time=None, instance_id="")
+        except OSError:
+            # flock genuinely failed (e.g. filesystem doesn't support it). Don't
+            # misread this as contention; surface it to the caller to degrade.
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
+        # We hold it. Stamp our identity and keep the fd open for our lifetime.
+        try:
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, json.dumps(asdict(owner)).encode("utf-8"))
+            os.fsync(fd)
+        except OSError as exc:  # pragma: no cover - stamping is best-effort
+            log.warning("could not stamp ledger owner lock %r: %s", self.path, exc)
+        self._fd = fd
+        return None
+
+    def _read_owner(self, fd: int) -> LockOwner | None:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            data = os.read(fd, 65536)
+        except OSError:
+            return None
+        return LockOwner.from_json(data)
+
+    def release(self) -> None:
+        """Release the lock (clean shutdown). Idempotent."""
+        if self._fd is None:
+            return
+        fd, self._fd = self._fd, None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:  # pragma: no cover - best-effort
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    @property
+    def held(self) -> bool:
+        return self._fd is not None

@@ -50,6 +50,7 @@ import asyncio
 import itertools
 import json
 import logging
+import os
 import random
 import secrets
 import time
@@ -66,6 +67,7 @@ from .errors import (
     BackendUnavailableError,
     BrokerError,
     ConcurrencyLimitError,
+    ConfigError,
     ModelBusyError,
     ModelLoadError,
     ModelNotFoundError,
@@ -73,7 +75,7 @@ from .errors import (
     TimeoutError_,
     ValidationError,
 )
-from .ledger import RuntimeLedger, RuntimeRecord, argv_hash
+from .ledger import LedgerOwnerLock, LockOwner, RuntimeLedger, RuntimeRecord, argv_hash
 from .lifecycle import LifecycleMachine, State
 from .registry import ModelEntry, Registry, load_registry
 from .reliability import ErrorClass, RetryPolicy, classify_error, retry_after_seconds
@@ -173,6 +175,8 @@ class ManagedModel:
         settings: Settings,
         ledger: RuntimeLedger | None = None,
         broker_instance_id: str = "",
+        broker_pid: int | None = None,
+        broker_start_time: str | None = None,
     ) -> None:
         self.entry = entry
         self.settings = settings
@@ -186,6 +190,9 @@ class ManagedModel:
         # Runtime-identity / restart-reconciliation state (ADR 0021).
         self.ledger = ledger
         self.broker_instance_id = broker_instance_id
+        #: The owning broker process's identity, stamped onto each ledger record.
+        self.broker_pid = broker_pid if broker_pid is not None else os.getpid()
+        self.broker_start_time = broker_start_time
         #: Normalized process start time of the current runtime (identity anchor).
         self.process_start_time: str | None = None
         #: True when the current runtime was ADOPTED at startup, not spawned.
@@ -261,6 +268,8 @@ class ManagedModel:
             broker_instance_id=self.broker_instance_id,
             base_url=self.entry.base_url,
             spawned_at=time.time(),
+            broker_pid=self.broker_pid,
+            broker_start_time=self.broker_start_time,
         )
         try:
             self.ledger.upsert(record)
@@ -366,11 +375,28 @@ class ModelManager:
         # under cache_dir and records every broker-spawned runtime so a restart can
         # reconcile orphans; a unique instance id tags which broker spawned each.
         self.broker_instance_id = secrets.token_hex(8)
-        self.ledger = RuntimeLedger(self._ledger_path(settings))
+        # This broker process's own durable identity (PID + start time), stamped
+        # onto every ledger record and the ownership lock so reconcile can tell a
+        # dead owner's orphans from a live sibling's runtimes (ADR 0021).
+        self.broker_pid = os.getpid()
+        self.broker_start_time = rid.process_start_time(self.broker_pid)
+        self.ledger: RuntimeLedger | None = RuntimeLedger(self._ledger_path(settings))
+        #: Broker-lifetime exclusive lock enforcing one live broker per cache dir.
+        self._owner_lock = LedgerOwnerLock(self._owner_lock_path(settings))
+        #: Set when the ledger was disabled because a live sibling owns it; shown
+        #: in /status so an operator sees why reconciliation is inert here.
+        self.reconcile_disabled_reason: str | None = None
         #: Summary of the last startup reconciliation, surfaced in /status.
         self.last_reconciliation: dict[str, Any] = {}
         self.models: dict[str, ManagedModel] = {
-            e.alias: ManagedModel(e, settings, self.ledger, self.broker_instance_id)
+            e.alias: ManagedModel(
+                e,
+                settings,
+                self.ledger,
+                self.broker_instance_id,
+                self.broker_pid,
+                self.broker_start_time,
+            )
             for e in registry.models
         }
         # Public name -> ordered list of member ManagedModels (a pool).
@@ -429,6 +455,77 @@ class ModelManager:
     def _ledger_path(settings: Settings) -> str:
         """Host-local path of the runtime ledger under BROKER_CACHE_DIR."""
         return f"{settings.cache_dir.rstrip('/')}/runtime-ledger.json"
+
+    @staticmethod
+    def _owner_lock_path(settings: Settings) -> str:
+        """Path of the broker-lifetime ledger ownership lock, next to the ledger."""
+        return f"{settings.cache_dir.rstrip('/')}/runtime-ledger.owner.lock"
+
+    def acquire_ledger_ownership(self) -> None:
+        """Take the broker-lifetime ownership lock on the runtime ledger (ADR 0021).
+
+        Enforces one live broker per ``BROKER_CACHE_DIR``. Called once from the app
+        lifespan BEFORE :meth:`reconcile`. If a live sibling broker already owns the
+        ledger (e.g. two local brokers accidentally sharing the default cache dir):
+
+        * ``adopt`` / ``stop`` — refuse to start with a :class:`ConfigError` naming
+          the cache dir and the owner PID. The operator opted into signalling or
+          adopting runtimes, so acting on a sibling's runtimes is unsafe: fail
+          closed.
+        * ``report`` (default) / ``off`` — start normally but disable this
+          instance's ledger and reconciliation, emitting one WARNING and surfacing
+          ``reconciliation.disabled_reason`` in ``/status``. This preserves v0.6.0
+          compatibility: two brokers sharing a dir must keep starting.
+
+        A stale lock (previous owner dead) is taken over automatically — an
+        advisory ``flock`` frees when the owning fd closes, including on process
+        death — so no manual liveness check is needed here.
+        """
+        if self.ledger is None or not self.ledger.path:
+            return
+        owner = LockOwner(
+            pid=self.broker_pid,
+            start_time=self.broker_start_time,
+            instance_id=self.broker_instance_id,
+            acquired_at=time.time(),
+        )
+        try:
+            held_by = self._owner_lock.acquire(owner)
+        except OSError as exc:
+            # The lock file could not be created/locked (e.g. an unwritable cache
+            # dir, or a filesystem without flock). This is a local IO problem, not
+            # a sibling: degrade to no-ledger (as the ledger itself does on write
+            # failure) rather than failing startup — preserves v0.6.0 behavior.
+            reason = f"runtime ledger unavailable ({exc}); running without a ledger"
+            log.warning("%s", reason)
+            self._disable_ledger(reason)
+            return
+        if held_by is None:
+            return  # we own the ledger
+        mode = self.settings.runtime_reconcile
+        cache_dir = self.settings.cache_dir
+        if mode in ("adopt", "stop"):
+            raise ConfigError(
+                f"another broker (pid {held_by.pid}) already owns the runtime "
+                f"ledger under BROKER_CACHE_DIR {cache_dir!r}; refusing to start "
+                f"with BROKER_RUNTIME_RECONCILE={mode!r} because reconciliation "
+                f"would signal or adopt that live broker's runtimes",
+                remediation="give each broker its own BROKER_CACHE_DIR",
+            )
+        reason = (
+            f"another broker (pid {held_by.pid}) owns the runtime ledger under "
+            f"BROKER_CACHE_DIR {cache_dir!r}; this instance runs without a ledger "
+            f"(give each broker its own BROKER_CACHE_DIR)"
+        )
+        log.warning("runtime ledger ownership unavailable: %s", reason)
+        self._disable_ledger(reason)
+
+    def _disable_ledger(self, reason: str) -> None:
+        """Drop the ledger for this instance (no writes, no reconciliation)."""
+        self.reconcile_disabled_reason = reason
+        self.ledger = None
+        for m in self.models.values():
+            m.ledger = None
 
     async def reconcile(self) -> dict[str, Any]:
         """Reconcile ledgered runtimes at startup per BROKER_RUNTIME_RECONCILE.
@@ -1717,7 +1814,14 @@ class ModelManager:
         # 2. Build + validate new ManagedModels for added/changed BEFORE mutating.
         fresh: dict[str, ManagedModel] = {}
         for a in added + changed:
-            mm = ManagedModel(new_by[a], self.settings, self.ledger, self.broker_instance_id)
+            mm = ManagedModel(
+                new_by[a],
+                self.settings,
+                self.ledger,
+                self.broker_instance_id,
+                self.broker_pid,
+                self.broker_start_time,
+            )
             mm.adapter.validate_config()  # raises → propagates, nothing mutated yet
             fresh[a] = mm
 
@@ -1924,6 +2028,9 @@ class ModelManager:
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
         await asyncio.gather(*(m.stop() for m in self.models.values()), return_exceptions=True)
+        # Release the broker-lifetime ledger ownership lock (ADR 0021) so a
+        # restart on the same cache dir takes it over cleanly.
+        self._owner_lock.release()
         await self.state.close()
 
     # --- status ----------------------------------------------------------
@@ -1979,6 +2086,8 @@ class ModelManager:
             "router": self.router.status() if self.router else {"enabled": False},
             "reconciliation": {
                 "runtime_reconcile": self.settings.runtime_reconcile,
+                "ledger_owned": self._owner_lock.held,
+                "disabled_reason": self.reconcile_disabled_reason,
                 "last": self.last_reconciliation,
             },
             "pools": {

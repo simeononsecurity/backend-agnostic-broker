@@ -447,6 +447,17 @@ broker reconciles that ledger against the live process table. See
 | `BROKER_RUNTIME_RECONCILE` | str | `report` | Startup action for recorded runtimes: `off` (ignore the ledger), `report` (list still-alive, identity-matched runtimes as `orphaned` in `/status`; never signal/adopt — **default**, silent on a fresh/empty ledger), `adopt` (if alive with matching identity + argv + readiness, mark the model READY without spawning), or `stop` (`SIGTERM`→grace→`SIGKILL` the recorded process group, then clear). In **every** mode a PID whose recorded start time no longer matches is dropped as stale and never signalled; a process the broker did not record is never touched. |
 | `BROKER_RUNTIME_PORT_PRECHECK` | bool | `true` | Before spawning a broker-managed runtime, fail fast with a clear error if the target port (from the registry `base_url`) is already bound, instead of a confusing readiness timeout. Non-loading TCP connect probe only. |
 
+**One broker per `BROKER_CACHE_DIR`.** The ledger assumes a single owning broker.
+At startup each broker takes an exclusive, lifetime lock on
+`<cache_dir>/runtime-ledger.owner.lock`. If a *live* sibling broker already owns it
+(two brokers sharing a cache dir), `adopt`/`stop` **refuse to start** with a
+`ConfigError` naming the cache dir and owner PID (fail closed — they would act on
+the sibling's runtimes), while `report`/`off` **start without a ledger** (one
+warning; `reconciliation.disabled_reason` + `ledger_owned` in `/status`) to preserve
+v0.6.0 behavior. Reconciliation also skips any record whose owning broker is still
+alive (`owned_by_live_broker`). Give each replica its own `BROKER_CACHE_DIR` (or
+host). There is no setting for this — it is always on.
+
 ## Docker / networking
 
 | Env var | Type | Default | Description |

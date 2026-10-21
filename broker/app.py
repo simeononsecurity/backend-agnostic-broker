@@ -238,8 +238,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Reconcile any runtimes orphaned by a previous unclean exit BEFORE the
-        # sweeper/health loops start (ADR 0021). Never loads a model.
+        # Take the broker-lifetime ledger ownership lock, then reconcile any
+        # runtimes orphaned by a previous unclean exit, BEFORE the sweeper/health
+        # loops start (ADR 0021). Ownership enforces one live broker per cache dir:
+        # a live sibling makes adopt/stop refuse to start and report/off disable
+        # the ledger. Reconcile never loads a model.
+        manager.acquire_ledger_ownership()
         await manager.reconcile()
         await manager.start_sweeper()
         await manager.start_health_probe()

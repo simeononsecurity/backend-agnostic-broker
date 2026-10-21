@@ -78,8 +78,39 @@ records behind.
 The ledger is **per host**: local child processes can only be reconciled on the
 machine that spawned them, so (unlike the ADR 0009 routing state) it is never
 shared via Redis. Each replica writes its own ledger under its own
-`BROKER_CACHE_DIR` and reconciles only its own records. Give each replica a
-distinct cache dir (or a distinct host) so their ledgers never collide.
+`BROKER_CACHE_DIR` and reconciles only its own records. **Give each replica a
+distinct cache dir** (or a distinct host) so their ledgers never collide.
+
+This is enforced, not just advised. At startup each broker takes an exclusive,
+broker-lifetime lock on `<BROKER_CACHE_DIR>/runtime-ledger.owner.lock`. If a *live*
+sibling broker already owns it (two brokers accidentally pointed at the same cache
+dir):
+
+- `BROKER_RUNTIME_RECONCILE=adopt` or `stop` — the second broker **refuses to
+  start** with a clear `ConfigError` naming the cache dir and the owner PID. These
+  modes act on (adopt/reap) runtimes, so acting on a sibling's would be unsafe:
+  they fail closed. Fix: give that broker its own `BROKER_CACHE_DIR`.
+- `BROKER_RUNTIME_RECONCILE=report` (default) or `off` — the second broker **starts
+  normally but runs without a ledger** (no recording, no reconciliation), logging
+  one warning and showing `reconciliation.disabled_reason` in `/status`. This keeps
+  v0.6.0 compatibility so a shared dir never turns into a hard startup failure.
+
+As a second layer, every ledger record also records its owning broker's identity,
+and reconciliation acts only on records whose owner broker is **dead** — a record
+owned by a live broker is reported as `owned_by_live_broker` and never signalled or
+adopted. A stale lock left by a crashed owner is taken over automatically (the OS
+frees an advisory `flock` when the owning process dies).
+
+### Docker: reaping runtime grandchildren
+
+A runtime may itself fork helper processes (for example vLLM's worker processes).
+When the broker reaps a runtime it signals the **process group**, but in a
+container those grandchildren are only reliably reaped if PID 1 runs an init that
+forwards signals and reaps zombies. The broker image's exec-form entrypoint makes
+`python` PID 1, which handles the broker and its direct runtime children; for
+runtimes that spawn their own workers, run the container with an init —
+`docker run --init …` or Compose `init: true` — so no grandchild is left behind on
+stop/restart.
 
 ## Troubleshooting
 

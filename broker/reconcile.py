@@ -52,6 +52,7 @@ async def reconcile_runtimes(manager: ModelManager) -> dict[str, Any]:
         "stopped": [],
         "orphaned": [],
         "stale": [],
+        "owned_by_live_broker": [],
     }
     ledger = manager.ledger
     if mode == "off" or ledger is None:
@@ -65,20 +66,61 @@ async def reconcile_runtimes(manager: ModelManager) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 - one bad record never breaks startup
             log.warning("reconcile of runtime %r failed: %s", rec.alias, exc)
 
-    if summary["adopted"] or summary["stopped"] or summary["orphaned"] or summary["stale"]:
+    if (
+        summary["adopted"]
+        or summary["stopped"]
+        or summary["orphaned"]
+        or summary["stale"]
+        or summary["owned_by_live_broker"]
+    ):
         log.warning(
-            "runtime reconciliation (%s): %d adopted, %d stopped, %d orphaned, %d stale",
+            "runtime reconciliation (%s): %d adopted, %d stopped, %d orphaned, "
+            "%d stale, %d owned-by-live-broker",
             mode,
             len(summary["adopted"]),
             len(summary["stopped"]),
             len(summary["orphaned"]),
             len(summary["stale"]),
+            len(summary["owned_by_live_broker"]),
         )
     return summary
 
 
+def _owner_broker_alive(manager: ModelManager, rec) -> bool:
+    """True if the broker that spawned ``rec`` is a *different*, still-live broker.
+
+    The per-record ownership gate (ADR 0021): reconcile may act only on a record
+    whose owning broker is dead. A record whose owner is still alive belongs to a
+    live sibling (two brokers sharing a cache dir) and must never be signalled,
+    adopted, or dropped by us.
+
+    Returns ``False`` for a record this broker instance wrote itself, and for a
+    legacy record with no recorded owner identity — both fall through to the
+    normal runtime-identity gate, preserving single-broker behavior.
+    """
+    if rec.broker_instance_id and rec.broker_instance_id == manager.broker_instance_id:
+        return False
+    if rec.broker_pid is None:
+        return False
+    return rid.identity_matches(rec.broker_pid, rec.broker_start_time)
+
+
 async def _reconcile_one(manager: ModelManager, rec, mode: str, summary: dict[str, Any]) -> None:
-    # Identity gate FIRST: never act on a PID whose start time doesn't match.
+    # Ownership gate FIRST: never touch a record whose owning broker is still
+    # alive (a live sibling sharing this cache dir owns it). Defense in depth
+    # alongside the broker-lifetime ownership lock.
+    if _owner_broker_alive(manager, rec):
+        log.info(
+            "runtime record %r is owned by a live broker (pid=%s); leaving it alone",
+            rec.alias,
+            rec.broker_pid,
+        )
+        summary["owned_by_live_broker"].append(
+            {"alias": rec.alias, "pid": rec.pid, "broker_pid": rec.broker_pid}
+        )
+        return
+
+    # Identity gate: never act on a PID whose start time doesn't match.
     if not rid.identity_matches(rec.pid, rec.start_time):
         log.info(
             "runtime record %r (pid=%s) no longer matches its recorded identity; dropping it",

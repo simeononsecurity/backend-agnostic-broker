@@ -62,20 +62,48 @@ is the on-disk anchor.
 ### 2. Host-local runtime ledger (`broker/ledger.py`)
 
 One JSON record per spawned runtime — `alias, pid, pgid, start_time, port,
-argv_sha256, broker_instance_id, base_url, spawned_at` — in
-`<BROKER_CACHE_DIR>/runtime-ledger.json`. Writes reuse the proven `broker/keys.py`
-pattern: **atomic** (temp file + `fsync` + `os.replace`), **`0600`**, serialized by
-an advisory **`flock`** on a sidecar `.lock`. A torn/unparsable/unknown-version
-ledger reads as **empty with a warning** — the broker never signals anything on
-the strength of bad data (fail-safe). The record is written on a successful spawn
-and removed on a clean stop/unload. Only broker-managed runtimes (those with a
-`startup_command`) are ledgered — the fake backend and external daemons (Ollama)
-are not, so default/test behavior is unchanged.
+argv_sha256, broker_instance_id, base_url, spawned_at, broker_pid,
+broker_start_time` — in `<BROKER_CACHE_DIR>/runtime-ledger.json`. Writes reuse the
+proven `broker/keys.py` pattern: **atomic** (temp file + `fsync` + `os.replace`),
+**`0600`**, serialized by an advisory **`flock`** on a sidecar `.lock`. A
+torn/unparsable/unknown-version ledger reads as **empty with a warning** — the
+broker never signals anything on the strength of bad data (fail-safe). The record
+is written on a successful spawn and removed on a clean stop/unload. Only
+broker-managed runtimes (those with a `startup_command`) are ledgered — the fake
+backend and external daemons (Ollama) are not, so default/test behavior is
+unchanged. `broker_pid` / `broker_start_time` record the **owning broker's**
+identity (see Multi-replica below).
 
 **Multi-replica:** scope is intentionally per host. Local child processes cannot be
 reconciled from another machine, so Redis is **not** involved (unlike the ADR 0009
-routing state). Each replica writes a ledger under its own `BROKER_CACHE_DIR` and
-reconciles only its own records on its own host; this is documented in the guide.
+routing state). Each replica should write a ledger under its **own**
+`BROKER_CACHE_DIR` and reconciles only its own records on its own host. Because two
+local brokers accidentally sharing one cache dir is a realistic mistake — and a
+non-owner must never signal or adopt the owner's live runtimes — two mechanisms
+enforce single ownership (defense in depth), rather than relying on the convention
+alone:
+
+1. **Lifetime ownership lock.** At startup each broker takes an exclusive,
+   non-blocking `flock` on `<BROKER_CACHE_DIR>/runtime-ledger.owner.lock`, held for
+   the broker's whole life (the fd stays open until clean shutdown), stamping its
+   PID + start time + instance id into the file. If a live sibling already holds
+   it:
+   - `adopt` / `stop` — **refuse to start** with a `ConfigError` naming the cache
+     dir and the owner PID. The operator opted into signalling/adopting runtimes,
+     so acting on a sibling's is unsafe: fail closed.
+   - `report` (default) / `off` — **start normally but disable this instance's
+     ledger and reconciliation**, with one WARNING and a
+     `reconciliation.disabled_reason` in `/status`. This keeps v0.6.0 behavior: two
+     brokers sharing a dir must not start failing.
+   An advisory `flock` is released by the kernel when the owning fd closes —
+   including on process death — so a **stale lock** (previous owner crashed) is
+   taken over automatically, with no manual liveness check.
+2. **Per-record owner check.** Each record carries its owning broker's
+   `broker_pid` + `broker_start_time`. Reconcile acts only on a record whose owner
+   broker is **dead** (identity mismatch or gone); a record owned by a live broker
+   is listed as `owned_by_live_broker` and is never signalled, adopted, or dropped.
+   Legacy records with no recorded owner fall through to the normal
+   runtime-identity gate (single-broker behavior preserved).
 
 ### 3. Startup reconciliation (`BROKER_RUNTIME_RECONCILE`, `broker/reconcile.py`)
 
@@ -126,8 +154,10 @@ directly) with an explicit `STOPSIGNAL SIGTERM`; no init shim is needed.
 ### 6. `/status` surface
 
 Each model gains a `process` object `{pid, start_time, adopted}`, and a top-level
-`reconciliation` summary reports the configured mode and the last startup's
-adopted/stopped/orphaned/stale breakdown.
+`reconciliation` summary reports the configured mode, whether this instance owns the
+ledger (`ledger_owned`), a `disabled_reason` (set when a live sibling owns the
+ledger), and the last startup's adopted/stopped/orphaned/stale/`owned_by_live_broker`
+breakdown.
 
 ## Alternatives considered
 
@@ -158,6 +188,12 @@ adopted/stopped/orphaned/stale breakdown.
 - A new tiny state file lives under `BROKER_CACHE_DIR`; it holds no secrets (pids,
   ports, hashes only) and is `0600`. A corrupt ledger degrades to "no
   reconciliation" with a warning, never a crash and never a wrong kill.
+- Two brokers accidentally sharing one `BROKER_CACHE_DIR` can never cross-reconcile:
+  the lifetime ownership lock makes `adopt`/`stop` refuse to start and `report`/`off`
+  run ledger-less, and the per-record owner check means even a stray record is left
+  alone while its owner lives. The only new startup failure is this deliberate
+  `adopt`/`stop` refusal, with a remediation ("give each broker its own
+  `BROKER_CACHE_DIR`").
 - Default behavior is unchanged for v0.6.0 deployments (empty ledger + `report`);
   the fake backend and Ollama are never ledgered, so the existing suite is
   untouched.
@@ -180,5 +216,16 @@ Verified by the test suite (CPU-only, real processes, no GPU):
   pre-check** fails fast naming the port; argv-drift refuses adoption and lists it
   as a non-adoptable orphan; and `python -m broker` runs a graceful lifespan
   shutdown on `SIGTERM`.
+- `tests/test_ledger_ownership.py` — multi-replica safety: the `LedgerOwnerLock`
+  is exclusive and reports the current holder; `acquire_ledger_ownership` refuses to
+  start (`ConfigError` naming the cache dir + owner PID) under `adopt`/`stop` when a
+  live sibling owns the ledger, disables the ledger with a `disabled_reason` under
+  `report`/`off`, and takes over a stale (dead-owner) lock; the per-record owner
+  check leaves a record owned by a **live** broker untouched (listed as
+  `owned_by_live_broker`, real orphan survives) and acts only once that owner dies,
+  while a legacy record with no owner reconciles as before; and a committed
+  **scenario E** starts two real `python -m broker` processes on one cache dir — the
+  stop/adopt sibling refuses to start, the report sibling starts with its ledger
+  disabled, and broker A keeps serving throughout.
 - `tests/test_config.py` — the new settings are validated and present in both
   `.env.example` and `docs/configuration.md`.

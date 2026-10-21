@@ -26,6 +26,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   error naming the port instead of a confusing readiness timeout.
 - `GET /status` now carries a per-model `process` object `{pid, start_time,
   adopted}` and a top-level `reconciliation` summary of the last startup.
+- **Multi-replica ledger safety (ADR 0021).** A live broker that shares another
+  broker's `BROKER_CACHE_DIR` can never have its runtimes stopped or adopted. Each
+  broker takes an exclusive, lifetime `flock` on
+  `runtime-ledger.owner.lock`; if a live sibling holds it, `adopt`/`stop` refuse to
+  start (clear `ConfigError` naming the cache dir + owner PID — fail closed) and
+  `report`/`off` start without a ledger (one warning;
+  `reconciliation.disabled_reason` + `ledger_owned` in `/status`), preserving v0.6.0
+  behavior. As defense in depth every record now carries its owning broker's
+  identity, and reconciliation acts only on records whose owner broker is dead
+  (others are listed as `owned_by_live_broker`). A stale lock from a crashed owner
+  is taken over automatically.
 - New config: `BROKER_RUNTIME_RECONCILE`, `BROKER_RUNTIME_PORT_PRECHECK`
   (`docs/configuration.md`, `.env.example`). New guide
   `docs/guides/restart-and-recovery.md` and tested `examples/restart-recovery/`.
