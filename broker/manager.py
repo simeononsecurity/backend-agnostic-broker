@@ -51,11 +51,13 @@ import itertools
 import json
 import logging
 import random
+import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import runtime_identity as rid
 from .adapters import make_adapter
 from .cache_routing import CacheRouter
 from .config import Settings
@@ -71,6 +73,7 @@ from .errors import (
     TimeoutError_,
     ValidationError,
 )
+from .ledger import RuntimeLedger, RuntimeRecord, argv_hash
 from .lifecycle import LifecycleMachine, State
 from .registry import ModelEntry, Registry, load_registry
 from .reliability import ErrorClass, RetryPolicy, classify_error, retry_after_seconds
@@ -164,7 +167,13 @@ def _result_to_sse_chunks(result: dict, model: str) -> list[bytes]:
 
 
 class ManagedModel:
-    def __init__(self, entry: ModelEntry, settings: Settings) -> None:
+    def __init__(
+        self,
+        entry: ModelEntry,
+        settings: Settings,
+        ledger: RuntimeLedger | None = None,
+        broker_instance_id: str = "",
+    ) -> None:
         self.entry = entry
         self.settings = settings
         self.adapter = make_adapter(entry, settings)
@@ -174,6 +183,13 @@ class ManagedModel:
         # Routing / health state.
         self.public_name = entry.public_name
         self.healthy = True
+        # Runtime-identity / restart-reconciliation state (ADR 0021).
+        self.ledger = ledger
+        self.broker_instance_id = broker_instance_id
+        #: Normalized process start time of the current runtime (identity anchor).
+        self.process_start_time: str | None = None
+        #: True when the current runtime was ADOPTED at startup, not spawned.
+        self.adopted = False
         # Set True while an admin unload/reload is draining this member: selection
         # skips it so in-flight requests finish without new ones piling on.
         self.draining = False
@@ -203,6 +219,8 @@ class ManagedModel:
                 self.machine.to(State.READY)
                 self.machine.touch()
                 self.healthy = True
+                self.adopted = False
+                self._record_runtime(pid)
                 log.info("model %s ready (pid=%s)", self.entry.alias, pid)
             except Exception as exc:  # noqa: BLE001
                 self.machine.to(State.FAILED, error=str(exc))
@@ -222,6 +240,90 @@ class ManagedModel:
                     remediation="check runtime logs and registry startup_command",
                 ) from exc
 
+    def _record_runtime(self, pid: int | None) -> None:
+        """Persist a ledger record for a freshly-spawned broker-managed runtime.
+
+        No-op for backends that do not spawn a broker-owned process (no pid, no
+        startup_command, or no ledger configured) — e.g. the fake backend and
+        external daemons like Ollama, so default/test behavior is unchanged.
+        """
+        if self.ledger is None or pid is None or not self.entry.startup_command:
+            return
+        start_time = rid.process_start_time(pid)
+        self.process_start_time = start_time
+        record = RuntimeRecord(
+            alias=self.entry.alias,
+            pid=pid,
+            pgid=rid.pgid_of(pid),
+            start_time=start_time,
+            port=rid.port_from_url(self.entry.base_url),
+            argv_sha256=argv_hash(self.adapter.runtime_argv()),
+            broker_instance_id=self.broker_instance_id,
+            base_url=self.entry.base_url,
+            spawned_at=time.time(),
+        )
+        try:
+            self.ledger.upsert(record)
+        except Exception as exc:  # noqa: BLE001 - ledger failure must not break a load
+            log.warning("failed to record runtime %s in ledger: %s", self.entry.alias, exc)
+
+    def _forget_runtime(self) -> None:
+        """Drop this model's ledger record on a clean stop/unload."""
+        self.process_start_time = None
+        self.adopted = False
+        if self.ledger is None:
+            return
+        try:
+            self.ledger.remove(self.entry.alias)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("failed to remove runtime %s from ledger: %s", self.entry.alias, exc)
+
+    async def adopt(self, record: RuntimeRecord) -> bool:
+        """Adopt a recorded, still-alive orphaned runtime (ADR 0021, adopt mode).
+
+        Preconditions (ALL required, checked by the caller's identity gate plus
+        here): the process is alive with a matching start time, the registry argv
+        still matches the recorded hash (no drift), and the runtime's port answers
+        the readiness probe. On success the model is marked READY **without
+        spawning** and the ledger record is kept. Returns False (no adoption) if
+        any check fails — the caller then surfaces it as an orphan instead.
+        """
+        # Registry drift check: the current spawn argv must hash to the record.
+        planned = self.adapter.planned_argv()
+        if planned is None or argv_hash(planned) != record.argv_sha256:
+            log.info("cannot adopt %s: registry argv no longer matches record", self.entry.alias)
+            return False
+        # Probe readiness BEFORE taking ownership (the probe uses base_url, not the
+        # process handle), so a failed probe leaves no adopted state to unwind.
+        try:
+            health = await self.adapter.health()
+        except Exception as exc:  # noqa: BLE001
+            log.info("cannot adopt %s: readiness probe errored: %s", self.entry.alias, exc)
+            return False
+        if not health.healthy:
+            log.info("cannot adopt %s: port did not answer readiness probe", self.entry.alias)
+            return False
+        # Take ownership of the live process so a later stop() can terminate it.
+        self.adapter.mark_adopted(record.pid, record.pgid, record.start_time)
+        # Mark READY without spawning (UNLOADED -> LOADING -> READY).
+        if self.machine.state == State.FAILED:
+            self.machine.to(State.UNLOADED)
+        if self.machine.state == State.UNLOADED:
+            self.machine.to(State.LOADING)
+        self.machine.to(State.READY)
+        self.machine.pid = record.pid
+        self.machine.touch()
+        self.healthy = True
+        self.adopted = True
+        self.process_start_time = record.start_time
+        log.info(
+            "adopted orphaned runtime for model %s (pid=%s, port=%s)",
+            self.entry.alias,
+            record.pid,
+            record.port,
+        )
+        return True
+
     async def unload(self) -> None:
         if not self.machine.is_active():
             return
@@ -234,6 +336,7 @@ class ManagedModel:
             try:
                 await self.adapter.unload()
                 self.machine.to(State.UNLOADED)
+                self._forget_runtime()
                 log.info("model %s unloaded", self.entry.alias)
             except Exception as exc:  # noqa: BLE001
                 self.machine.to(State.FAILED, error=str(exc))
@@ -248,6 +351,7 @@ class ManagedModel:
             try:
                 await self.adapter.stop()
             finally:
+                self._forget_runtime()
                 try:
                     self.machine.to(State.UNLOADED)
                 except Exception:  # noqa: BLE001
@@ -258,8 +362,16 @@ class ModelManager:
     def __init__(self, registry: Registry, settings: Settings) -> None:
         self.settings = settings
         self.registry = registry
+        # Runtime ledger + this broker's instance id (ADR 0021). The ledger lives
+        # under cache_dir and records every broker-spawned runtime so a restart can
+        # reconcile orphans; a unique instance id tags which broker spawned each.
+        self.broker_instance_id = secrets.token_hex(8)
+        self.ledger = RuntimeLedger(self._ledger_path(settings))
+        #: Summary of the last startup reconciliation, surfaced in /status.
+        self.last_reconciliation: dict[str, Any] = {}
         self.models: dict[str, ManagedModel] = {
-            e.alias: ManagedModel(e, settings) for e in registry.models
+            e.alias: ManagedModel(e, settings, self.ledger, self.broker_instance_id)
+            for e in registry.models
         }
         # Public name -> ordered list of member ManagedModels (a pool).
         self.pools: dict[str, list[ManagedModel]] = {}
@@ -311,6 +423,24 @@ class ModelManager:
         """Validate every adapter config at startup (no model loads)."""
         for m in self.models.values():
             m.adapter.validate_config()
+
+    # --- runtime ledger / reconciliation (ADR 0021) ----------------------
+    @staticmethod
+    def _ledger_path(settings: Settings) -> str:
+        """Host-local path of the runtime ledger under BROKER_CACHE_DIR."""
+        return f"{settings.cache_dir.rstrip('/')}/runtime-ledger.json"
+
+    async def reconcile(self) -> dict[str, Any]:
+        """Reconcile ledgered runtimes at startup per BROKER_RUNTIME_RECONCILE.
+
+        Called once from the app lifespan BEFORE the sweeper/health loops start.
+        Never loads a model (adoption marks an already-live runtime READY without
+        spawning). The result is stored for /status.
+        """
+        from .reconcile import reconcile_runtimes
+
+        self.last_reconciliation = await reconcile_runtimes(self)
+        return self.last_reconciliation
 
     def get(self, alias: str) -> ManagedModel:
         m = self.models.get(alias)
@@ -1587,7 +1717,7 @@ class ModelManager:
         # 2. Build + validate new ManagedModels for added/changed BEFORE mutating.
         fresh: dict[str, ManagedModel] = {}
         for a in added + changed:
-            mm = ManagedModel(new_by[a], self.settings)
+            mm = ManagedModel(new_by[a], self.settings, self.ledger, self.broker_instance_id)
             mm.adapter.validate_config()  # raises → propagates, nothing mutated yet
             fresh[a] = mm
 
@@ -1806,6 +1936,12 @@ class ModelManager:
             snap["backend"] = m.adapter.name
             snap["healthy"] = m.healthy
             snap["last_health"] = m.last_health
+            # Per-model runtime process identity (ADR 0021).
+            snap["process"] = {
+                "pid": m.machine.pid,
+                "start_time": m.process_start_time,
+                "adopted": m.adopted,
+            }
             if cooldowns_on:
                 cd_dict = (await self.state.get_cooldown(m.entry.alias)).to_dict()
                 if self.settings.cooldown_half_open_single_trial:
@@ -1841,6 +1977,10 @@ class ModelManager:
             ),
             "tracing_enabled": self.tracer.enabled,
             "router": self.router.status() if self.router else {"enabled": False},
+            "reconciliation": {
+                "runtime_reconcile": self.settings.runtime_reconcile,
+                "last": self.last_reconciliation,
+            },
             "pools": {
                 name: [mm.entry.alias for mm in members] for name, members in self.pools.items()
             },

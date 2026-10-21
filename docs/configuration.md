@@ -431,6 +431,22 @@ in browser memory only — never `localStorage`/`sessionStorage`/cookies); it ad
 | `BROKER_USAGE_LOG_ENABLED` | bool | `true` | Record per-request usage to the SQLite usage log (metadata + token counts only; see `/usage`). |
 | `BROKER_USAGE_LOG_PATH` | str? | `<cache_dir>/usage.sqlite3` | Usage-log path; `:memory:` for ephemeral. Self-disables if unwritable. |
 
+## Runtime identity & restart reconciliation (ADR 0021)
+
+The broker records every runtime it spawns (vLLM / llama.cpp / Strata) in a
+small, **host-local** ledger under `BROKER_CACHE_DIR`
+(`<cache_dir>/runtime-ledger.json`, `0600`, atomic + flock). Identity is
+**PID + process start time** plus the process-group id and an argv hash — never a
+bare PID — so a recycled PID is never mistaken for one of ours. On startup the
+broker reconciles that ledger against the live process table. See
+[`guides/restart-and-recovery.md`](guides/restart-and-recovery.md) and
+[ADR 0021](adr/0021-runtime-identity-and-restart-reconciliation.md).
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_RUNTIME_RECONCILE` | str | `report` | Startup action for recorded runtimes: `off` (ignore the ledger), `report` (list still-alive, identity-matched runtimes as `orphaned` in `/status`; never signal/adopt — **default**, silent on a fresh/empty ledger), `adopt` (if alive with matching identity + argv + readiness, mark the model READY without spawning), or `stop` (`SIGTERM`→grace→`SIGKILL` the recorded process group, then clear). In **every** mode a PID whose recorded start time no longer matches is dropped as stale and never signalled; a process the broker did not record is never touched. |
+| `BROKER_RUNTIME_PORT_PRECHECK` | bool | `true` | Before spawning a broker-managed runtime, fail fast with a clear error if the target port (from the registry `base_url`) is already bound, instead of a confusing readiness timeout. Non-loading TCP connect probe only. |
+
 ## Docker / networking
 
 | Env var | Type | Default | Description |

@@ -238,6 +238,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Reconcile any runtimes orphaned by a previous unclean exit BEFORE the
+        # sweeper/health loops start (ADR 0021). Never loads a model.
+        await manager.reconcile()
         await manager.start_sweeper()
         await manager.start_health_probe()
         log.info(

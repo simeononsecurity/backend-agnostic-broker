@@ -93,6 +93,32 @@ All opt-in; defaults reproduce v0.5.0. Read live state from `GET /status`
   deadline — so even `BROKER_REQUEST_TIMEOUT_SECONDS=0` can't stall unbounded.
 - See the runnable [`examples/reliability/`](../examples/reliability/) demo.
 
+## Crash recovery: orphaned runtimes (ADR 0021)
+
+Broker-managed runtimes (vLLM / llama.cpp / Strata) run in their own
+session/process-group, so an **unclean** broker exit (`SIGKILL`, OOM-kill, crash,
+container restart) leaves them running, holding VRAM and their port. The broker
+records every runtime it spawns in `<BROKER_CACHE_DIR>/runtime-ledger.json` and
+reconciles it on the next startup.
+
+- Inspect what the restarted broker found:
+  ```bash
+  curl -s localhost:8080/status | jq '.reconciliation, .models[].process'
+  ```
+  `.reconciliation.last` has `adopted` / `stopped` / `orphaned` / `stale`;
+  `.models[].process` is `{pid, start_time, adopted}`.
+- Choose the startup action with `BROKER_RUNTIME_RECONCILE`:
+  - `report` (default) — orphans are listed; decide manually.
+  - `adopt` — reuse a still-healthy survivor without reloading (saves a cold
+    start / avoids a second copy OOM).
+  - `stop` — reap survivors (`SIGTERM`→grace→`SIGKILL`), then load fresh.
+- The broker **never** signals a PID whose recorded start time no longer matches
+  (PID reuse is dropped as stale), and never touches a process it did not record.
+- A **clean** stop (`SIGTERM` / `docker stop`) stops runtimes and clears the
+  ledger, so there is nothing to reconcile on the next start.
+- Reconciliation is **per host**: give each replica its own `BROKER_CACHE_DIR`.
+- Full procedure: [`guides/restart-and-recovery.md`](guides/restart-and-recovery.md).
+
 ## Multi-replica / shared state (ADR 0009)
 
 By default each broker keeps routing state (sticky map, cooldowns, counters)

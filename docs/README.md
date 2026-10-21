@@ -20,6 +20,7 @@ task-oriented **how-to guides**, exhaustive **reference**, and **explanation**
 [response cache](guides/response-cache.md) · [admin API](guides/admin-api.md) ·
 [web UI](guides/web-ui.md) · [observability](guides/observability.md) ·
 [embeddings & rerank](guides/embeddings-and-rerank.md) ·
+[restart & recovery](guides/restart-and-recovery.md) ·
 [production deployment](guides/production-deployment.md) ·
 [upgrading](guides/upgrading.md)
 

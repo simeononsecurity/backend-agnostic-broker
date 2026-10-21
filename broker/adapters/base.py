@@ -155,6 +155,34 @@ class BackendAdapter(abc.ABC):
     async def collect_status(self) -> dict[str, Any]:
         """Return a status dict (pid, gpu allocation, endpoint, etc.)."""
 
+    # --- runtime identity / adoption (ADR 0021) --------------------------
+    def runtime_argv(self) -> list[str] | None:
+        """The exact argv of the last spawned runtime, or None if not managed.
+
+        Used by the runtime ledger to hash a spawned runtime's command. Backends
+        that do not spawn a broker-owned process (external daemons, in-process
+        fakes) return None.
+        """
+        return None
+
+    def planned_argv(self) -> list[str] | None:
+        """The argv this entry WOULD spawn, computed without starting anything.
+
+        Used at reconciliation time to confirm a recorded runtime still matches
+        the current registry (argv hash) before adopting it. Returns None for
+        backends that do not spawn a broker-owned process.
+        """
+        return None
+
+    def mark_adopted(self, pid: int, pgid: int | None, start_time: str | None) -> None:
+        """Record that ``pid`` is an adopted (pre-existing) runtime for this model.
+
+        The default is a no-op: only broker-managed HTTP runtimes support
+        adoption. An adopted runtime has no :class:`asyncio.subprocess.Process`
+        handle, so :meth:`stop` must terminate it by its process group instead.
+        """
+        return None
+
     # --- load signal (optional; cache-aware routing, ADR 0010) -----------
     async def collect_load(self) -> float | None:
         """Return a real load signal for routing, or None when unavailable.

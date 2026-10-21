@@ -26,6 +26,7 @@ no external daemon**, then swap in real backends for production.
 | [otel](otel/) | OpenTelemetry tracing → Collector → Jaeger | [observability](../docs/guides/observability.md) |
 | [rerank](rerank/) | The `/v1/rerank` endpoint | [embeddings-and-rerank](../docs/guides/embeddings-and-rerank.md) |
 | [rag-pipeline](rag-pipeline/) | embed → retrieve → rerank → chat | [embeddings-and-rerank](../docs/guides/embeddings-and-rerank.md) |
+| [restart-recovery](restart-recovery/) | Runtime ledger + restart reconciliation (adopt/stop/report) | [restart-and-recovery](../docs/guides/restart-and-recovery.md) |
 
 ## How these are tested
 

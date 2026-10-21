@@ -22,6 +22,7 @@ then come back here for the feature you need.
 | [web-ui](web-ui.md) | The optional `/ui` playground | [web-ui](../../examples/web-ui/) |
 | [observability](observability.md) | OTel tracing, usage log, `/status`, `/metrics` | [otel](../../examples/otel/) |
 | [embeddings-and-rerank](embeddings-and-rerank.md) | `/v1/embeddings`, `/v1/rerank`, RAG | [rag-pipeline](../../examples/rag-pipeline/) |
+| [restart-and-recovery](restart-and-recovery.md) | Runtime ledger + restart reconciliation (adopt/stop/report) | [restart-recovery](../../examples/restart-recovery/) |
 | [production-deployment](production-deployment.md) | Docker, reverse proxy/TLS, non-root, security checklist | [docker-compose.yml](../../docker-compose.yml) |
 | [upgrading](upgrading.md) | Upgrading from 0.4 / 0.5 (what's opt-in) | — |
 

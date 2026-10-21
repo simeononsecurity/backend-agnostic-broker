@@ -31,6 +31,12 @@ from ..errors import (
     UpstreamHTTPError,
 )
 from ..proc import ProcessSupervisor
+from ..runtime_identity import (
+    host_from_url,
+    port_from_url,
+    port_in_use,
+    terminate_process_group,
+)
 from ..security import (
     build_argv,
     validate_executable,
@@ -129,6 +135,11 @@ class HTTPBackendAdapter(BackendAdapter):
         self._supervisor: ProcessSupervisor | None = None
         self._client: httpx.AsyncClient | None = None
         self._inflight: dict[str, asyncio.Event] = {}
+        #: The exact argv of the currently-spawned runtime (for the ledger hash).
+        self._last_argv: list[str] | None = None
+        #: Set when this model's runtime was ADOPTED (a pre-existing orphan the
+        #: broker reconciled into READY, not spawned): (pid, pgid, start_time).
+        self._adopted: tuple[int, int | None, str | None] | None = None
 
     # --- helpers ---------------------------------------------------------
     def _base_url(self) -> str:
@@ -231,7 +242,10 @@ class HTTPBackendAdapter(BackendAdapter):
         if not self.entry.startup_command:
             # External server manages its own lifetime (e.g. a shared daemon).
             return None
+        self._port_precheck()
         argv = self._build_startup_argv()
+        self._last_argv = list(argv)
+        self._adopted = None
         self._supervisor = ProcessSupervisor(
             argv,
             env=self._process_env(),
@@ -239,6 +253,31 @@ class HTTPBackendAdapter(BackendAdapter):
             backend=self.name,
         )
         return await self._supervisor.start()
+
+    def _port_precheck(self) -> None:
+        """Fail fast if the runtime's target port is already bound (ADR 0021).
+
+        Without this, a leftover orphan holding the port turns into a confusing
+        readiness-probe timeout; here the error names the exact port. Non-loading
+        (a plain TCP connect probe) and opt-outable via BROKER_RUNTIME_PORT_PRECHECK.
+        """
+        if not self.settings.runtime_port_precheck:
+            return
+        port = port_from_url(self.entry.base_url)
+        host = host_from_url(self.entry.base_url) or "127.0.0.1"
+        if port is None:
+            return
+        if port_in_use(host, port):
+            raise ModelLoadError(
+                f"port {port} is already in use before starting runtime {self.entry.alias!r}",
+                backend=self.name,
+                model=self.entry.alias,
+                remediation=(
+                    "another process (possibly an orphaned runtime) holds the port; "
+                    "free it, or set BROKER_RUNTIME_RECONCILE=stop/adopt to reconcile "
+                    "recorded runtimes, or BROKER_RUNTIME_PORT_PRECHECK=false to skip"
+                ),
+            )
 
     async def wait_until_ready(self, timeout: float) -> None:
         probe = self.entry.readiness
@@ -291,12 +330,39 @@ class HTTPBackendAdapter(BackendAdapter):
         await self.stop()
 
     async def stop(self) -> None:
+        if self._adopted is not None:
+            # An adopted runtime has no Process handle; terminate it by its
+            # process group, identity-gated so we never signal a reused PID.
+            pid, pgid, start_time = self._adopted
+            terminate_process_group(
+                pid, pgid, start_time, grace=self.settings.shutdown_timeout_seconds
+            )
+            self._adopted = None
         if self._supervisor:
             await self._supervisor.stop(grace=self.settings.shutdown_timeout_seconds)
             self._supervisor = None
+        self._last_argv = None
         if self._client:
             await self._client.aclose()
             self._client = None
+
+    # --- runtime identity / adoption (ADR 0021) --------------------------
+    def runtime_argv(self) -> list[str] | None:
+        return list(self._last_argv) if self._last_argv else None
+
+    def planned_argv(self) -> list[str] | None:
+        """Compute this entry's spawn argv WITHOUT starting anything (reconcile)."""
+        if not self.entry.startup_command:
+            return None
+        try:
+            return self._build_startup_argv()
+        except Exception:  # noqa: BLE001 - a config error here just means "can't adopt"
+            return None
+
+    def mark_adopted(self, pid: int, pgid: int | None, start_time: str | None) -> None:
+        self._adopted = (pid, pgid, start_time)
+        self._supervisor = None
+        self._last_argv = self.planned_argv()
 
     # --- inference -------------------------------------------------------
     def _request_body(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -522,12 +588,14 @@ class HTTPBackendAdapter(BackendAdapter):
             return None
 
     async def collect_status(self) -> dict[str, Any]:
+        adopted_pid = self._adopted[0] if self._adopted else None
         return {
             "backend": self.name,
             "alias": self.entry.alias,
             "base_url": self.entry.base_url,
-            "pid": self._supervisor.pid if self._supervisor else None,
+            "pid": (self._supervisor.pid if self._supervisor else adopted_pid),
             "process_running": self._supervisor.is_running() if self._supervisor else None,
+            "adopted": self._adopted is not None,
             "gpu": {
                 "device_ids": self.entry.gpu.device_ids,
                 "tensor_split": self.entry.gpu.tensor_split,
