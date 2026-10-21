@@ -63,6 +63,53 @@ These are standard Ollama behaviors; confirm against your installed version.
   `OLLAMA_KEEP_ALIVE`, `OLLAMA_MAX_LOADED_MODELS`), documented rather than
   managed by the broker.
 
+## Context window / long-context truncation (server-side, not the broker)
+
+**Symptom.** A long-context request returns `usage.prompt_tokens` pinned at a
+fixed value (e.g. `16386` = `16384` + chat-template tokens) for *both* a ~45k-
+and a ~100k-token prompt: the prompt is silently truncated and any fact past the
+cap (the "needle") is dropped.
+
+**Root cause — Ollama server config, not the broker.** The broker forwards chat
+requests to Ollama's **OpenAI-compatible** `POST /v1/chat/completions`. That
+protocol has **no context-window field**: `num_ctx` is not an OpenAI parameter,
+so neither the broker nor any OpenAI client can set the context length on that
+path. The effective context window is governed entirely on the Ollama daemon by:
+
+1. the per-model **Modelfile `num_ctx`** (`PARAMETER num_ctx <N>`), and/or
+2. the daemon default **`OLLAMA_CONTEXT_LENGTH`** (older Ollama defaulted to
+   `2048`/`4096`).
+
+The broker passes any client-supplied `options`/`num_ctx` through **unchanged**
+(it only pins `model`; see the regression test
+`tests/test_ollama_ctx_passthrough.py`), but Ollama ignores `num_ctx` on the
+OpenAI-compat endpoint, so the cap is applied upstream regardless of the broker.
+
+**Proof it is broker-independent.** Driving the *same* Ollama daemon directly
+(bypassing the broker entirely) truncates identically and **per model** — e.g.
+`gemma3:27b` → `4099`, `gemma3:12b` → `4099`, `phi4:latest` → `8194`, while
+models with a larger configured context return the full count
+(`qwen2.5:14b-instruct` → `21707`). Different caps per model ⇒ the cap is each
+model's Modelfile `num_ctx`, not anything the broker does.
+
+**Fix (on the Ollama host — no broker change needed).** Either:
+
+- Raise the daemon default so new loads get more context:
+  set `OLLAMA_CONTEXT_LENGTH=131072` (or the model's native max) in the Ollama
+  service environment and **restart the daemon** (`systemctl restart ollama`,
+  or restart `ollama serve`); or
+- Pin it per model via a Modelfile so it is independent of the daemon default:
+  ```
+  FROM gemma3:27b
+  PARAMETER num_ctx 131072
+  ```
+  then `ollama create gemma3-27b-128k -f Modelfile` and point the registry
+  `runtime_model_id` at the new tag.
+
+Larger `num_ctx` costs proportionally more KV-cache VRAM; size it to the GPU.
+Verify the fix by re-sending a >16k-token prompt and confirming
+`usage.prompt_tokens` now reflects the full prompt.
+
 ## Known limitations
 
 - The broker does not manage the Ollama daemon's own GPU placement or process

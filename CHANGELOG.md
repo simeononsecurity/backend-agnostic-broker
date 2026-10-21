@@ -140,6 +140,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Default behavior is byte-for-byte v0.6.0: with `BROKER_GPU_TELEMETRY=off` (the
   default), no `memory_mib`/budget, `BROKER_QUEUE_ENABLED` unset, and the runtime
   ledger (ADR 0021) in `report` mode, nothing new runs.
+- Ollama long-context truncation (`prompt_tokens` capped near 16k) is a server-side
+  setting, not a broker bug: the broker forwards `options.num_ctx` unchanged, but
+  Ollama's OpenAI-compatible endpoint ignores it. Raise `OLLAMA_CONTEXT_LENGTH` or the
+  model's Modelfile `num_ctx` on the Ollama host. See `docs/backends/ollama.md`
+  ("Context window"); pinned by `tests/test_ollama_ctx_passthrough.py`.
 
 ## [0.6.0] - 2026-10-19
 
