@@ -121,6 +121,15 @@ auto/cascade — `/v1/embeddings` and `/v1/rerank`):
    - **Count limit** (v0.6.0): the LRU idle model is unloaded if
      `max_loaded_models` is reached (raises `ConcurrencyLimitError` if nothing can
      be evicted).
+   - **Port pre-check + ledger record, then spawn** (ADR 0021): before starting a
+     broker-managed runtime, `_port_precheck` fails fast (naming the port) if the
+     target port is already bound (`BROKER_RUNTIME_PORT_PRECHECK`, default on); after
+     a successful spawn, `ensure_ready` writes a durable ledger record
+     (PID + start-time identity) for restart reconciliation. A model that is
+     **adopted** (reused from a still-healthy orphan in `adopt` mode) is marked
+     `ready` **without spawning** and therefore counts toward both the
+     `max_loaded_models` limit and the ADR 0022 memory accounting, and is evictable
+     like any other resident — see the ADR 0021 section below.
    - `ensure_ready()` starts + readies the model **exactly once** under an
      `asyncio.Lock` (`load_lock`). A previously `failed` model is reset to
      `unloaded` and retried.
@@ -194,6 +203,29 @@ loops, never loading a model) the broker reconciles the ledger per
 runtime and clears the ledger. The scope is per host (local processes), so the
 ledger is never shared via Redis. See `docs/guides/restart-and-recovery.md`.
 
+**Ownership lock.** Because the ledger is host-local, two brokers that accidentally
+share a `BROKER_CACHE_DIR` could otherwise stop or adopt each other's live
+runtimes. Each broker therefore takes a broker-lifetime exclusive `flock` on
+`runtime-ledger.owner.lock`: `adopt`/`stop` **refuse to start** (a `ConfigError`
+naming the cache dir + owner PID) while a live sibling holds it, and `report`/`off`
+start with the ledger disabled (`reconciliation.disabled_reason` + `ledger_owned`
+in `/status`), preserving v0.6.0 behavior. A stale lock (owner dead) is taken over.
+As defense in depth every record carries its owning broker's identity, and
+reconciliation only ever acts on records whose owner is dead — a live sibling's
+record is listed as `owned_by_live_broker` and never signalled, adopted, or
+dropped.
+
+**Adopted runtimes are broker-owned.** A model adopted in `adopt` mode transitions
+`unloaded → ready` **without a spawn**, so it is a resident exactly like a spawned
+one: it counts toward `max_loaded_models` (the `loaded_count`), it contributes its
+declared `memory_mib` to the ADR 0022 memory accounting (and is a valid LRU
+eviction victim), and — when telemetry is on — its device memory is attributed by
+PID in the `resources` block like any other holder. Its provenance is visible in
+`/status` as `models[].process.adopted = true` and in the last startup's
+`reconciliation.last` summary (`adopted` list, alongside `stopped`, `orphaned`,
+`stale`, and `owned_by_live_broker`). A model reported (not adopted) by a sibling
+broker in `report` mode is **not** counted by that broker at all.
+
 ## Security boundaries
 
 Every externally-influenced value crosses a boundary in `broker/security.py`:
@@ -206,14 +238,22 @@ link-local/metadata addresses. See `docs/security-model.md` and
 
 ## Observability
 
-- `GET /status` — per-model lifecycle snapshot (state, inflight, pid, idle
-  seconds, last error, live `healthy`/`last_health`, and `cooldown` when enabled)
-  plus adapter status (endpoint, GPU allocation), the `pools` map,
+- `GET /status` — a single response composing the whole runtime view. Per-model:
+  the lifecycle snapshot (state, inflight, idle seconds, last error, live
+  `healthy`/`last_health`), a `process` object `{pid, start_time, adopted}`
+  (ADR 0021), `cooldown` when enabled, and the adapter status (endpoint, GPU
+  allocation). Top-level: `loaded_count`/`max_loaded_models`, the `pools` map,
   `route_strategy` / `sticky_sessions`, `state_backend` (`in_process`|`redis`),
   `retry_max_attempts`, `cooldowns_enabled`, a `reliability` block (ejection cap,
   cooldown growth, half-open, Retry-After, Redis sticky bound — ADR 0017),
-  `tracing_enabled`, and a `response_cache` stats block (ADR 0012).
-- `GET /healthz/backends` — live, non-loading per-backend liveness (`ok`/`degraded`), with per-member `cooldown`.
+  `tracing_enabled`, a `response_cache` stats block (ADR 0012), a `resources`
+  block (ADR 0020/0022: measured devices + per-PID holders, declared admission
+  budgets + recent decisions, `release_stuck`, and Ollama memory labeled
+  `reported`), a `reconciliation` block (ADR 0021: mode, `ledger_owned`,
+  `disabled_reason`, and the last startup's adopted/stopped/orphaned/stale/
+  `owned_by_live_broker` summary), and a `queue` block (ADR 0023: depth, per-key
+  waiters, triggers, and served/shed counts).
+- `GET /healthz/backends` — live, non-loading per-backend liveness (`ok`/`degraded`), with per-member `cooldown`, and the same `resources` block as `/status`.
 - `GET /api/ps` — Ollama residency passthrough (what is actually in memory).
 - `GET /metrics` — Prometheus exposition (when `metrics_enabled`).
 - **OpenTelemetry tracing** (ADR 0012, opt-in `tracing_enabled` + the `otel`
