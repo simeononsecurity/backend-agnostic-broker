@@ -174,6 +174,37 @@ def test_rerank_max_documents_must_be_positive(settings):
         settings.validate_runtime()
 
 
+# --- Resource telemetry + admission (ADR 0020 / 0022) -------------------
+def test_gpu_telemetry_defaults_off_and_validates(settings):
+    assert settings.gpu_telemetry == "off"
+    settings.validate_runtime()  # default is valid
+
+
+def test_gpu_telemetry_invalid_rejected(fake_registry_file):
+    with pytest.raises(ValueError):
+        Settings(gpu_telemetry="rocm", registry_path=str(fake_registry_file))
+
+
+def test_budget_single_int_applies_to_every_device(settings):
+    settings.gpu_memory_budget_mib = "40000"
+    assert settings.budget_for_device("0") == 40000
+    assert settings.budget_for_device("default") == 40000
+
+
+def test_budget_per_device_map(settings):
+    settings.gpu_memory_budget_mib = "0=24000,1=48000,default=16000"
+    assert settings.budget_for_device("0") == 24000
+    assert settings.budget_for_device("1") == 48000
+    assert settings.budget_for_device("2") is None  # no "*" fallback
+    assert settings.budget_for_device("default") == 16000
+
+
+def test_relative_tool_path_rejected(settings):
+    settings.gpu_telemetry_nvidia_smi_path = "nvidia-smi"
+    with pytest.raises(ConfigError):
+        settings.validate_runtime()
+
+
 # --- Config/env/docs completeness (integration gate) --------------------
 #
 # Every BROKER_* setting must be discoverable by an operator: it must appear in

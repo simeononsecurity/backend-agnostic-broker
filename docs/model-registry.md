@@ -50,6 +50,7 @@ and toggle backends via config. Duplicate aliases are rejected.
 | `priority` | int | `0` | Auto-router tie-break preference (higher = preferred). |
 | `cost_tier` | int | `2` | Relative cost/size `1`(cheapest)..`5`(most expensive); the router prefers the cheapest capable model. |
 | `placement` | list[str] | `[]` | Data-residency labels (e.g. `local`, `trusted`, `region:eu`). A request carrying a placement requirement is only served by models/pool members that carry **all** required labels; otherwise `403 placement_denied` (fail-closed). See [auto-router.md](auto-router.md). |
+| `memory_mib` | int? | _(none)_ | Declared resident footprint in MiB for memory-aware admission (ADR 0022, opt-in). When set, a load is admitted only if it fits the device budget — measured free memory when `BROKER_GPU_TELEMETRY` is on, else the declared `BROKER_GPU_MEMORY_BUDGET_MIB` — evicting idle models on the same device(s) first, else `429 capacity_unavailable`. The device(s) come from `gpu.device_ids` (else a shared `default` bucket). Unset ⇒ v0.6.0 count-only behavior. See [gpu-memory.md](guides/gpu-memory.md). |
 
 ### `router` (top-level, optional)
 

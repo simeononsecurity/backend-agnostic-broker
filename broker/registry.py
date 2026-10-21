@@ -142,6 +142,15 @@ class ModelEntry(BaseModel):
     gpu: GPURequirements = Field(default_factory=GPURequirements)
     mtp: MTPConfig = Field(default_factory=MTPConfig)
 
+    # Memory-aware admission (ADR 0022, opt-in). Declared resident footprint of
+    # this model in MiB. When set, the broker admits a load only if it fits the
+    # device budget (measured free memory when BROKER_GPU_TELEMETRY is on, else
+    # the declared BROKER_GPU_MEMORY_BUDGET_MIB), evicting idle models on the same
+    # device(s) first. Unset => the model keeps v0.6.0 count-only behavior. The
+    # device(s) accounted against come from ``gpu.device_ids`` (else a shared
+    # default bucket / the host pool).
+    memory_mib: int | None = None
+
     # Broker-managed process controls.
     base_url: str | None = None  # where the runtime serves (http backends)
     startup_command: list[str] = Field(default_factory=list)  # argv template
@@ -196,6 +205,13 @@ class ModelEntry(BaseModel):
     def _cost_tier(cls, v: int) -> int:
         if not (1 <= v <= 5):
             raise ValueError("cost_tier must be between 1 and 5")
+        return v
+
+    @field_validator("memory_mib")
+    @classmethod
+    def _memory_mib(cls, v: int | None) -> int | None:
+        if v is not None and v <= 0:
+            raise ValueError("memory_mib must be a positive integer (MiB)")
         return v
 
     @field_validator("placement")

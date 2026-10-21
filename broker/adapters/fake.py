@@ -32,8 +32,15 @@ class FakeAdapter(BackendAdapter):
         self._started = False
         self._ready = False
         self._pid: int | None = None
+        self._last_pid: int | None = None
         self._cancelled: set[str] = set()
         self._load_count = 0
+        # ADR 0020 test knobs: simulate a runtime whose process survives SIGKILL
+        # (telemetry-off path) and/or whose device memory lingers (telemetry path
+        # scripts that via the fake telemetry provider, not here).
+        self.simulate_survive_kill = False
+        self._proc_alive = False
+        self._release_ok = True
         # Simulated real load signal for cache-aware routing tests (ADR 0010);
         # None means "no real signal" so the manager falls back to in-flight.
         self.sim_load: float | None = None
@@ -54,6 +61,9 @@ class FakeAdapter(BackendAdapter):
         self._ready = False
         self._load_count += 1
         self._pid = 100000 + self._load_count  # synthetic pid
+        self._last_pid = self._pid
+        self._proc_alive = True
+        self._release_ok = True
         return self._pid
 
     async def wait_until_ready(self, timeout: float) -> None:
@@ -72,9 +82,25 @@ class FakeAdapter(BackendAdapter):
         self._ready = False
         self._started = False
         self._pid = None
+        if self.simulate_survive_kill:
+            # Telemetry-off path: process refuses to die; stop() reports it.
+            self._proc_alive = True
+            self._release_ok = False
+        else:
+            self._proc_alive = False
+            self._release_ok = True
 
     async def stop(self) -> None:
         await self.unload()
+
+    def process_pid(self) -> int | None:
+        return self._pid if self._pid is not None else self._last_pid
+
+    async def process_alive(self) -> bool:
+        return self._proc_alive
+
+    def last_release_ok(self) -> bool:
+        return self._release_ok
 
     def _completion(self, payload: dict[str, Any], text: str) -> dict[str, Any]:
         prompt = " ".join(str(m.get("content", "")) for m in payload.get("messages", []))

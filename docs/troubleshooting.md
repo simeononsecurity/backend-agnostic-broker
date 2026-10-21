@@ -53,5 +53,30 @@ Errors are structured (`broker/errors.py`) and carry a `remediation` hint and a
 - `GET /healthz/backends` shows per-member liveness and `cooldown`
   (`failures`, `in_cooldown`, `seconds_remaining`, `ejections`).
 - `GET /metrics` shows request/latency/in-flight/loaded gauges.
+- `GET /status` → `resources` (ADR 0020/0022, when `BROKER_GPU_TELEMETRY` is on):
+  measured per-device memory (`source: measured`), per-PID holders, declared
+  admission budgets + recent decisions, and any `release_stuck`/`survived_kill`
+  holders. Ollama memory appears under `resources.reported` (`source: reported`).
 - Logs: set `BROKER_LOG_LEVEL=DEBUG` for verbose output.
 - Reproduce the full local check suite via `docs/EVIDENCE.md`.
+
+## GPU memory issues (ADR 0020 / 0022)
+
+| Symptom | Cause / fix |
+|---------|-------------|
+| `503 release_stuck` on a load | The previous runtime's device memory didn't come back (lazy reclaim or a zombie CUDA/ROCm context). Inspect `resources.release_stuck` (PID/device/MiB), free the holder, then retry — or raise `BROKER_RELEASE_TIMEOUT_SECONDS`. The broker never resets a GPU or kills a foreign process. |
+| `429 capacity_unavailable` | A sized model (`memory_mib`) does not fit and the device holder can't be evicted. Raise the budget/headroom, pin to another device, or wait for the holder to go idle. The `reason`/`holder` fields name why. |
+| `resources.sample.status: unavailable` | The driver tool isn't at an absolute/allow-listed path, timed out, or returned nothing. Run `python -m broker.resources_probe <provider>` and read the `reason`. |
+| A model shows `survived_kill: true` | `stop()` could not confirm the process exited after SIGKILL. Check for a wedged runtime holding the device. |
+
+## Request-queue issues (ADR 0023)
+
+| Symptom | Cause / fix |
+|---------|-------------|
+| `429 queue_full` | The admission queue hit `BROKER_QUEUE_MAX_DEPTH` (or `_PER_MODEL`). Too much sustained overload — add capacity, raise the depth, or let clients back off per `Retry-After`. The `trigger` names the overload. |
+| `503 queue_timeout` | A request waited past `BROKER_QUEUE_MAX_WAIT_SECONDS`. The named `trigger` stayed active the whole wait — add capacity or raise the wait/threshold. Check `/status` → `queue.timeouts_by_reason`. |
+| Requests never queue though the box looks busy | Trigger off or threshold not met. Concurrency + capacity are on by default; device-memory needs `BROKER_GPU_TELEMETRY` on; host/backend are opt-in with a threshold (`BROKER_QUEUE_HOST_LOAD_PER_CPU_MAX`, `BROKER_QUEUE_BACKEND_WAITING_MAX`). Confirm `BROKER_QUEUE_ENABLED=true` and see `/status` → `queue.waiting_triggers`. |
+| A quota 429 isn't being queued | By design — per-key rpm/tpm/budget 429s (`rate_limit_exceeded`/`insufficient_quota`) are a caller limit, never queued. Only server overload (`queue_full`/`queue_timeout`) is. |
+| `capacity_unavailable` with `reason=exceeds_device_capacity` never waits | By design — it can never fit even with everything evicted, so it fails fast instead of queueing. |
+| Streaming request has no `x-broker-queue-wait-ms` | SSE headers flush before the pre-first-byte wait; a streaming request reports its wait in `/status` and traces, not a header. Keep client/proxy keep-alive above `BROKER_QUEUE_MAX_WAIT_SECONDS`. |
+| One API key starves others | Shouldn't happen — fairness is FIFO-per-key + round-robin across keys. If an important key should go first, set `limits.priority` in the keys file (aging prevents starvation of the rest). |

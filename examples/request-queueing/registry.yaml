@@ -1,0 +1,13 @@
+# A two-member pool used to demonstrate the ADR 0023 admission queue. Both
+# members are the dependency-free `fake` backend so the example runs anywhere
+# (no GPU, no downloads). In production these would be real vLLM/llama.cpp/Ollama
+# models; the queue behavior is identical.
+models:
+  - alias: chat-a
+    backend: fake
+    runtime_model_id: fake-chat
+    pool: chat
+  - alias: chat-b
+    backend: fake
+    runtime_model_id: fake-chat
+    pool: chat

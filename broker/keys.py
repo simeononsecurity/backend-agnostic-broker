@@ -279,6 +279,10 @@ class KeyLimits:
     allowed_models: list[str] = field(default_factory=list)
     placement: list[str] = field(default_factory=list)  # ADR 0016 per-key placement
     per_model: dict[str, PerModelLimit] = field(default_factory=dict)  # ADR 0016
+    # ADR 0023 admission-queue priority: higher = served earlier under overload.
+    # Ordering only (never a gate/quota), so it is deliberately excluded from
+    # ``any_limit`` — a key with only a priority stays an "unlimited" principal.
+    priority: int = 0
 
     @property
     def any_limit(self) -> bool:
@@ -319,6 +323,7 @@ class KeyLimits:
             allowed_models=list(d.get("allowed_models") or []),
             placement=list(d.get("placement") or []),
             per_model=per_model,
+            priority=int(d.get("priority") or 0),
         )
 
 
@@ -426,6 +431,7 @@ class KeyRecord:
                     if self.limits.per_model
                     else None
                 ),
+                "priority": self.limits.priority or None,
             }.items()
             if v is not None
         }

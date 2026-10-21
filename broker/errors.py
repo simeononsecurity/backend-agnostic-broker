@@ -190,6 +190,70 @@ class ConcurrencyLimitError(BrokerError):
     error_type = "rate_limit_error"
 
 
+class CapacityUnavailableError(ConcurrencyLimitError):
+    """Memory-aware admission could not fit a sized model (ADR 0022).
+
+    A *typed, distinct* capacity signal: the model declares ``memory_mib`` but the
+    device budget (measured free memory when telemetry is on, else the declared
+    ``BROKER_GPU_MEMORY_BUDGET_MIB``) cannot accommodate it even after evicting
+    every idle model on its device(s). Carries the machine-readable ``reason`` and
+    the ``holder`` (what currently occupies the memory) so an operator — and the
+    ADR 0023 request queue — can tell "capacity unavailable" apart from a bare
+    concurrency 429 and *wait* on it instead of failing. Subclasses
+    :class:`ConcurrencyLimitError` so existing 429 handling is unchanged.
+    """
+
+    error_type = "capacity_unavailable"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str | None = None,
+        holder: str | None = None,
+        backend: str | None = None,
+        model: str | None = None,
+        state: str | None = None,
+        remediation: str | None = None,
+        code: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            backend=backend,
+            model=model,
+            state=state,
+            remediation=remediation,
+            code=code,
+            headers=headers,
+        )
+        #: Machine-readable cause, e.g. "measured_insufficient" / "declared_insufficient".
+        self.reason = reason
+        #: What holds the memory (alias(es) or a measured-device description).
+        self.holder = holder
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = super().to_payload()
+        payload["error"]["reason"] = self.reason
+        payload["error"]["holder"] = self.holder
+        return payload
+
+
+class ReleaseStuckError(BrokerError):
+    """A broker-spawned runtime did not release its device after unload (ADR 0020).
+
+    After evicting a model the broker waits (bounded by
+    ``BROKER_RELEASE_TIMEOUT_SECONDS``) for the process group to exit AND — when
+    telemetry is on — for the device to stop reporting that group's PIDs. If the
+    memory never comes back, the next load fails with this **503** naming the stuck
+    holder (PID, device, MiB still held) instead of starting into an OOM. The
+    broker never force-resets the GPU or kills a process it did not start.
+    """
+
+    http_status = 503
+    error_type = "release_stuck"
+
+
 class RequestTooLargeError(BrokerError):
     """Request body exceeded the configured size limit."""
 
@@ -266,3 +330,68 @@ class ConflictError(BrokerError):
 
     http_status = 409
     error_type = "conflict"
+
+
+class QueueFullError(ConcurrencyLimitError):
+    """The admission queue is full; the request was not enqueued (ADR 0023).
+
+    Returned when a newly arriving request would exceed the configured queue
+    depth (global or per model). Maps to **429** ``queue_full`` — the client is
+    contributing to overload and should back off — and carries ``Retry-After``.
+    Subclasses :class:`ConcurrencyLimitError` so existing 429 handling (and the
+    "a quota 429 is never queued" invariant) is unaffected. Distinct from a
+    per-key quota 429 (``rate_limit_exceeded`` / ``insufficient_quota``): this is
+    a *server* capacity signal, not a per-key limit, and it is never itself
+    re-queued. Carries the ``trigger`` that caused the request to need queueing.
+    """
+
+    error_type = "queue_full"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        trigger: str | None = None,
+        depth: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message, **kwargs)
+        self.trigger = trigger
+        self.depth = depth
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = super().to_payload()
+        payload["error"]["trigger"] = self.trigger
+        return payload
+
+
+class QueueTimeoutError(BrokerError):
+    """A queued request waited longer than ``BROKER_QUEUE_MAX_WAIT_SECONDS`` (ADR 0023).
+
+    Maps to **503** ``queue_timeout``: the service was overloaded for the whole
+    wait budget, independent of the caller (vLLM rejects an over-full admission
+    queue with 503; Envoy overflows its pending-request queue with 503). Carries
+    ``Retry-After`` and the ``trigger`` that kept the request waiting so an
+    operator/client sees *why*. A timed-out request never started streaming, so
+    the client can safely retry.
+    """
+
+    http_status = 503
+    error_type = "queue_timeout"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        trigger: str | None = None,
+        waited_ms: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message, **kwargs)
+        self.trigger = trigger
+        self.waited_ms = waited_ms
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = super().to_payload()
+        payload["error"]["trigger"] = self.trigger
+        return payload

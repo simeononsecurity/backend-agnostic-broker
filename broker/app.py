@@ -180,6 +180,27 @@ def _latency_budget_ms(request: Request) -> float | None:
     return v
 
 
+def _pop_queue_headers(result: object) -> dict[str, str]:
+    """Extract ADR 0023 queue-wait response headers from a serve result dict.
+
+    The manager stashes ``_broker_queue_wait_ms`` / ``_broker_queue_trigger`` on
+    the result when a (non-streaming) request waited in the admission queue; this
+    pops them (so they never reach the client body) into ``x-broker-queue-*``
+    headers. Streaming requests surface their wait via /status + traces instead
+    (the SSE headers are already flushed before the pre-first-byte queue wait).
+    """
+    headers: dict[str, str] = {}
+    if not isinstance(result, dict):
+        return headers
+    wait = result.pop("_broker_queue_wait_ms", None)
+    trigger = result.pop("_broker_queue_trigger", None)
+    if wait is not None:
+        headers["x-broker-queue-wait-ms"] = str(int(round(float(wait))))
+        if trigger:
+            headers["x-broker-queue-trigger"] = str(trigger)
+    return headers
+
+
 def _setup_logging(settings: Settings) -> None:
     level = getattr(logging, settings.log_level.upper(), logging.INFO)
     handler = logging.StreamHandler()
@@ -247,6 +268,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await manager.reconcile()
         await manager.start_sweeper()
         await manager.start_health_probe()
+        await manager.start_queue_pump()
         log.info(
             "broker %s started; %d models registered (none loaded)",
             __version__,
@@ -887,6 +909,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             route_key=session_key,
                             allowed_models=allowed,
                             model_guard=model_guard,
+                            queue_key=key_id,
+                            queue_priority=principal.limits.priority,
                         )
                     else:
                         aiter = manager.stream_chat(
@@ -897,6 +921,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             required_placement=placement,
                             allowed_models=allowed,
                             model_guard=model_guard,
+                            queue_key=key_id,
+                            queue_priority=principal.limits.priority,
                         )
                     async for chunk in aiter:
                         if ttft_ms is None:
@@ -953,6 +979,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     latency_budget_ms=budget,
                     allowed_models=allowed,
                     model_guard=model_guard,
+                    queue_key=key_id,
+                    queue_priority=principal.limits.priority,
                 )
 
             result, cache_state, cache_headers = await _cached_serve(
@@ -964,6 +992,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 serve=_serve,
             )
             route_path = result.pop("_broker_route", result.get("model", alias))
+            queue_headers = _pop_queue_headers(result)
             REQUESTS.labels("chat", alias, "ok").inc()
             u = result.get("usage") or {}
             prompt_tokens = u.get("prompt_tokens", 0)
@@ -988,6 +1017,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "x-broker-route": route_path,
                     "x-broker-cache": cache_state,
                     **cache_headers,
+                    **queue_headers,
                     **admission.headers,
                 },
             )
@@ -1099,6 +1129,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         required_placement=placement,
                         allowed_models=allowed,
                         model_guard=model_guard,
+                        queue_key=key_id,
+                        queue_priority=principal.limits.priority,
                     )
                     async for out in chat_sse_to_text_sse(aiter, model):
                         if ttft_ms is None:
@@ -1157,6 +1189,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     latency_budget_ms=budget,
                     allowed_models=allowed,
                     model_guard=model_guard,
+                    queue_key=key_id,
+                    queue_priority=principal.limits.priority,
                 )
 
             result, cache_state, cache_headers = await _cached_serve(
@@ -1168,6 +1202,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 serve=_serve,
             )
             route_path = result.pop("_broker_route", result.get("model", model))
+            queue_headers = _pop_queue_headers(result)
             out = chat_to_text_completion(result, model)
             REQUESTS.labels("completions", model, "ok").inc()
             u = result.get("usage") or {}
@@ -1193,6 +1228,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "x-broker-route": route_path,
                     "x-broker-cache": cache_state,
                     **cache_headers,
+                    **queue_headers,
                     **admission.headers,
                 },
             )
@@ -1296,6 +1332,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         required_placement=placement,
                         allowed_models=allowed,
                         model_guard=model_guard,
+                        queue_key=key_id,
+                        queue_priority=principal.limits.priority,
                     )
                     async for out in chat_sse_to_responses_sse(aiter, model):
                         if ttft_ms is None:
@@ -1354,6 +1392,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     latency_budget_ms=budget,
                     allowed_models=allowed,
                     model_guard=model_guard,
+                    queue_key=key_id,
+                    queue_priority=principal.limits.priority,
                 )
 
             result, cache_state, cache_headers = await _cached_serve(
@@ -1365,6 +1405,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 serve=_serve,
             )
             route_path = result.pop("_broker_route", result.get("model", model))
+            queue_headers = _pop_queue_headers(result)
             out = chat_to_response(result, model)
             REQUESTS.labels("responses", model, "ok").inc()
             u = result.get("usage") or {}
@@ -1390,6 +1431,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "x-broker-route": route_path,
                     "x-broker-cache": cache_state,
                     **cache_headers,
+                    **queue_headers,
                     **admission.headers,
                 },
             )
@@ -1459,6 +1501,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     required_placement=placement,
                     allowed_models=allowed,
                     model_guard=model_guard,
+                    queue_key=key_id,
+                    queue_priority=principal.limits.priority,
                 )
 
             result, cache_state, cache_headers = await _cached_serve(
@@ -1470,6 +1514,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 serve=_serve,
                 always_deterministic=True,
             )
+            queue_headers = _pop_queue_headers(result)
             REQUESTS.labels("embeddings", model, "ok").inc()
             u = result.get("usage") or {}
             prompt_tokens = u.get("prompt_tokens", 0)
@@ -1492,6 +1537,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "x-request-id": request_id,
                     "x-broker-cache": cache_state,
                     **cache_headers,
+                    **queue_headers,
                     **admission.headers,
                 },
             )
@@ -1578,6 +1624,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     route_key=session_key,
                     required_placement=placement,
                     allowed_models=allowed,
+                    queue_key=key_id,
+                    queue_priority=principal.limits.priority,
                 )
 
             result, cache_state, cache_headers = await _cached_serve(
@@ -1589,6 +1637,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 serve=_serve,
                 always_deterministic=True,
             )
+            queue_headers = _pop_queue_headers(result)
             REQUESTS.labels("rerank", model, "ok").inc()
             u = result.get("usage") or {}
             prompt_tokens = u.get("total_tokens", u.get("prompt_tokens", 0))
@@ -1611,6 +1660,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "x-request-id": request_id,
                     "x-broker-cache": cache_state,
                     **cache_headers,
+                    **queue_headers,
                     **admission.headers,
                 },
             )

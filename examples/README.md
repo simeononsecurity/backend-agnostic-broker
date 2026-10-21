@@ -27,6 +27,8 @@ no external daemon**, then swap in real backends for production.
 | [rerank](rerank/) | The `/v1/rerank` endpoint | [embeddings-and-rerank](../docs/guides/embeddings-and-rerank.md) |
 | [rag-pipeline](rag-pipeline/) | embed → retrieve → rerank → chat | [embeddings-and-rerank](../docs/guides/embeddings-and-rerank.md) |
 | [restart-recovery](restart-recovery/) | Runtime ledger + restart reconciliation (adopt/stop/report) | [restart-and-recovery](../docs/guides/restart-and-recovery.md) |
+| [gpu-memory](gpu-memory/) | Telemetry, measured release, sized models (ADR 0020/0022) | [gpu-memory](../docs/guides/gpu-memory.md) |
+| [request-queueing](request-queueing/) | Bounded, fair admission queue under overload (ADR 0023) | [request-queueing](../docs/guides/request-queueing.md) |
 
 ## How these are tested
 

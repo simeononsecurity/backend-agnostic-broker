@@ -105,6 +105,32 @@ class BackendAdapter(abc.ABC):
     async def stop(self) -> None:
         """Forcefully stop and clean up any broker-owned process/resources."""
 
+    # --- process identity / measured release (ADR 0020) ------------------
+    # Default: the backend owns no broker-spawned process (external daemon). These
+    # let the manager match a telemetry provider's per-device PIDs to a model and
+    # wait for a measured release before loading the next model on the same device.
+    def process_pid(self) -> int | None:
+        """PID of the broker-spawned runtime, or None for external daemons."""
+        return None
+
+    async def process_alive(self) -> bool:
+        """Whether a broker-spawned runtime process is still running."""
+        return False
+
+    def last_release_ok(self) -> bool:
+        """False if the most recent stop() left the process alive after SIGKILL."""
+        return True
+
+    def device_keys(self) -> list[str]:
+        """Device keys this model is accounted against for memory admission.
+
+        The pinned ``gpu.device_ids`` (as strings) when set, else the shared
+        ``"default"`` bucket. Used by ADR 0022 declared accounting and to scope
+        measured-release waits + eviction to the right device(s).
+        """
+        ids = self.entry.gpu.device_ids
+        return [str(d) for d in ids] if ids else ["default"]
+
     # --- inference -------------------------------------------------------
     @abc.abstractmethod
     async def chat(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:

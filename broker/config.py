@@ -374,6 +374,101 @@ class Settings(BaseSettings):
     gpu_visible: bool = False
     cuda_visible_devices: str | None = None  # e.g. "0,1"
 
+    # --- Resource telemetry + measured release (ADR 0020; opt-in, default OFF) ---
+    # Provider that measures per-device memory (and, where exposed, which PIDs hold
+    # it): "off" (DEFAULT; behavior == v0.6.0), "nvidia" (nvidia-smi query mode),
+    # "amd" (amd-smi/rocm-smi JSON), "host" (system RAM — CPU / Apple-silicon
+    # unified memory), or "auto" (probe nvidia -> amd -> host). Providers shell out
+    # argv-only to an absolute/allow-listed binary with a timeout and parse
+    # defensively; a failed probe degrades to "unavailable", never a crash.
+    gpu_telemetry: str = "off"
+    # How long a telemetry sample is cached before the next probe (seconds).
+    gpu_telemetry_poll_seconds: float = 5.0
+    # Per-probe subprocess timeout (seconds).
+    gpu_telemetry_timeout_seconds: float = 4.0
+    # Optional absolute path overrides for the driver tools (else an allow-list of
+    # standard locations is searched; PATH is never consulted).
+    gpu_telemetry_nvidia_smi_path: str | None = None
+    gpu_telemetry_amd_smi_path: str | None = None
+    gpu_telemetry_rocm_smi_path: str | None = None
+    # Device-isolation env var set for a broker-spawned runtime. Unset => derived
+    # from the active provider: "amd" -> ROCR_VISIBLE_DEVICES, else
+    # CUDA_VISIBLE_DEVICES (the portable default). Override e.g. with
+    # HIP_VISIBLE_DEVICES when a runtime requires it.
+    gpu_device_env_var: str | None = None
+    # Measured release: after evicting a broker-spawned runtime the next load on
+    # the same device waits up to this long for the process group to exit and (when
+    # telemetry is on) for the device to stop reporting its PIDs. On timeout the
+    # model enters `release_stuck` and the waiting load fails 503 instead of OOMing.
+    release_timeout_seconds: float = 30.0
+
+    # --- Memory-aware admission (ADR 0022; opt-in, default OFF) ---
+    # Declared per-device budget (MiB) used for admission when telemetry is OFF.
+    # Either a single integer applied to every device ("40000") or a per-device map
+    # ("0=24000,1=48000"; the key "default" covers unpinned models). Unset => no
+    # declared accounting (models with memory_mib then need telemetry on to be
+    # sized, else they keep count-only behavior).
+    gpu_memory_budget_mib: str | None = None
+    # Headroom (MiB) subtracted from MEASURED free memory before admitting a sized
+    # model, so a load never consumes the last sliver of a device.
+    gpu_memory_headroom_mib: int = 1024
+
+    # --- Admission queue under overload (ADR 0023; opt-in, default OFF) ---
+    # When OFF (default) behavior == v0.6.0: a request that cannot be admitted now
+    # either waits on the concurrency semaphores (load_concurrency_policy="queue")
+    # or 429s ("reject"), with no bound/timeout/fairness. When ON, a request that
+    # cannot be admitted *right now* enters a bounded, timed, FAIR queue instead of
+    # blocking unboundedly or failing — it is served in turn when capacity frees, or
+    # rejected with a clear status + Retry-After. Quota 429s (ADR 0008/0016 per-key
+    # rpm/tpm/budget) are a DIFFERENT concern and are NEVER queued.
+    queue_enabled: bool = False
+    # Max requests waiting in the admission queue, globally and per model. A newly
+    # arriving request that would exceed either bound is rejected immediately with
+    # HTTP 429 + Retry-After (it never joins the queue). 0 disables that bound.
+    queue_max_depth: int = 128
+    queue_max_depth_per_model: int = 32
+    # Max time (seconds) a request may wait in the queue before giving up. On
+    # timeout the request fails with HTTP 503 + Retry-After naming the trigger.
+    # 0 = wait forever (bounded only by the request/client timeout).
+    queue_max_wait_seconds: float = 30.0
+    # Retry-After (seconds) advertised on a queue-full 429 or a wait-timeout 503.
+    queue_retry_after_seconds: float = 5.0
+    # Background re-check interval (seconds): how often queued waiters are re-woken
+    # to retry admission, so a telemetry/host overload that clears (no completion
+    # event) still drains the queue promptly. Keep small.
+    queue_pump_interval_seconds: float = 0.25
+    # Fairness aging: a waiter's EFFECTIVE priority rises by 1 every this many
+    # seconds it waits, so a low-priority request still progresses (no starvation).
+    # 0 disables aging (strict priority — not recommended).
+    queue_priority_aging_seconds: float = 10.0
+
+    # Overload triggers — each decides INDEPENDENTLY whether a request waits in the
+    # queue. All are no-ops unless queue_enabled. Telemetry-based triggers
+    # (device_memory) are additionally inactive unless BROKER_GPU_TELEMETRY is on.
+    # Concurrency saturation (global or per-model semaphore full) and capacity
+    # (memory-aware admission / max_loaded_models) are the intrinsic triggers.
+    queue_trigger_concurrency: bool = True
+    queue_trigger_capacity: bool = True
+    # Measured device memory pressure (ADR 0020 telemetry): queue when a relevant
+    # device's free memory drops below queue_device_free_mib_min OR its used
+    # fraction rises above queue_device_used_fraction_max. Inactive when telemetry
+    # is off. 0 / 0.0 disables that sub-check.
+    queue_trigger_device_memory: bool = False
+    queue_device_free_mib_min: int = 0
+    queue_device_used_fraction_max: float = 0.0
+    # Host overload: queue when the 1-minute load average per CPU exceeds
+    # queue_host_load_per_cpu_max, measured cheaply and cross-platform
+    # (os.getloadavg; unavailable on Windows -> this trigger is simply inactive).
+    # 0.0 disables.
+    queue_trigger_host: bool = False
+    queue_host_load_per_cpu_max: float = 0.0
+    # Backend backpressure: queue when the selected member reports more than
+    # queue_backend_waiting_max queued requests (vLLM num_requests_waiting via
+    # collect_load) or is in an upstream-429/Retry-After backpressure window (ADR
+    # 0017). 0 disables the waiting-count sub-check.
+    queue_trigger_backend: bool = False
+    queue_backend_waiting_max: int = 0
+
     # --- Cache / tmp ---
     cache_dir: str = "/var/cache/broker"
     tmp_dir: str = "/tmp/broker"
@@ -464,6 +559,43 @@ class Settings(BaseSettings):
         if v not in ("off", "report", "adopt", "stop"):
             raise ValueError("runtime_reconcile must be 'off', 'report', 'adopt', or 'stop'")
         return v
+
+    @field_validator("gpu_telemetry")
+    @classmethod
+    def _gpu_telemetry(cls, v: str) -> str:
+        if v not in ("off", "nvidia", "amd", "host", "auto"):
+            raise ValueError("gpu_telemetry must be 'off', 'nvidia', 'amd', 'host', or 'auto'")
+        return v
+
+    def gpu_memory_budget_map(self) -> dict[str, int]:
+        """Parse ``gpu_memory_budget_mib`` into a ``{device_key: MiB}`` map.
+
+        Accepts a single integer (``"40000"`` -> applies to every device under the
+        special key ``"*"``) or a comma-separated per-device map
+        (``"0=24000,1=48000,default=16000"``). Empty/unset -> ``{}``.
+        """
+        raw = self.gpu_memory_budget_mib
+        if raw is None or not str(raw).strip():
+            return {}
+        raw = str(raw).strip()
+        out: dict[str, int] = {}
+        if "=" not in raw:
+            out["*"] = int(raw)
+            return out
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            key, _, val = part.partition("=")
+            out[key.strip()] = int(val.strip())
+        return out
+
+    def budget_for_device(self, device_key: str) -> int | None:
+        """Declared budget (MiB) for a device key, honoring an explicit key then ``*``."""
+        m = self.gpu_memory_budget_map()
+        if device_key in m:
+            return m[device_key]
+        return m.get("*")
 
     def validate_runtime(self) -> None:
         """Cross-field, fail-fast checks run once at startup."""
@@ -597,6 +729,56 @@ class Settings(BaseSettings):
                 ) from exc
         if self.rerank_max_documents < 1:
             raise ConfigError("BROKER_RERANK_MAX_DOCUMENTS must be >= 1")
+        if self.gpu_telemetry_poll_seconds < 0:
+            raise ConfigError("BROKER_GPU_TELEMETRY_POLL_SECONDS must be >= 0")
+        if self.gpu_telemetry_timeout_seconds <= 0:
+            raise ConfigError("BROKER_GPU_TELEMETRY_TIMEOUT_SECONDS must be > 0")
+        if self.release_timeout_seconds < 0:
+            raise ConfigError("BROKER_RELEASE_TIMEOUT_SECONDS must be >= 0 (0 = don't wait)")
+        if self.gpu_memory_headroom_mib < 0:
+            raise ConfigError("BROKER_GPU_MEMORY_HEADROOM_MIB must be >= 0")
+        # Admission queue (ADR 0023): all no-ops unless queue_enabled, but validate
+        # the numbers eagerly so a misconfiguration fails fast at startup.
+        if self.queue_max_depth < 0:
+            raise ConfigError("BROKER_QUEUE_MAX_DEPTH must be >= 0 (0 = unbounded)")
+        if self.queue_max_depth_per_model < 0:
+            raise ConfigError("BROKER_QUEUE_MAX_DEPTH_PER_MODEL must be >= 0 (0 = unbounded)")
+        if self.queue_max_wait_seconds < 0:
+            raise ConfigError("BROKER_QUEUE_MAX_WAIT_SECONDS must be >= 0 (0 = wait forever)")
+        if self.queue_retry_after_seconds < 0:
+            raise ConfigError("BROKER_QUEUE_RETRY_AFTER_SECONDS must be >= 0")
+        if self.queue_pump_interval_seconds <= 0:
+            raise ConfigError("BROKER_QUEUE_PUMP_INTERVAL_SECONDS must be > 0")
+        if self.queue_priority_aging_seconds < 0:
+            raise ConfigError("BROKER_QUEUE_PRIORITY_AGING_SECONDS must be >= 0 (0 = no aging)")
+        if self.queue_device_free_mib_min < 0:
+            raise ConfigError("BROKER_QUEUE_DEVICE_FREE_MIB_MIN must be >= 0")
+        if not 0.0 <= self.queue_device_used_fraction_max <= 1.0:
+            raise ConfigError("BROKER_QUEUE_DEVICE_USED_FRACTION_MAX must be in [0.0, 1.0]")
+        if self.queue_host_load_per_cpu_max < 0:
+            raise ConfigError("BROKER_QUEUE_HOST_LOAD_PER_CPU_MAX must be >= 0")
+        if self.queue_backend_waiting_max < 0:
+            raise ConfigError("BROKER_QUEUE_BACKEND_WAITING_MAX must be >= 0")
+        for _tool_path in (
+            self.gpu_telemetry_nvidia_smi_path,
+            self.gpu_telemetry_amd_smi_path,
+            self.gpu_telemetry_rocm_smi_path,
+        ):
+            if _tool_path and not Path(_tool_path).is_absolute():
+                raise ConfigError(
+                    f"telemetry tool path {_tool_path!r} must be absolute",
+                    remediation="give an absolute path to the driver binary, or unset it",
+                )
+        try:
+            budgets = self.gpu_memory_budget_map()
+        except ValueError as exc:
+            raise ConfigError(
+                f"invalid BROKER_GPU_MEMORY_BUDGET_MIB: {exc}",
+                remediation="use an integer (e.g. '40000') or a map '0=24000,1=48000'",
+            ) from exc
+        for _k, _v in budgets.items():
+            if _v < 0:
+                raise ConfigError("BROKER_GPU_MEMORY_BUDGET_MIB values must be >= 0")
         if not Path(self.registry_path).exists():
             raise ConfigError(
                 f"registry not found: {self.registry_path!r}",

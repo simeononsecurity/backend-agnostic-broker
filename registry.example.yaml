@@ -261,6 +261,11 @@ models:
     tags: [general, tools, long-context]
     description: 32k-context instruct model with tool support
     cost_tier: 4
+    # Memory-aware admission (ADR 0022, opt-in): declared resident footprint in
+    # MiB. With BROKER_GPU_TELEMETRY on this is checked against measured free VRAM
+    # (minus headroom); with telemetry off it is checked against the declared
+    # BROKER_GPU_MEMORY_BUDGET_MIB for device 0. Omit to keep count-only behavior.
+    memory_mib: 18000
     startup_command:
       - /usr/local/bin/vllm
       - serve

@@ -43,6 +43,8 @@ links the ADR that records the decision. Every item below is resolved: ✅ done 
 | 11 | Runtime control: manual unload + registry hot-reload | ✅ done — unload/load + transactional reload | [0012](adr/0012-caching-runtime-control-observability.md) |
 | 12 | OpenTelemetry tracing + optional web UI/playground | ✅ done — tracing (metadata [0012](adr/0012-caching-runtime-control-observability.md); **opt-in span content capture** [0014](adr/0014-semantic-cache-and-cache-extensions.md)); web UI ([0015](adr/0015-web-ui-playground.md)) | [0012](adr/0012-caching-runtime-control-observability.md) · [0014](adr/0014-semantic-cache-and-cache-extensions.md) · [0015](adr/0015-web-ui-playground.md) |
 | 13 | Crash recovery: runtime identity + restart reconciliation | ✅ done — PID+start-time identity, host-local ledger, reconcile (adopt/stop/report), port pre-check | [0021](adr/0021-runtime-identity-and-restart-reconciliation.md) |
+| 14 | GPU-safe model swapping: vendor-neutral memory telemetry + measured release + memory-aware admission | ✅ done — opt-in, default OFF; `off`/`nvidia`/`amd`/`host`/`auto` providers, `release_stuck`, sized models with declared/measured budgets | [0020](adr/0020-resource-telemetry-and-measured-release.md) · [0022](adr/0022-memory-aware-admission.md) |
+| 15 | Bounded, fair request queueing under overload | ✅ done — opt-in, default OFF; bounded+timed queue (429 `queue_full` / 503 `queue_timeout` + Retry-After), FIFO-per-key + round-robin fairness + priority/aging, configurable concurrency/capacity/device/host/backend triggers | [0023](adr/0023-request-queueing.md) |
 
 ## Notes
 

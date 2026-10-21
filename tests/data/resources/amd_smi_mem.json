@@ -1,0 +1,20 @@
+[
+  {
+    "gpu": 0,
+    "name": "AMD Instinct MI300X",
+    "mem_usage": {
+      "total_vram": {"value": 196592, "unit": "MB"},
+      "used_vram": {"value": 1024, "unit": "MB"},
+      "free_vram": {"value": 195568, "unit": "MB"}
+    }
+  },
+  {
+    "gpu": 1,
+    "name": "AMD Instinct MI300X",
+    "mem_usage": {
+      "total_vram": {"value": 196592, "unit": "MB"},
+      "used_vram": {"value": 190000, "unit": "MB"},
+      "free_vram": {"value": 6592, "unit": "MB"}
+    }
+  }
+]
