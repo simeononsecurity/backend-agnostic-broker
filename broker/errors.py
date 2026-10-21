@@ -261,6 +261,21 @@ class RequestTooLargeError(BrokerError):
     error_type = "request_too_large"
 
 
+class ClientDisconnectedError(BrokerError):
+    """The client went away before the (non-streaming) response was produced.
+
+    Raised by the serve path's disconnect guard (ADR 0023) once the client has
+    disconnected, so the held admission/concurrency slot and the inflight
+    upstream request are cancelled and released immediately instead of leaking
+    until the serve finishes. The response is never delivered (the socket is
+    gone); the 499 status is for logs/metrics only, matching nginx's convention
+    for a client-closed request.
+    """
+
+    http_status = 499
+    error_type = "client_disconnected"
+
+
 class PlacementDeniedError(BrokerError):
     """No model satisfies the request's placement/residency requirement.
 

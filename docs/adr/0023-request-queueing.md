@@ -115,11 +115,14 @@ never passed to the queue.
 
 ## Confirmation
 
-`tests/test_queue.py` (14 tests): saturation → queued then served **FIFO**;
+`tests/test_queue.py` (18 tests): saturation → queued then served **FIFO**;
 **fairness** (key A floods, key B still served within bound, round-robin);
 **priority** ordering + an **aging** unit test; **max depth → 429 + Retry-After**;
 **max wait → 503 + Retry-After** naming the trigger; **client disconnect frees the
-slot**; **quota 429s and `exceeds_device_capacity` never queued**; **fast path
+slot** — both the manager's cancellation-safety *and* the app-layer serve guard
+(`_await_or_disconnect`, which watches the ASGI `receive` channel for
+`http.disconnect` and cancels the serve, because uvicorn does not cancel a
+buffered non-streaming handler on disconnect); **quota 429s and `exceeds_device_capacity` never queued**; **fast path
 bypasses the queue**; **device-telemetry overload queues then drains**; **host-load
 overload queues then drains**; **composes with failover (pool, one bad member) with
 no deadlock**; **the queue never switches model**; and **queue OFF == v0.6.0**. The

@@ -181,6 +181,38 @@ async def test_reconcile_report_lists_orphan_without_signalling(tmp_path, orphan
     await mgr.shutdown()
 
 
+async def test_report_shutdown_preserves_unowned_orphan_record(tmp_path, orphans):
+    """A report/off-mode broker's graceful shutdown must NOT clear a ledger
+    record for a runtime it never spawned/adopted (the model stays UNLOADED).
+
+    Regression: ``ManagedModel.stop()`` used to call ``_forget_runtime()``
+    unconditionally, so a report-mode shutdown wiped another (crashed) broker's
+    orphan record — stranding the orphan so a later ``adopt``/``stop`` restart
+    could no longer reconcile it. ADR 0021: never touch a runtime this broker did
+    not record.
+    """
+    port = _free_port()
+    proc = _spawn_http_orphan(port, orphans)
+    mgr = _build_manager(tmp_path, port, "report")
+    mgr.ledger.upsert(_record_for(mgr, proc, port))
+
+    await mgr.reconcile()
+    assert mgr.get("r1").machine.state == State.UNLOADED
+
+    # A load attempt fails fast on the orphan-held port, leaving r1 FAILED (not
+    # UNLOADED) but with NO process spawned by this broker — the record ownership
+    # must still be recognized as "not ours", so the orphan record is preserved.
+    with pytest.raises(ModelLoadError):
+        await mgr.get("r1").ensure_ready()
+    assert mgr.get("r1").machine.state == State.FAILED
+
+    await mgr.shutdown()
+
+    # The orphan record survives and the orphan process is untouched (not signalled).
+    assert {r.alias for r in mgr.ledger.load()} == {"r1"}
+    assert rid.pid_alive(proc.pid)
+
+
 async def test_pid_reuse_is_never_signalled(tmp_path, orphans):
     """A record whose start time does not match is stale — never signalled."""
     port = _free_port()

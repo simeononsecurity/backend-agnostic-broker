@@ -261,6 +261,68 @@ async def test_client_disconnect_frees_queue_slot(settings: Settings):
 
 
 # --------------------------------------------------------------------------- #
+# 6b. app layer: a REAL client disconnect cancels the serve so the slot frees.
+# The manager is cancellation-safe (test above), but uvicorn does not cancel a
+# buffered non-streaming handler on disconnect — the app serve guard must watch
+# the ASGI ``receive`` channel for ``http.disconnect`` and cancel the serve
+# itself (ADR 0023). (Starlette's near-zero-timeout ``is_disconnected`` poll can
+# miss the event under an active upstream call; a blocking receive does not.)
+# --------------------------------------------------------------------------- #
+class _DiscRequest:
+    """Request stand-in whose ASGI ``receive`` reports an immediate disconnect."""
+
+    async def receive(self) -> dict:
+        return {"type": "http.disconnect"}
+
+
+class _ConnectedRequest:
+    """Request stand-in that never disconnects (``receive`` blocks forever)."""
+
+    async def receive(self) -> dict:
+        await asyncio.sleep(3600)
+        return {"type": "http.disconnect"}  # pragma: no cover
+
+
+async def test_serve_guard_cancels_held_serve_on_disconnect():
+    from broker.app import _await_or_disconnect
+    from broker.errors import ClientDisconnectedError
+
+    cancelled = asyncio.Event()
+
+    async def held_serve():
+        try:
+            await asyncio.sleep(30)  # stands in for a slow upstream holding a slot
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return {"ok": True}
+
+    with pytest.raises(ClientDisconnectedError):
+        await _await_or_disconnect(_DiscRequest(), held_serve())
+    # The serve (and therefore its admission/concurrency slot) was released.
+    assert cancelled.is_set()
+
+
+async def test_serve_guard_returns_result_when_connected():
+    from broker.app import _await_or_disconnect
+
+    async def quick():
+        return {"served": 1}
+
+    assert await _await_or_disconnect(_ConnectedRequest(), quick()) == {"served": 1}
+
+
+async def test_serve_guard_propagates_serve_error():
+    from broker.app import _await_or_disconnect
+
+    async def boom():
+        raise ValueError("upstream fail")
+
+    with pytest.raises(ValueError, match="upstream fail"):
+        await _await_or_disconnect(_ConnectedRequest(), boom())
+
+
+# --------------------------------------------------------------------------- #
 # 7. quota 429s are never queueable; exceeds_device_capacity fails fast
 # --------------------------------------------------------------------------- #
 def test_quota_and_hard_capacity_never_queued(settings: Settings):

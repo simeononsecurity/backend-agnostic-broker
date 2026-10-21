@@ -21,6 +21,8 @@ envelopes, configurable concurrency/timeouts.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -44,6 +46,7 @@ from .errors import (
     AuthError,
     AuthorizationError,
     BrokerError,
+    ClientDisconnectedError,
     ModelNotFoundError,
     RequestTooLargeError,
     ValidationError,
@@ -199,6 +202,67 @@ def _pop_queue_headers(result: object) -> dict[str, str]:
         if trigger:
             headers["x-broker-queue-trigger"] = str(trigger)
     return headers
+
+
+async def _wait_for_disconnect(request: Request) -> None:
+    """Block until the ASGI server reports the client has gone away.
+
+    Awaits the raw ASGI ``receive`` channel (the request body is already consumed
+    by the handler, so the next message uvicorn delivers on this connection is
+    ``http.disconnect`` when the client closes). This is deliberately a *real*
+    await rather than Starlette's near-zero-timeout ``is_disconnected`` poll: under
+    an active upstream call uvicorn pauses reading after the buffered body, and the
+    nanosecond-timeout poll resumes reading but times out before the disconnect
+    event lands — so it can miss the disconnect entirely. A blocking receive lets
+    the event be delivered as soon as the socket closes.
+    """
+    while True:
+        message = await request.receive()
+        if message.get("type") == "http.disconnect":
+            return
+
+
+async def _await_or_disconnect(request: Request, coro: Awaitable):
+    """Await ``coro`` but cancel it if the client disconnects first (ADR 0023).
+
+    Model serving holds an admission/concurrency slot *and* an inflight upstream
+    request for the whole call. uvicorn does not cancel a buffered (non-streaming)
+    handler when the client goes away, so without this the slot would leak until
+    the upstream finished — defeating the ADR 0023 "a client disconnect frees the
+    slot" guarantee. Racing the serve against the ASGI disconnect signal and
+    cancelling the serve lets the manager's cancellation-safe ``finally`` release
+    the slot at once.
+
+    A normal request incurs no extra latency: ``asyncio.wait`` returns the moment
+    the serve task finishes, and the serve's result (or exception) is propagated
+    unchanged. On disconnect the serve is cancelled and ``ClientDisconnectedError``
+    is raised (never delivered — the socket is gone — but the handler's ``finally``
+    still refunds governance reservations).
+    """
+    serve = asyncio.ensure_future(coro)
+    watch = asyncio.ensure_future(_wait_for_disconnect(request))
+    try:
+        await asyncio.wait({serve, watch}, return_when=asyncio.FIRST_COMPLETED)
+        if serve.done():
+            return serve.result()
+        # The disconnect watcher fired first: cancel the serve so the manager
+        # releases the admission slot and the inflight upstream request.
+        log.debug("client disconnected mid-serve; cancelling to free the slot")
+        serve.cancel()
+        with contextlib.suppress(BaseException):
+            await serve
+        raise ClientDisconnectedError("client disconnected before response")
+    except asyncio.CancelledError:
+        # The handler task itself was cancelled (e.g. server shutdown): propagate
+        # cancellation to the serve so its slot is released too.
+        serve.cancel()
+        with contextlib.suppress(BaseException):
+            await serve
+        raise
+    finally:
+        watch.cancel()
+        with contextlib.suppress(BaseException):
+            await watch
 
 
 def _setup_logging(settings: Settings) -> None:
@@ -508,10 +572,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if ctx["result"] is not None:
             return ctx["result"], ctx["state"], ctx["headers"]
         if ctx["state"] == "bypass":
-            return await serve(alias), "bypass", {}
+            return await _await_or_disconnect(request, serve(alias)), "bypass", {}
         # Serve through the ORIGINAL alias (not the pre-resolved model) so auto,
         # cascade, placement and per-key scoping all run in the manager.
-        result = await serve(alias)
+        result = await _await_or_disconnect(request, serve(alias))
         await _cache_store(ctx, result)
         return result, "miss", {}
 

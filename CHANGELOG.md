@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-10-21
 
 ### Added
 
@@ -111,11 +111,35 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Docker image declares `STOPSIGNAL SIGTERM` explicitly (exec-form entrypoint
   already made python PID 1).
 
+### Fixed
+
+- **Restart reconciliation no longer loses an orphan on an unrelated broker's
+  shutdown (ADR 0021).** `ManagedModel.stop()` removed a model's ledger record
+  unconditionally, so a graceful shutdown of a broker running in `report`/`off`
+  mode (or one whose load failed on the orphan-held port) wiped the ledger record
+  of a *different*, crashed broker's still-running runtime — stranding the orphan
+  so a later `adopt`/`stop` restart could no longer reconcile it. The ledger
+  record is now dropped only when this broker actually owns the runtime (it
+  spawned or adopted it, i.e. `process_start_time` is set); an orphan it merely
+  observed is left intact. Found by the v0.7.0 real-backend test matrix;
+  regression test in `tests/test_runtime_reconcile.py`.
+- **Client disconnect now frees a held admission slot end-to-end (ADR 0023).**
+  The admission queue was already cancellation-safe, but uvicorn does not cancel a
+  buffered (non-streaming) handler when the client goes away, so a disconnected
+  request kept holding its concurrency slot until the upstream call finished — a
+  queued follow-up could time out behind it. The non-streaming serve path
+  (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`,
+  `/v1/rerank`) now watches the ASGI `receive` channel for `http.disconnect` and
+  cancels the serve the moment the client leaves, releasing the slot and the
+  inflight upstream request at once (internal `client_disconnected` / 499, never
+  delivered). Found by the v0.7.0 real-backend test matrix; regression tests in
+  `tests/test_queue.py`.
+
 ### Notes
 
 - Default behavior is byte-for-byte v0.6.0: with `BROKER_GPU_TELEMETRY=off` (the
   default), no `memory_mib`/budget, `BROKER_QUEUE_ENABLED` unset, and the runtime
-  ledger (ADR 0021) in `report` mode, nothing new runs. No version bump.
+  ledger (ADR 0021) in `report` mode, nothing new runs.
 
 ## [0.6.0] - 2026-10-19
 

@@ -322,10 +322,17 @@ class ManagedModel:
             log.warning("failed to record runtime %s in ledger: %s", self.entry.alias, exc)
 
     def _forget_runtime(self) -> None:
-        """Drop this model's ledger record on a clean stop/unload."""
+        """Drop this model's ledger record on a clean stop/unload — but ONLY if
+        this broker owns the runtime (it spawned or adopted it, so
+        ``process_start_time`` is set). A record for a runtime this broker never
+        owned — an orphan merely observed in ``report``/``off`` mode, or a failed
+        load that never spawned a process — is left intact so a later
+        ``adopt``/``stop`` restart can still reconcile it (ADR 0021: never touch a
+        runtime this broker did not record)."""
+        owned = self.process_start_time is not None
         self.process_start_time = None
         self.adopted = False
-        if self.ledger is None:
+        if self.ledger is None or not owned:
             return
         try:
             self.ledger.remove(self.entry.alias)
