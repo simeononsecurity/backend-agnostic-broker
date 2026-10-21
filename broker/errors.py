@@ -190,6 +190,70 @@ class ConcurrencyLimitError(BrokerError):
     error_type = "rate_limit_error"
 
 
+class CapacityUnavailableError(ConcurrencyLimitError):
+    """Memory-aware admission could not fit a sized model (ADR 0022).
+
+    A *typed, distinct* capacity signal: the model declares ``memory_mib`` but the
+    device budget (measured free memory when telemetry is on, else the declared
+    ``BROKER_GPU_MEMORY_BUDGET_MIB``) cannot accommodate it even after evicting
+    every idle model on its device(s). Carries the machine-readable ``reason`` and
+    the ``holder`` (what currently occupies the memory) so an operator — and the
+    ADR 0023 request queue — can tell "capacity unavailable" apart from a bare
+    concurrency 429 and *wait* on it instead of failing. Subclasses
+    :class:`ConcurrencyLimitError` so existing 429 handling is unchanged.
+    """
+
+    error_type = "capacity_unavailable"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str | None = None,
+        holder: str | None = None,
+        backend: str | None = None,
+        model: str | None = None,
+        state: str | None = None,
+        remediation: str | None = None,
+        code: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            backend=backend,
+            model=model,
+            state=state,
+            remediation=remediation,
+            code=code,
+            headers=headers,
+        )
+        #: Machine-readable cause, e.g. "measured_insufficient" / "declared_insufficient".
+        self.reason = reason
+        #: What holds the memory (alias(es) or a measured-device description).
+        self.holder = holder
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = super().to_payload()
+        payload["error"]["reason"] = self.reason
+        payload["error"]["holder"] = self.holder
+        return payload
+
+
+class ReleaseStuckError(BrokerError):
+    """A broker-spawned runtime did not release its device after unload (ADR 0020).
+
+    After evicting a model the broker waits (bounded by
+    ``BROKER_RELEASE_TIMEOUT_SECONDS``) for the process group to exit AND — when
+    telemetry is on — for the device to stop reporting that group's PIDs. If the
+    memory never comes back, the next load fails with this **503** naming the stuck
+    holder (PID, device, MiB still held) instead of starting into an OOM. The
+    broker never force-resets the GPU or kills a process it did not start.
+    """
+
+    http_status = 503
+    error_type = "release_stuck"
+
+
 class RequestTooLargeError(BrokerError):
     """Request body exceeded the configured size limit."""
 

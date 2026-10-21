@@ -42,6 +42,7 @@ links the ADR that records the decision. Every item below is resolved: ✅ done 
 | 10 | Response caching (exact, then optional semantic) | ✅ done — exact cache ([0012](adr/0012-caching-runtime-control-observability.md)); semantic cache + streaming replay + per-request TTL/namespace controls ([0014](adr/0014-semantic-cache-and-cache-extensions.md)) | [0012](adr/0012-caching-runtime-control-observability.md) · [0014](adr/0014-semantic-cache-and-cache-extensions.md) |
 | 11 | Runtime control: manual unload + registry hot-reload | ✅ done — unload/load + transactional reload | [0012](adr/0012-caching-runtime-control-observability.md) |
 | 12 | OpenTelemetry tracing + optional web UI/playground | ✅ done — tracing (metadata [0012](adr/0012-caching-runtime-control-observability.md); **opt-in span content capture** [0014](adr/0014-semantic-cache-and-cache-extensions.md)); web UI ([0015](adr/0015-web-ui-playground.md)) | [0012](adr/0012-caching-runtime-control-observability.md) · [0014](adr/0014-semantic-cache-and-cache-extensions.md) · [0015](adr/0015-web-ui-playground.md) |
+| 13 | GPU-safe model swapping: vendor-neutral memory telemetry + measured release + memory-aware admission | ✅ done — opt-in, default OFF; `off`/`nvidia`/`amd`/`host`/`auto` providers, `release_stuck`, sized models with declared/measured budgets | [0020](adr/0020-resource-telemetry-and-measured-release.md) · [0022](adr/0022-memory-aware-admission.md) |
 
 ## Notes
 

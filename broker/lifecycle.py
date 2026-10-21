@@ -29,17 +29,23 @@ class State(str, enum.Enum):
     UNLOADING = "unloading"
     FAILED = "failed"
     STOPPING = "stopping"
+    # ADR 0020: the process was stopped but its device memory has not come back
+    # within BROKER_RELEASE_TIMEOUT_SECONDS (a lazy-reclaim or zombie context).
+    # Visible in /status with the stuck holder; the next load on that device fails
+    # 503 rather than starting into an OOM.
+    RELEASE_STUCK = "release_stuck"
 
 
 # Allowed transitions. A state maps to the set of states it may move to.
 _TRANSITIONS: dict[State, set[State]] = {
-    State.UNLOADED: {State.LOADING, State.STOPPING},
+    State.UNLOADED: {State.LOADING, State.STOPPING, State.RELEASE_STUCK},
     State.LOADING: {State.READY, State.FAILED, State.STOPPING},
     State.READY: {State.BUSY, State.UNLOADING, State.STOPPING, State.FAILED},
     State.BUSY: {State.READY, State.UNLOADING, State.STOPPING, State.FAILED},
-    State.UNLOADING: {State.UNLOADED, State.FAILED, State.STOPPING},
+    State.UNLOADING: {State.UNLOADED, State.FAILED, State.STOPPING, State.RELEASE_STUCK},
     State.FAILED: {State.UNLOADED, State.LOADING, State.STOPPING},
     State.STOPPING: {State.UNLOADED, State.FAILED},
+    State.RELEASE_STUCK: {State.UNLOADED, State.LOADING, State.STOPPING},
 }
 
 
@@ -55,6 +61,11 @@ class LifecycleMachine:
     loaded_at: float | None = None
     pid: int | None = None
     history: list[tuple[str, float]] = field(default_factory=list)
+    # ADR 0020: set when a stop() left the process alive after SIGKILL (telemetry
+    # off path) or when measured release timed out (release_stuck). Surfaced in
+    # /status so a stuck device is visible instead of silently swallowed.
+    survived_kill: bool = False
+    release_info: dict | None = None
 
     def can(self, target: State) -> bool:
         return target in _TRANSITIONS[self.state]
@@ -78,6 +89,9 @@ class LifecycleMachine:
         if target == State.UNLOADED:
             self.loaded_at = None
             self.pid = None
+        if target == State.LOADING:
+            self.survived_kill = False
+            self.release_info = None
         if error is not None:
             self.last_error = error
 
@@ -105,4 +119,6 @@ class LifecycleMachine:
             "loaded_at": self.loaded_at,
             "pid": self.pid,
             "last_error": self.last_error,
+            "survived_kill": self.survived_kill,
+            "release_info": self.release_info,
         }

@@ -296,7 +296,37 @@ carry **all** required labels; if none qualify the broker returns
 | Env var | Type | Default | Description |
 |---------|------|---------|-------------|
 | `BROKER_GPU_VISIBLE` | bool | `false` | Whether GPUs are exposed to the broker/runtimes. |
-| `BROKER_CUDA_VISIBLE_DEVICES` | str? | _(none)_ | e.g. `0,1`; sets device visibility for broker-managed runtimes. |
+| `BROKER_CUDA_VISIBLE_DEVICES` | str? | _(none)_ | e.g. `0,1`; sets device visibility for broker-managed runtimes (the var name follows the active provider — see below). |
+
+## Resource telemetry + measured release (ADR 0020)
+
+Opt-in, vendor-neutral, **default OFF** (behavior equals v0.6.0). See the
+[GPU memory guide](guides/gpu-memory.md). Providers shell out argv-only to an
+absolute/allow-listed driver binary with a timeout and parse defensively; a failed
+probe degrades to `unavailable` (never a crash, never an invented number).
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_GPU_TELEMETRY` | str | `off` | Telemetry provider: `off`, `nvidia` (`nvidia-smi` query mode), `amd` (`amd-smi`/`rocm-smi` JSON), `host` (system RAM — CPU / Apple-silicon unified memory), or `auto` (probe `nvidia`→`amd`→`host`). |
+| `BROKER_GPU_TELEMETRY_POLL_SECONDS` | float | `5.0` | How long a telemetry sample is cached before the next probe. |
+| `BROKER_GPU_TELEMETRY_TIMEOUT_SECONDS` | float | `4.0` | Per-probe subprocess timeout. |
+| `BROKER_GPU_TELEMETRY_NVIDIA_SMI_PATH` | str? | _(none)_ | Absolute path override for `nvidia-smi` (else an allow-list of standard locations is searched; PATH is never used). |
+| `BROKER_GPU_TELEMETRY_AMD_SMI_PATH` | str? | _(none)_ | Absolute path override for `amd-smi`. |
+| `BROKER_GPU_TELEMETRY_ROCM_SMI_PATH` | str? | _(none)_ | Absolute path override for `rocm-smi`. |
+| `BROKER_GPU_DEVICE_ENV_VAR` | str? | _(none)_ | Device-isolation env var set for a broker-spawned runtime. Unset ⇒ derived from the provider: `amd` → `ROCR_VISIBLE_DEVICES`, else `CUDA_VISIBLE_DEVICES` (the portable default). Override e.g. with `HIP_VISIBLE_DEVICES`. |
+| `BROKER_RELEASE_TIMEOUT_SECONDS` | float | `30.0` | After evicting a broker-spawned runtime, how long the next load on the same device waits for the process group to exit and (telemetry on) the device to stop reporting its PIDs. On timeout the model enters `release_stuck` and the load fails **503** instead of OOMing. `0` = don't wait. |
+
+## Memory-aware admission (ADR 0022)
+
+Opt-in, **default OFF**. A model with `memory_mib` in the registry is admitted only
+if it fits the device budget — measured free memory when telemetry is on, else the
+declared budget below. See [model-registry.md](model-registry.md) and the
+[GPU memory guide](guides/gpu-memory.md).
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_GPU_MEMORY_BUDGET_MIB` | str? | _(none)_ | Declared per-device budget (MiB) used when telemetry is OFF. A single integer (`40000`, every device) or a per-device map (`0=24000,1=48000`; key `default` covers unpinned models). |
+| `BROKER_GPU_MEMORY_HEADROOM_MIB` | int | `1024` | Headroom subtracted from **measured** free memory before admitting a sized model, so a load never consumes the last sliver of a device. |
 
 ## Cache / tmp
 

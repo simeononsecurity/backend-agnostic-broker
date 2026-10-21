@@ -116,7 +116,10 @@ Error types and HTTP status: `config_error` (500), `invalid_request_error`
 (404), `model_load_error` (503), `backend_unavailable` (502), `timeout_error`
 (504), `rate_limit_error` (429), `rate_limit_exceeded` (429, per-key
 rpm/tpm/concurrency), `insufficient_quota` (429, per-key budget exhausted),
-`request_too_large` (413), `upstream_client_error` (the upstream 4xx; see below).
+`capacity_unavailable` (429, memory-aware admission — ADR 0022; carries `reason`
+and `holder`), `release_stuck` (503, a runtime did not release its device after
+eviction — ADR 0020), `request_too_large` (413), `upstream_client_error` (the
+upstream 4xx; see below).
 
 ### Upstream backend errors (ADR 0017)
 
@@ -193,8 +196,16 @@ member aliases), loaded/limit counts, and routing info: `route_strategy`,
 `cooldowns_enabled`, and a `reliability` block (ejection cap, cooldown
 growth/decay, single-trial half-open, Retry-After, Redis sticky bound — ADR 0017).
 
+When `BROKER_GPU_TELEMETRY` is on (ADR 0020/0022), a `resources` block is included:
+`telemetry` (provider/enabled/poll), measured `devices` (`source: measured`, with
+per-PID `processes`), `admission` (declared `budget_mib`, `headroom_mib`, recent
+decisions), `release` timeout, any `release_stuck` holders, and — for Ollama —
+separately-labeled `reported` daemon memory (never mixed with `measured`). With
+telemetry off, `resources.source` is `null` and `devices` is empty.
+`GET /healthz/backends` carries the same `resources` block.
+
 ```bash
-curl -s -H "Authorization: Bearer my-key" http://127.0.0.1:8080/status
+curl -s -H "Authorization: Bearer ***" http://127.0.0.1:8080/status
 ```
 
 ### `GET /v1/models` — list models (auth)

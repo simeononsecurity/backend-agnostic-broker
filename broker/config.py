@@ -374,6 +374,45 @@ class Settings(BaseSettings):
     gpu_visible: bool = False
     cuda_visible_devices: str | None = None  # e.g. "0,1"
 
+    # --- Resource telemetry + measured release (ADR 0020; opt-in, default OFF) ---
+    # Provider that measures per-device memory (and, where exposed, which PIDs hold
+    # it): "off" (DEFAULT; behavior == v0.6.0), "nvidia" (nvidia-smi query mode),
+    # "amd" (amd-smi/rocm-smi JSON), "host" (system RAM — CPU / Apple-silicon
+    # unified memory), or "auto" (probe nvidia -> amd -> host). Providers shell out
+    # argv-only to an absolute/allow-listed binary with a timeout and parse
+    # defensively; a failed probe degrades to "unavailable", never a crash.
+    gpu_telemetry: str = "off"
+    # How long a telemetry sample is cached before the next probe (seconds).
+    gpu_telemetry_poll_seconds: float = 5.0
+    # Per-probe subprocess timeout (seconds).
+    gpu_telemetry_timeout_seconds: float = 4.0
+    # Optional absolute path overrides for the driver tools (else an allow-list of
+    # standard locations is searched; PATH is never consulted).
+    gpu_telemetry_nvidia_smi_path: str | None = None
+    gpu_telemetry_amd_smi_path: str | None = None
+    gpu_telemetry_rocm_smi_path: str | None = None
+    # Device-isolation env var set for a broker-spawned runtime. Unset => derived
+    # from the active provider: "amd" -> ROCR_VISIBLE_DEVICES, else
+    # CUDA_VISIBLE_DEVICES (the portable default). Override e.g. with
+    # HIP_VISIBLE_DEVICES when a runtime requires it.
+    gpu_device_env_var: str | None = None
+    # Measured release: after evicting a broker-spawned runtime the next load on
+    # the same device waits up to this long for the process group to exit and (when
+    # telemetry is on) for the device to stop reporting its PIDs. On timeout the
+    # model enters `release_stuck` and the waiting load fails 503 instead of OOMing.
+    release_timeout_seconds: float = 30.0
+
+    # --- Memory-aware admission (ADR 0022; opt-in, default OFF) ---
+    # Declared per-device budget (MiB) used for admission when telemetry is OFF.
+    # Either a single integer applied to every device ("40000") or a per-device map
+    # ("0=24000,1=48000"; the key "default" covers unpinned models). Unset => no
+    # declared accounting (models with memory_mib then need telemetry on to be
+    # sized, else they keep count-only behavior).
+    gpu_memory_budget_mib: str | None = None
+    # Headroom (MiB) subtracted from MEASURED free memory before admitting a sized
+    # model, so a load never consumes the last sliver of a device.
+    gpu_memory_headroom_mib: int = 1024
+
     # --- Cache / tmp ---
     cache_dir: str = "/var/cache/broker"
     tmp_dir: str = "/tmp/broker"
@@ -435,6 +474,43 @@ class Settings(BaseSettings):
         if v not in ("auto", "llm", "heuristic", "off"):
             raise ValueError("router_backend must be 'auto', 'llm', 'heuristic', or 'off'")
         return v
+
+    @field_validator("gpu_telemetry")
+    @classmethod
+    def _gpu_telemetry(cls, v: str) -> str:
+        if v not in ("off", "nvidia", "amd", "host", "auto"):
+            raise ValueError("gpu_telemetry must be 'off', 'nvidia', 'amd', 'host', or 'auto'")
+        return v
+
+    def gpu_memory_budget_map(self) -> dict[str, int]:
+        """Parse ``gpu_memory_budget_mib`` into a ``{device_key: MiB}`` map.
+
+        Accepts a single integer (``"40000"`` -> applies to every device under the
+        special key ``"*"``) or a comma-separated per-device map
+        (``"0=24000,1=48000,default=16000"``). Empty/unset -> ``{}``.
+        """
+        raw = self.gpu_memory_budget_mib
+        if raw is None or not str(raw).strip():
+            return {}
+        raw = str(raw).strip()
+        out: dict[str, int] = {}
+        if "=" not in raw:
+            out["*"] = int(raw)
+            return out
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            key, _, val = part.partition("=")
+            out[key.strip()] = int(val.strip())
+        return out
+
+    def budget_for_device(self, device_key: str) -> int | None:
+        """Declared budget (MiB) for a device key, honoring an explicit key then ``*``."""
+        m = self.gpu_memory_budget_map()
+        if device_key in m:
+            return m[device_key]
+        return m.get("*")
 
     def validate_runtime(self) -> None:
         """Cross-field, fail-fast checks run once at startup."""
@@ -568,6 +644,34 @@ class Settings(BaseSettings):
                 ) from exc
         if self.rerank_max_documents < 1:
             raise ConfigError("BROKER_RERANK_MAX_DOCUMENTS must be >= 1")
+        if self.gpu_telemetry_poll_seconds < 0:
+            raise ConfigError("BROKER_GPU_TELEMETRY_POLL_SECONDS must be >= 0")
+        if self.gpu_telemetry_timeout_seconds <= 0:
+            raise ConfigError("BROKER_GPU_TELEMETRY_TIMEOUT_SECONDS must be > 0")
+        if self.release_timeout_seconds < 0:
+            raise ConfigError("BROKER_RELEASE_TIMEOUT_SECONDS must be >= 0 (0 = don't wait)")
+        if self.gpu_memory_headroom_mib < 0:
+            raise ConfigError("BROKER_GPU_MEMORY_HEADROOM_MIB must be >= 0")
+        for _tool_path in (
+            self.gpu_telemetry_nvidia_smi_path,
+            self.gpu_telemetry_amd_smi_path,
+            self.gpu_telemetry_rocm_smi_path,
+        ):
+            if _tool_path and not Path(_tool_path).is_absolute():
+                raise ConfigError(
+                    f"telemetry tool path {_tool_path!r} must be absolute",
+                    remediation="give an absolute path to the driver binary, or unset it",
+                )
+        try:
+            budgets = self.gpu_memory_budget_map()
+        except ValueError as exc:
+            raise ConfigError(
+                f"invalid BROKER_GPU_MEMORY_BUDGET_MIB: {exc}",
+                remediation="use an integer (e.g. '40000') or a map '0=24000,1=48000'",
+            ) from exc
+        for _k, _v in budgets.items():
+            if _v < 0:
+                raise ConfigError("BROKER_GPU_MEMORY_BUDGET_MIB values must be >= 0")
         if not Path(self.registry_path).exists():
             raise ConfigError(
                 f"registry not found: {self.registry_path!r}",

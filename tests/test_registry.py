@@ -44,6 +44,28 @@ def test_supports_rerank_defaults_false_and_parses(tmp_path):
     assert by["plain"].supports_rerank is False  # default
 
 
+def test_memory_mib_parses_and_defaults_none(tmp_path):
+    # ADR 0022: optional per-model memory_mib for memory-aware admission.
+    p = tmp_path / "mem.yaml"
+    p.write_text(
+        "models:\n"
+        "  - alias: big\n    backend: fake\n    runtime_model_id: x\n    memory_mib: 40000\n"
+        "  - alias: plain\n    backend: fake\n    runtime_model_id: y\n"
+    )
+    by = load_registry(str(p)).by_alias()
+    assert by["big"].memory_mib == 40000
+    assert by["plain"].memory_mib is None  # unsized -> v0.6.0 behavior
+
+
+def test_memory_mib_must_be_positive(tmp_path):
+    p = tmp_path / "bad.yaml"
+    p.write_text(
+        "models:\n  - alias: a\n    backend: fake\n    runtime_model_id: x\n    memory_mib: 0\n"
+    )
+    with pytest.raises(ConfigError):
+        load_registry(str(p))
+
+
 def test_unknown_backend_rejected(tmp_path):
     p = tmp_path / "bad.yaml"
     p.write_text("models:\n  - alias: a\n    backend: nope\n    runtime_model_id: x\n")
