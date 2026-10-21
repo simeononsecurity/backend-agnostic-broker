@@ -118,8 +118,23 @@ Error types and HTTP status: `config_error` (500), `invalid_request_error`
 rpm/tpm/concurrency), `insufficient_quota` (429, per-key budget exhausted),
 `capacity_unavailable` (429, memory-aware admission — ADR 0022; carries `reason`
 and `holder`), `release_stuck` (503, a runtime did not release its device after
-eviction — ADR 0020), `request_too_large` (413), `upstream_client_error` (the
-upstream 4xx; see below).
+eviction — ADR 0020), `queue_full` (429, the admission queue is full — ADR 0023;
+carries `trigger` + `Retry-After`), `queue_timeout` (503, a queued request waited
+past `BROKER_QUEUE_MAX_WAIT_SECONDS` — ADR 0023; carries `trigger` + `Retry-After`),
+`request_too_large` (413), `upstream_client_error` (the upstream 4xx; see below).
+
+### Admission queue headers + errors (ADR 0023)
+
+When `BROKER_QUEUE_ENABLED` is on, a non-streaming response that waited in the
+admission queue carries `x-broker-queue-wait-ms` and `x-broker-queue-trigger`.
+A request rejected because the queue is full returns **429** `queue_full`; a
+request that waited past the limit returns **503** `queue_timeout`; both carry
+`Retry-After` and a `trigger` naming the overload. Per-key **quota** 429s
+(`rate_limit_exceeded` / `insufficient_quota`) are never queued — they are a
+caller limit, distinct from these server-overload codes. Streaming requests
+surface their wait in `GET /status` and traces (SSE headers are flushed before
+the pre-first-byte wait); a full/timed-out streaming request returns a JSON error
+in the stream.
 
 ### Upstream backend errors (ADR 0017)
 

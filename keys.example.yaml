@@ -42,6 +42,10 @@
 #     per_model             per-model rpm/tpm overrides (ADR 0016), enforced on
 #                           the RESOLVED model incl. auto + every cascade hop:
 #                             per_model: {chat: {rpm: 30, tpm: 50000}}
+#     priority              ADR 0023 admission-queue priority (default 0). Higher =
+#                           served earlier under overload, with aging so lower
+#                           priorities never starve. Ordering ONLY — never a gate
+#                           or quota (a key with just a priority stays unlimited).
 #
 # tenants:  (optional, ADR 0016) aggregate token/cost budgets shared by EVERY key
 #   of a tenant, enforced IN ADDITION to per-key budgets (a request must pass all
@@ -67,6 +71,7 @@ keys:
       monthly_cost_usd: 100.0
       allowed_models: [chat, auto]
       placement: [local]
+      priority: 10          # ADR 0023: served ahead of default (0) under overload
       per_model:
         chat:
           rpm: 30

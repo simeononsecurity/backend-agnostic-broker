@@ -330,3 +330,68 @@ class ConflictError(BrokerError):
 
     http_status = 409
     error_type = "conflict"
+
+
+class QueueFullError(ConcurrencyLimitError):
+    """The admission queue is full; the request was not enqueued (ADR 0023).
+
+    Returned when a newly arriving request would exceed the configured queue
+    depth (global or per model). Maps to **429** ``queue_full`` — the client is
+    contributing to overload and should back off — and carries ``Retry-After``.
+    Subclasses :class:`ConcurrencyLimitError` so existing 429 handling (and the
+    "a quota 429 is never queued" invariant) is unaffected. Distinct from a
+    per-key quota 429 (``rate_limit_exceeded`` / ``insufficient_quota``): this is
+    a *server* capacity signal, not a per-key limit, and it is never itself
+    re-queued. Carries the ``trigger`` that caused the request to need queueing.
+    """
+
+    error_type = "queue_full"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        trigger: str | None = None,
+        depth: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message, **kwargs)
+        self.trigger = trigger
+        self.depth = depth
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = super().to_payload()
+        payload["error"]["trigger"] = self.trigger
+        return payload
+
+
+class QueueTimeoutError(BrokerError):
+    """A queued request waited longer than ``BROKER_QUEUE_MAX_WAIT_SECONDS`` (ADR 0023).
+
+    Maps to **503** ``queue_timeout``: the service was overloaded for the whole
+    wait budget, independent of the caller (vLLM rejects an over-full admission
+    queue with 503; Envoy overflows its pending-request queue with 503). Carries
+    ``Retry-After`` and the ``trigger`` that kept the request waiting so an
+    operator/client sees *why*. A timed-out request never started streaming, so
+    the client can safely retry.
+    """
+
+    http_status = 503
+    error_type = "queue_timeout"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        trigger: str | None = None,
+        waited_ms: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message, **kwargs)
+        self.trigger = trigger
+        self.waited_ms = waited_ms
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = super().to_payload()
+        payload["error"]["trigger"] = self.trigger
+        return payload

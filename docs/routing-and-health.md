@@ -72,6 +72,15 @@ Each member keeps its **own** independent lifecycle, load lock, per-model
 concurrency, and idle timer. `BROKER_MAX_LOADED_MODELS` and
 `BROKER_PER_MODEL_MAX_CONCURRENCY` still apply per member.
 
+> **Admission queue (ADR 0023).** Routing picks the member *before* any admission
+> queueing. With `BROKER_QUEUE_ENABLED`, a chosen member that is saturated or
+> overloaded makes the request **wait in a bounded, fair queue** (served when
+> capacity frees, or 429 `queue_full` / 503 `queue_timeout` + `Retry-After`)
+> rather than blocking the semaphore or failing. The queue **never switches the
+> model** and composes with failover (a queue verdict is terminal — it does not
+> fail over and re-queue elsewhere). See the
+> [request queueing guide](guides/request-queueing.md).
+
 > **Sending a session id.** Any client can set `X-Session-Id: <conversation-id>`
 > to control stickiness explicitly. OpenAI SDKs that send `user` get stickiness
 > per user for free. With neither, callers are stuck per source IP.

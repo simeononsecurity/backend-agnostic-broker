@@ -50,14 +50,27 @@ import asyncio
 import itertools
 import json
 import logging
+import os
 import random
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 from .adapters import make_adapter
+from .admission import (
+    TRIGGER_BACKEND_BACKPRESSURE,
+    TRIGGER_CAPACITY_MEMORY,
+    TRIGGER_DEVICE_MEMORY,
+    TRIGGER_GLOBAL_CONCURRENCY,
+    TRIGGER_HOST_LOAD,
+    TRIGGER_MAX_LOADED,
+    TRIGGER_MODEL_CONCURRENCY,
+    AdmissionQueue,
+    Waiter,
+)
 from .cache_routing import CacheRouter
 from .config import Settings
 from .errors import (
@@ -70,11 +83,21 @@ from .errors import (
     ModelLoadError,
     ModelNotFoundError,
     PlacementDeniedError,
+    QueueFullError,
+    QueueTimeoutError,
     ReleaseStuckError,
     TimeoutError_,
     ValidationError,
 )
 from .lifecycle import LifecycleMachine, State
+from .metrics import (
+    QUEUE_ADMITTED,
+    QUEUE_DEPTH,
+    QUEUE_ENQUEUED,
+    QUEUE_REJECTED,
+    QUEUE_TIMEOUTS,
+    QUEUE_WAIT_SECONDS,
+)
 from .registry import ModelEntry, Registry, load_registry
 from .reliability import ErrorClass, RetryPolicy, classify_error, retry_after_seconds
 from .resources import TelemetrySample, make_telemetry
@@ -83,6 +106,21 @@ from .state import make_state_store
 from .tracing import make_tracer
 
 log = logging.getLogger("broker.manager")
+
+
+class _WouldBlock(Exception):  # noqa: N818 - internal control-flow signal, not an error
+    """Internal: admission cannot proceed right now; the caller should queue.
+
+    Never surfaces to a client — it is caught inside the admission loop and
+    turned into a queue wait (or, if the queue is full/times out, a typed
+    :class:`QueueFullError` / :class:`QueueTimeoutError`). Carries the overload
+    ``trigger`` that blocked admission.
+    """
+
+    def __init__(self, trigger: str) -> None:
+        super().__init__(trigger)
+        self.trigger = trigger
+
 
 #: Exceptions that make a pool member a failover candidate under the DEFAULT
 #: per-error policy (ADR 0009). ADR 0017's ``RetryPolicy`` is authoritative — it
@@ -187,6 +225,10 @@ class ManagedModel:
         # by the non-loading health probe when cache-aware routing wants it; None
         # falls back to in-flight counts. See ADR 0010.
         self.last_load: float | None = None
+        # Monotonic deadline until which this member is treated as under upstream
+        # backpressure (ADR 0017 429 + Retry-After). The ADR 0023 admission queue
+        # reads it as a backend-backpressure overload trigger. 0 = not throttled.
+        self.backpressure_until: float = 0.0
 
     async def ensure_ready(self) -> None:
         """Start + ready the model if needed, exactly once, under the load lock."""
@@ -321,6 +363,15 @@ class ModelManager:
         # Recent memory-aware admission decisions (ADR 0022), newest last, for
         # /status visibility and debugging.
         self._admissions: deque[dict[str, Any]] = deque(maxlen=50)
+        # Admission queue (ADR 0023): bounded/fair/timed waiting room in front of
+        # model serving. A no-op passthrough unless BROKER_QUEUE_ENABLED, so the
+        # default path keeps exact v0.6.0 concurrency behavior.
+        self.admission = AdmissionQueue(settings)
+        self._queue_pump_task: asyncio.Task | None = None
+        # Cheap, cached host 1-min load-average-per-CPU for the host overload
+        # trigger (os.getloadavg; refreshed at most once per poll interval).
+        self._host_load_value: float | None = None
+        self._host_load_at: float = 0.0
 
     # --- validation ------------------------------------------------------
     def validate_all(self) -> None:
@@ -997,6 +1048,14 @@ class ModelManager:
         on repeated ejections via ``cooldown_backoff_multiplier`` (capped by
         ``cooldown_max_seconds``).
         """
+        # ADR 0023: record an upstream-backpressure window on the member so the
+        # admission queue's backend-backpressure trigger can hold new requests
+        # until it clears. Independent of the cooldown machinery (works even with
+        # cooldowns off), and only for an actual 429/Retry-After backpressure.
+        if error_class is ErrorClass.BACKPRESSURE and retry_after is not None and retry_after > 0:
+            cap = self.settings.retry_after_max_seconds
+            window = min(retry_after, cap) if cap > 0 else retry_after
+            m.backpressure_until = time.monotonic() + window
         if self.settings.cooldown_failures <= 0:
             return
         if retry_after is not None and retry_after > 0:
@@ -1345,6 +1404,328 @@ class ModelManager:
                 remediation="request a model in the key's allowed_models list",
             )
 
+    # --- admission queue (ADR 0023) --------------------------------------
+    @staticmethod
+    def _sem_free(sem: asyncio.Semaphore) -> int:
+        """Free permits on a semaphore (0 when fully taken). Read-only."""
+        return max(0, getattr(sem, "_value", 0))
+
+    def _model_free_slots(self, alias: str) -> int:
+        m = self.models.get(alias)
+        return self._sem_free(m.sem) if m is not None else 0
+
+    def _pump_now(self) -> None:
+        """Wake the best-eligible queued waiters (no-op when the queue is off)."""
+        if not self.admission.enabled:
+            return
+        self.admission.pump(
+            lambda: self._sem_free(self.global_sem),
+            self._model_free_slots,
+        )
+
+    def _release_slots(self, m: ManagedModel) -> None:
+        """Release the global + per-model concurrency slots and re-pump."""
+        m.sem.release()
+        self.global_sem.release()
+        self._pump_now()
+
+    def _queueable_capacity_trigger(self, exc: BrokerError) -> str | None:
+        """Map a capacity/concurrency error to a queue trigger, or None (fail fast).
+
+        A capacity error is *queueable* only if waiting could ever let it through:
+        a concurrency/memory holder may go idle. ``exceeds_device_capacity``
+        (ADR 0020/0022) can never fit even with everything evicted, so it is never
+        queued — it fails fast. Honors ``queue_trigger_capacity``.
+        """
+        if not self.settings.queue_trigger_capacity:
+            return None
+        if isinstance(exc, CapacityUnavailableError):
+            if getattr(exc, "reason", None) == "exceeds_device_capacity":
+                return None
+            return TRIGGER_CAPACITY_MEMORY
+        if isinstance(exc, ConcurrencyLimitError):
+            # _evict_for_count: "max loaded models reached and no idle model to evict".
+            return TRIGGER_MAX_LOADED
+        return None
+
+    def _host_load_per_cpu(self) -> float | None:
+        """1-minute load average per CPU, cached briefly. None if unavailable."""
+        now = time.monotonic()
+        ttl = max(0.2, self.settings.queue_pump_interval_seconds)
+        if self._host_load_value is not None and (now - self._host_load_at) < ttl:
+            return self._host_load_value
+        try:
+            avg1 = os.getloadavg()[0]
+        except (OSError, AttributeError):  # not available on this platform (e.g. Windows)
+            self._host_load_value = None
+            self._host_load_at = now
+            return None
+        ncpu = os.cpu_count() or 1
+        self._host_load_value = avg1 / ncpu
+        self._host_load_at = now
+        return self._host_load_value
+
+    def _host_overloaded(self) -> bool:
+        cap = self.settings.queue_host_load_per_cpu_max
+        if cap <= 0:
+            return False
+        load = self._host_load_per_cpu()
+        return load is not None and load > cap
+
+    async def _device_overload(self, m: ManagedModel) -> str | None:
+        """Measured device-memory pressure on the model's device(s) (telemetry on)."""
+        s = self.settings
+        sample = await self.telemetry_sample()
+        if not sample.ok:
+            return None
+        keys = m.adapter.device_keys()
+        for d in self._relevant_devices(sample, keys):
+            if (
+                s.queue_device_free_mib_min > 0
+                and d.free_mib is not None
+                and d.free_mib < s.queue_device_free_mib_min
+            ):
+                return TRIGGER_DEVICE_MEMORY
+            if (
+                s.queue_device_used_fraction_max > 0
+                and d.total_mib
+                and d.used_mib is not None
+                and (d.used_mib / d.total_mib) > s.queue_device_used_fraction_max
+            ):
+                return TRIGGER_DEVICE_MEMORY
+        return None
+
+    def _backend_overload(self, m: ManagedModel) -> str | None:
+        """Backend backpressure: upstream 429/Retry-After window or vLLM queue depth."""
+        s = self.settings
+        if m.backpressure_until and time.monotonic() < m.backpressure_until:
+            return TRIGGER_BACKEND_BACKPRESSURE
+        if (
+            s.queue_backend_waiting_max > 0
+            and m.last_load is not None
+            and m.last_load > s.queue_backend_waiting_max
+        ):
+            return TRIGGER_BACKEND_BACKPRESSURE
+        return None
+
+    async def _overload_trigger(self, m: ManagedModel) -> str | None:
+        """First active *soft* overload trigger for ``m``, or None.
+
+        Soft triggers hold a request in the queue even when a concurrency slot is
+        free. Telemetry-based device pressure is inactive unless telemetry is on.
+        """
+        s = self.settings
+        if s.queue_trigger_device_memory and self.telemetry_enabled():
+            t = await self._device_overload(m)
+            if t is not None:
+                return t
+        if s.queue_trigger_host and self._host_overloaded():
+            return TRIGGER_HOST_LOAD
+        if s.queue_trigger_backend:
+            t = self._backend_overload(m)
+            if t is not None:
+                return t
+        return None
+
+    async def _acquire_admission(
+        self, m: ManagedModel, *, blocking: bool, honor_reject_policy: bool = True
+    ) -> None:
+        """Make room (evict), ready the model, and take the global + model slots.
+
+        ``blocking=True`` reproduces v0.6.0 exactly (queue off): it may block on
+        the semaphores and (when ``honor_reject_policy``) honors
+        ``load_concurrency_policy='reject'``. The streaming path passes
+        ``honor_reject_policy=False`` because v0.6.0 streaming always waited on the
+        semaphores and never rejected. ``blocking=False`` (queue on) never blocks:
+        it raises :class:`_WouldBlock` with the overload trigger whenever it cannot
+        admit right now, so the caller can wait in the fair queue. On success BOTH
+        slots are held and the caller MUST release them with :meth:`_release_slots`.
+        """
+        if not blocking:
+            trig = await self._overload_trigger(m)
+            if trig is not None:
+                raise _WouldBlock(trig)
+        try:
+            await self._maybe_evict(m.entry.alias)
+        except (CapacityUnavailableError, ConcurrencyLimitError) as exc:
+            if not blocking:
+                qt = self._queueable_capacity_trigger(exc)
+                if qt is not None:
+                    raise _WouldBlock(qt) from exc
+            raise
+        await m.ensure_ready()
+        if blocking:
+            await self.global_sem.acquire()
+            try:
+                if (
+                    honor_reject_policy
+                    and m.sem.locked()
+                    and self.settings.load_concurrency_policy == "reject"
+                ):
+                    raise ConcurrencyLimitError(
+                        f"per-model concurrency limit for {m.entry.alias}",
+                        model=m.entry.alias,
+                        remediation="retry later or raise per-model concurrency",
+                    )
+                await m.sem.acquire()
+            except BaseException:
+                self.global_sem.release()
+                raise
+            return
+        # Non-blocking (queue on): both acquisitions complete synchronously when a
+        # permit is free, so there is no interleaving window between the checks.
+        if self._sem_free(self.global_sem) <= 0:
+            raise _WouldBlock(TRIGGER_GLOBAL_CONCURRENCY)
+        await self.global_sem.acquire()
+        if m.sem.locked():
+            self.global_sem.release()
+            raise _WouldBlock(TRIGGER_MODEL_CONCURRENCY)
+        await m.sem.acquire()
+
+    def _queue_retry_after_headers(self) -> dict[str, str]:
+        ra = max(0, int(round(self.settings.queue_retry_after_seconds)))
+        return {"Retry-After": str(ra)}
+
+    async def _wait_for_turn(self, waiter: Waiter, deadline: float | None) -> None:
+        """Block until this waiter is woken, or raise :class:`QueueTimeoutError`."""
+        if deadline is None:
+            await waiter.event.wait()
+            return
+        remaining = deadline - self.admission.clock()
+        if remaining <= 0:
+            self._raise_queue_timeout(waiter)
+        try:
+            await asyncio.wait_for(waiter.event.wait(), timeout=remaining)
+        except TimeoutError:
+            self._raise_queue_timeout(waiter)
+
+    def _raise_queue_timeout(self, waiter: Waiter) -> None:
+        self.admission.record_timeout(waiter)
+        QUEUE_TIMEOUTS.labels(waiter.trigger).inc()
+        waited_ms = (self.admission.clock() - waiter.enqueued_at) * 1000.0
+        raise QueueTimeoutError(
+            f"request for {waiter.alias!r} waited "
+            f"{self.settings.queue_max_wait_seconds}s in the admission queue "
+            f"(overload: {waiter.trigger}) and timed out",
+            trigger=waiter.trigger,
+            waited_ms=waited_ms,
+            model=waiter.alias,
+            headers=self._queue_retry_after_headers(),
+            remediation="retry after Retry-After; raise BROKER_QUEUE_MAX_WAIT_SECONDS or add capacity",
+        )
+
+    async def _queue_admit(
+        self, m: ManagedModel, queue_key: str, queue_priority: int
+    ) -> tuple[float, str | None]:
+        """Admit ``m`` through the bounded fair queue. Returns (waited_ms, trigger).
+
+        Fast path: if admission succeeds immediately, return (0, None). Otherwise
+        the request joins the queue (or 429s if it is full) and waits its fair
+        turn, retrying admission on each wake until it is served or times out.
+        """
+        # Fast path: only when NOBODY is already waiting, so a fresh arrival can
+        # never jump ahead of the queue (FIFO/fairness). If anyone is queued, this
+        # request takes its fair place at the back.
+        if self.admission.depth() == 0:
+            try:
+                await self._acquire_admission(m, blocking=False)
+                return 0.0, None
+            except _WouldBlock as wb:
+                first_trigger = wb.trigger
+        else:
+            first_trigger = await self._overload_trigger(m) or TRIGGER_MODEL_CONCURRENCY
+        try:
+            waiter = self.admission.enqueue(m.entry.alias, queue_key, queue_priority, first_trigger)
+        except QueueFullError as qf:
+            QUEUE_REJECTED.labels(qf.trigger or first_trigger).inc()
+            qf.headers.setdefault("Retry-After", self._queue_retry_after_headers()["Retry-After"])
+            raise
+        QUEUE_ENQUEUED.labels(first_trigger).inc()
+        QUEUE_DEPTH.set(self.admission.depth())
+        max_wait = self.settings.queue_max_wait_seconds
+        deadline = (waiter.enqueued_at + max_wait) if max_wait > 0 else None
+        try:
+            # A fresh waiter may be admissible already (a slot freed between the
+            # fast-path miss and enqueue); pump once so it is considered.
+            self._pump_now()
+            while True:
+                await self._wait_for_turn(waiter, deadline)
+                try:
+                    await self._acquire_admission(m, blocking=False)
+                except _WouldBlock as wb:
+                    # Still cannot admit (e.g. a soft overload has not cleared).
+                    # Go back to waiting WITHOUT re-waking ourselves — the next
+                    # wake comes from a slot release or the periodic pump tick, so
+                    # this never becomes a busy spin.
+                    waiter.trigger = wb.trigger
+                    waiter.event.clear()
+                    continue
+                waited_ms = (self.admission.clock() - waiter.enqueued_at) * 1000.0
+                waiter.waited_ms = waited_ms
+                self.admission.record_admit(waiter)
+                QUEUE_ADMITTED.inc()
+                QUEUE_WAIT_SECONDS.observe(waited_ms / 1000.0)
+                return waited_ms, first_trigger
+        finally:
+            self.admission.dequeue(waiter)
+            QUEUE_DEPTH.set(self.admission.depth())
+            self._pump_now()
+
+    @asynccontextmanager
+    async def _admit(
+        self, m: ManagedModel, queue_key: str | None, queue_priority: int
+    ) -> AsyncIterator[tuple[float, str | None]]:
+        """Hold the admission slots for the serve body (queue-aware).
+
+        Yields ``(queue_wait_ms, trigger)``: 0/None when admitted immediately.
+        Releasing the slots on exit re-pumps the queue so the next waiter runs.
+        """
+        waited = await self._admit_enter(m, queue_key, queue_priority)
+        try:
+            yield waited
+        finally:
+            self._admit_exit(m)
+
+    async def _admit_enter(
+        self,
+        m: ManagedModel,
+        queue_key: str | None,
+        queue_priority: int,
+        *,
+        honor_reject_policy: bool = True,
+    ) -> tuple[float, str | None]:
+        """Acquire admission slots (queue-aware). Returns (queue_wait_ms, trigger).
+
+        When the queue is off this is exactly v0.6.0 (may block on the semaphores).
+        The caller MUST pair every successful enter with :meth:`_admit_exit`.
+        """
+        if not self.admission.enabled:
+            await self._acquire_admission(m, blocking=True, honor_reject_policy=honor_reject_policy)
+            return 0.0, None
+        return await self._queue_admit(m, queue_key or "anon", queue_priority)
+
+    def _admit_exit(self, m: ManagedModel) -> None:
+        """Release the admission slots and re-pump the queue."""
+        self._release_slots(m)
+
+    async def start_queue_pump(self) -> None:
+        """Background ticker that re-drains the queue (soft-overload recovery)."""
+        if not self.admission.enabled:
+            return
+
+        async def loop() -> None:
+            interval = self.settings.queue_pump_interval_seconds
+            while not self._stopping:
+                await asyncio.sleep(interval)
+                if self._stopping:
+                    break
+                try:
+                    self._pump_now()
+                except Exception as exc:  # noqa: BLE001 - never let the pump die
+                    log.warning("queue pump error: %s", exc)
+
+        self._queue_pump_task = asyncio.ensure_future(loop())
+
     async def chat(
         self,
         name: str,
@@ -1355,6 +1736,8 @@ class ModelManager:
         latency_budget_ms: float | None = None,
         allowed_models: set[str] | None = None,
         model_guard: Callable[[str], Awaitable[None]] | None = None,
+        queue_key: str | None = None,
+        queue_priority: int = 0,
     ) -> dict:
         req = frozenset(required_placement or ())
         resolved = await self._resolve_route(name, payload, req, latency_budget_ms)
@@ -1366,9 +1749,24 @@ class ModelManager:
             await model_guard(resolved.hops[0])
         if resolved.mode == "cascade" and len(resolved.hops) > 1:
             return await self._serve_cascade(
-                resolved, payload, request_id, route_key, allowed_models, model_guard
+                resolved,
+                payload,
+                request_id,
+                route_key,
+                allowed_models,
+                model_guard,
+                queue_key=queue_key,
+                queue_priority=queue_priority,
             )
-        result = await self._serve_one(resolved.hops[0], payload, request_id, route_key, req)
+        result = await self._serve_one(
+            resolved.hops[0],
+            payload,
+            request_id,
+            route_key,
+            req,
+            queue_key=queue_key,
+            queue_priority=queue_priority,
+        )
         if isinstance(result, dict):
             result["_broker_route"] = result.get("model", resolved.hops[0])
         return result
@@ -1380,6 +1778,8 @@ class ModelManager:
         request_id: str,
         route_key: str | None,
         required_placement: frozenset[str],
+        queue_key: str | None = None,
+        queue_priority: int = 0,
     ) -> dict:
         """Serve one concrete model/pool with member selection, retries + failover.
 
@@ -1393,7 +1793,9 @@ class ModelManager:
             name,
             members,
             route_key,
-            lambda m: self._serve_chat(m, name, payload, request_id),
+            lambda m: self._serve_chat(
+                m, name, payload, request_id, queue_key=queue_key, queue_priority=queue_priority
+            ),
             prefix_blocks=self._prefix_blocks(payload),
         )
 
@@ -1405,6 +1807,8 @@ class ModelManager:
         route_key: str | None,
         allowed_models: set[str] | None = None,
         model_guard: Callable[[str], Awaitable[None]] | None = None,
+        queue_key: str | None = None,
+        queue_priority: int = 0,
     ) -> dict:
         """Serve the cheapest-capable hop; escalate once on a quality signal.
 
@@ -1416,7 +1820,15 @@ class ModelManager:
         """
         primary, escalation = resolved.hops[0], resolved.hops[1]
         req = resolved.required_placement
-        result = await self._serve_one(primary, payload, request_id, route_key, req)
+        result = await self._serve_one(
+            primary,
+            payload,
+            request_id,
+            route_key,
+            req,
+            queue_key=queue_key,
+            queue_priority=queue_priority,
+        )
         escalate, reason = should_escalate(result, resolved.cascade_cfg)
         primary_served = result.get("model", primary) if isinstance(result, dict) else primary
         if not escalate:
@@ -1431,7 +1843,15 @@ class ModelManager:
         if model_guard is not None:
             await model_guard(escalation)
         self._record_hop("chat_cascade", resolved.public_name, result, request_id, "escalated")
-        result2 = await self._serve_one(escalation, payload, request_id, route_key, req)
+        result2 = await self._serve_one(
+            escalation,
+            payload,
+            request_id,
+            route_key,
+            req,
+            queue_key=queue_key,
+            queue_priority=queue_priority,
+        )
         served = result2.get("model", escalation) if isinstance(result2, dict) else escalation
         if self.router is not None:
             self.router.record_cascade(primary_served, served, True, reason)
@@ -1447,6 +1867,8 @@ class ModelManager:
         route_key: str | None = None,
         allowed_models: set[str] | None = None,
         model_guard: Callable[[str], Awaitable[None]] | None = None,
+        queue_key: str | None = None,
+        queue_priority: int = 0,
     ) -> AsyncIterator[bytes]:
         """Serve a buffered streaming cascade (ADR 0019): buffer, score, then
         replay or stream the stronger model.
@@ -1466,7 +1888,15 @@ class ModelManager:
         if model_guard is not None:
             await model_guard(primary)
         # Serve the cheap hop fully (non-streamed) so we can inspect its answer.
-        result = await self._serve_one(primary, payload, request_id, route_key, req)
+        result = await self._serve_one(
+            primary,
+            payload,
+            request_id,
+            route_key,
+            req,
+            queue_key=queue_key,
+            queue_priority=queue_priority,
+        )
         escalate, reason = should_escalate(result, plan.cascade_cfg)
         primary_served = result.get("model", primary) if isinstance(result, dict) else primary
         if not escalate:
@@ -1492,82 +1922,94 @@ class ModelManager:
             route_key=route_key,
             required_placement=req,
             allowed_models=allowed_models,
+            queue_key=queue_key,
+            queue_priority=queue_priority,
         ):
             yield chunk
 
     async def _serve_chat(
-        self, m: ManagedModel, public_name: str, payload: dict, request_id: str
+        self,
+        m: ManagedModel,
+        public_name: str,
+        payload: dict,
+        request_id: str,
+        queue_key: str | None = None,
+        queue_priority: int = 0,
     ) -> dict:
         # inflight was reserved by _select_member; release it in finally.
         try:
-            await self._maybe_evict(m.entry.alias)
+            # Admission (ADR 0023): evict/ready + concurrency slots, queue-aware.
+            # With the queue off this is exactly v0.6.0 (may block on the sems).
             with self.tracer.span(
                 "load_model",
                 {"gen_ai.request.model": public_name, "broker.member.alias": m.entry.alias},
             ):
-                await m.ensure_ready()
-            async with self.global_sem:
-                if m.sem.locked() and self.settings.load_concurrency_policy == "reject":
-                    raise ConcurrencyLimitError(
-                        f"per-model concurrency limit for {m.entry.alias}",
-                        model=m.entry.alias,
-                        remediation="retry later or raise per-model concurrency",
+                queue_wait_ms, queue_trigger = await self._admit_enter(m, queue_key, queue_priority)
+            try:
+                if m.machine.state == State.READY:
+                    m.machine.to(State.BUSY)
+                with self.tracer.span(
+                    "inference",
+                    {
+                        "gen_ai.operation.name": "chat",
+                        "gen_ai.request.model": public_name,
+                        "gen_ai.provider.name": m.adapter.name,
+                        "broker.member.alias": m.entry.alias,
+                    },
+                ) as sp:
+                    # OTel queue-wait span event (ADR 0023): no-op when tracing off.
+                    if queue_wait_ms > 0:
+                        sp.set_attribute("broker.queue.wait_ms", round(queue_wait_ms, 1))
+                        if queue_trigger:
+                            sp.set_attribute("broker.queue.trigger", queue_trigger)
+                    result = await asyncio.wait_for(
+                        m.adapter.chat(payload, request_id),
+                        timeout=m.entry.request_timeout_seconds,
                     )
-                async with m.sem:
-                    if m.machine.state == State.READY:
-                        m.machine.to(State.BUSY)
-                    with self.tracer.span(
-                        "inference",
-                        {
-                            "gen_ai.operation.name": "chat",
-                            "gen_ai.request.model": public_name,
-                            "gen_ai.provider.name": m.adapter.name,
-                            "broker.member.alias": m.entry.alias,
-                        },
-                    ) as sp:
-                        result = await asyncio.wait_for(
-                            m.adapter.chat(payload, request_id),
-                            timeout=m.entry.request_timeout_seconds,
-                        )
-                        if isinstance(result, dict):
-                            usage = result.get("usage") or {}
-                            sp.set_attribute("gen_ai.response.model", public_name)
-                            if usage.get("prompt_tokens") is not None:
-                                sp.set_attribute(
-                                    "gen_ai.usage.input_tokens", usage["prompt_tokens"]
-                                )
-                            if usage.get("completion_tokens") is not None:
-                                sp.set_attribute(
-                                    "gen_ai.usage.output_tokens", usage["completion_tokens"]
-                                )
-                        # Opt-in span content capture (ADR 0014): OFF by default.
-                        # OTel GenAI `spanOnly` mode — truncated JSON strings; may
-                        # contain PII, so never captured unless explicitly enabled.
-                        if self.tracer.capture_content:
-                            try:
-                                sp.set_attribute(
-                                    "gen_ai.input.messages",
-                                    self.tracer.truncate(json.dumps(payload.get("messages", []))),
-                                )
-                                if isinstance(result, dict):
-                                    sp.set_attribute(
-                                        "gen_ai.output.messages",
-                                        self.tracer.truncate(
-                                            json.dumps(
-                                                [
-                                                    c.get("message", {})
-                                                    for c in result.get("choices", [])
-                                                ]
-                                            )
-                                        ),
-                                    )
-                            except Exception:  # noqa: BLE001 - tracing never breaks a request
-                                pass
-                    m.healthy = True
-                    # Present the public (requested) model name back to the caller.
                     if isinstance(result, dict):
-                        result["model"] = public_name
-                    return result
+                        usage = result.get("usage") or {}
+                        sp.set_attribute("gen_ai.response.model", public_name)
+                        if usage.get("prompt_tokens") is not None:
+                            sp.set_attribute("gen_ai.usage.input_tokens", usage["prompt_tokens"])
+                        if usage.get("completion_tokens") is not None:
+                            sp.set_attribute(
+                                "gen_ai.usage.output_tokens", usage["completion_tokens"]
+                            )
+                    # Opt-in span content capture (ADR 0014): OFF by default.
+                    # OTel GenAI `spanOnly` mode — truncated JSON strings; may
+                    # contain PII, so never captured unless explicitly enabled.
+                    if self.tracer.capture_content:
+                        try:
+                            sp.set_attribute(
+                                "gen_ai.input.messages",
+                                self.tracer.truncate(json.dumps(payload.get("messages", []))),
+                            )
+                            if isinstance(result, dict):
+                                sp.set_attribute(
+                                    "gen_ai.output.messages",
+                                    self.tracer.truncate(
+                                        json.dumps(
+                                            [
+                                                c.get("message", {})
+                                                for c in result.get("choices", [])
+                                            ]
+                                        )
+                                    ),
+                                )
+                        except Exception:  # noqa: BLE001 - tracing never breaks a request
+                            pass
+                m.healthy = True
+                # Present the public (requested) model name back to the caller, and
+                # expose the queue wait to the API layer (ADR 0023 response headers).
+                if isinstance(result, dict):
+                    result["model"] = public_name
+                    if queue_wait_ms > 0:
+                        result["_broker_queue_wait_ms"] = queue_wait_ms
+                        if queue_trigger:
+                            result["_broker_queue_trigger"] = queue_trigger
+                return result
+            finally:
+                self._admit_exit(m)
         finally:
             m.machine.inflight -= 1
             m.machine.touch()
@@ -1583,6 +2025,8 @@ class ModelManager:
         required_placement: frozenset[str] | None = None,
         allowed_models: set[str] | None = None,
         model_guard: Callable[[str], Awaitable[None]] | None = None,
+        queue_key: str | None = None,
+        queue_priority: int = 0,
     ) -> AsyncIterator[bytes]:
         req = frozenset(required_placement or ())
         # ``name`` is already a concrete model (the API resolves streaming routes via
@@ -1605,6 +2049,8 @@ class ModelManager:
         deadline = self._retry_deadline()
         pending_retry_after: float | None = None
         attempt = 0
+        queue_wait_ms: float = 0.0
+        queue_trigger: str | None = None
         while attempt < cap:
             m = await self._select_member(name, members, exclude, route_key, prefix_blocks)
             if m is not None:
@@ -1629,8 +2075,13 @@ class ModelManager:
                     break
             attempt += 1
             try:
-                await self._maybe_evict(m.entry.alias)
-                await m.ensure_ready()
+                # Admission (ADR 0023) incl. the pre-first-byte queue wait. Holds
+                # the concurrency slots on success; a queue-full/timeout verdict is
+                # terminal (classified OTHER) and propagates instead of failing
+                # over. honor_reject_policy=False keeps exact v0.6.0 stream timing.
+                queue_wait_ms, queue_trigger = await self._admit_enter(
+                    m, queue_key, queue_priority, honor_reject_policy=False
+                )
                 chosen = m
                 break
             except BrokerError as exc:
@@ -1661,11 +2112,17 @@ class ModelManager:
             )
 
         m = chosen
-        await self.global_sem.acquire()
-        await m.sem.acquire()
+        # The concurrency slots were acquired by _admit_enter above (queue-aware).
         if m.machine.state == State.READY:
             m.machine.to(State.BUSY)
         m.healthy = True
+        if queue_wait_ms > 0:
+            log.debug(
+                "stream %s queued %.1fms (trigger=%s) before first byte",
+                m.entry.alias,
+                queue_wait_ms,
+                queue_trigger,
+            )
         try:
             async for chunk in m.adapter.stream_chat(payload, request_id):
                 yield chunk
@@ -1677,8 +2134,7 @@ class ModelManager:
             m.machine.touch()
             if m.machine.inflight == 0 and m.machine.state == State.BUSY:
                 m.machine.to(State.READY)
-            m.sem.release()
-            self.global_sem.release()
+            self._admit_exit(m)
 
     async def embeddings(
         self,
@@ -1689,6 +2145,8 @@ class ModelManager:
         required_placement: frozenset[str] | None = None,
         allowed_models: set[str] | None = None,
         model_guard: Callable[[str], Awaitable[None]] | None = None,
+        queue_key: str | None = None,
+        queue_priority: int = 0,
     ) -> dict:
         """Route an embeddings request through pool selection + failover.
 
@@ -1706,34 +2164,33 @@ class ModelManager:
             name,
             members,
             route_key,
-            lambda m: self._serve_embeddings(m, name, payload, request_id),
+            lambda m: self._serve_embeddings(
+                m, name, payload, request_id, queue_key=queue_key, queue_priority=queue_priority
+            ),
             prefix_blocks=self._prefix_blocks(payload),
         )
 
     async def _serve_embeddings(
-        self, m: ManagedModel, public_name: str, payload: dict, request_id: str
+        self,
+        m: ManagedModel,
+        public_name: str,
+        payload: dict,
+        request_id: str,
+        queue_key: str | None = None,
+        queue_priority: int = 0,
     ) -> dict:
         try:
-            await self._maybe_evict(m.entry.alias)
-            await m.ensure_ready()
-            async with self.global_sem:
-                if m.sem.locked() and self.settings.load_concurrency_policy == "reject":
-                    raise ConcurrencyLimitError(
-                        f"per-model concurrency limit for {m.entry.alias}",
-                        model=m.entry.alias,
-                        remediation="retry later or raise per-model concurrency",
-                    )
-                async with m.sem:
-                    if m.machine.state == State.READY:
-                        m.machine.to(State.BUSY)
-                    result = await asyncio.wait_for(
-                        m.adapter.embeddings(payload, request_id),
-                        timeout=m.entry.request_timeout_seconds,
-                    )
-                    m.healthy = True
-                    if isinstance(result, dict):
-                        result["model"] = public_name
-                    return result
+            async with self._admit(m, queue_key, queue_priority):
+                if m.machine.state == State.READY:
+                    m.machine.to(State.BUSY)
+                result = await asyncio.wait_for(
+                    m.adapter.embeddings(payload, request_id),
+                    timeout=m.entry.request_timeout_seconds,
+                )
+                m.healthy = True
+                if isinstance(result, dict):
+                    result["model"] = public_name
+                return result
         finally:
             m.machine.inflight -= 1
             m.machine.touch()
@@ -1754,6 +2211,8 @@ class ModelManager:
         route_key: str | None = None,
         required_placement: frozenset[str] | None = None,
         allowed_models: set[str] | None = None,
+        queue_key: str | None = None,
+        queue_priority: int = 0,
     ) -> dict:
         """Route a rerank request through pool selection + failover (ADR 0013).
 
@@ -1778,33 +2237,32 @@ class ModelManager:
             name,
             members,
             route_key,
-            lambda m: self._serve_rerank(m, name, payload, request_id),
+            lambda m: self._serve_rerank(
+                m, name, payload, request_id, queue_key=queue_key, queue_priority=queue_priority
+            ),
         )
 
     async def _serve_rerank(
-        self, m: ManagedModel, public_name: str, payload: dict, request_id: str
+        self,
+        m: ManagedModel,
+        public_name: str,
+        payload: dict,
+        request_id: str,
+        queue_key: str | None = None,
+        queue_priority: int = 0,
     ) -> dict:
         try:
-            await self._maybe_evict(m.entry.alias)
-            await m.ensure_ready()
-            async with self.global_sem:
-                if m.sem.locked() and self.settings.load_concurrency_policy == "reject":
-                    raise ConcurrencyLimitError(
-                        f"per-model concurrency limit for {m.entry.alias}",
-                        model=m.entry.alias,
-                        remediation="retry later or raise per-model concurrency",
-                    )
-                async with m.sem:
-                    if m.machine.state == State.READY:
-                        m.machine.to(State.BUSY)
-                    result = await asyncio.wait_for(
-                        m.adapter.rerank(payload, request_id),
-                        timeout=m.entry.request_timeout_seconds,
-                    )
-                    m.healthy = True
-                    if isinstance(result, dict):
-                        result["model"] = public_name
-                    return result
+            async with self._admit(m, queue_key, queue_priority):
+                if m.machine.state == State.READY:
+                    m.machine.to(State.BUSY)
+                result = await asyncio.wait_for(
+                    m.adapter.rerank(payload, request_id),
+                    timeout=m.entry.request_timeout_seconds,
+                )
+                m.healthy = True
+                if isinstance(result, dict):
+                    result["model"] = public_name
+                return result
         finally:
             m.machine.inflight -= 1
             m.machine.touch()
@@ -2022,14 +2480,14 @@ class ModelManager:
         elif external:
             # Daemon liveness (independent of broker lifecycle) drives the flag.
             m.healthy = healthy
-        # Optional real load signal for cache-aware routing (ADR 0010): scrape an
+        # Optional real load signal for cache-aware routing (ADR 0010) and the
+        # ADR 0023 admission queue's backend-backpressure trigger: scrape an
         # exposed vLLM /metrics endpoint WITHOUT loading a model (adapters return
         # None when their process is not running). Falls back to in-flight counts.
-        if (
-            self.settings.route_strategy == "cache_aware"
-            and self.settings.cache_aware_use_metrics
-            and (external or active)
-        ):
+        want_load = (
+            self.settings.route_strategy == "cache_aware" and self.settings.cache_aware_use_metrics
+        ) or (self.settings.queue_enabled and self.settings.queue_trigger_backend)
+        if want_load and (external or active):
             try:
                 load = await m.adapter.collect_load()
                 if load is not None:
@@ -2116,7 +2574,7 @@ class ModelManager:
 
     async def shutdown(self) -> None:
         self._stopping = True
-        for task in (self._sweeper, self._health_task):
+        for task in (self._sweeper, self._health_task, self._queue_pump_task):
             if task:
                 task.cancel()
                 try:
@@ -2260,6 +2718,7 @@ class ModelManager:
                 name: [mm.entry.alias for mm in members] for name, members in self.pools.items()
             },
             "resources": await self.resources_block(),
+            "queue": self.admission.snapshot(),
             "models": models,
             "timestamp": time.time(),
         }

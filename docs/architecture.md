@@ -21,6 +21,7 @@ tensor/layer split, and caching are all configurable.
 | `broker/security.py` | Trust boundaries: executable allow-list, model-path validation, request-flag rejection, no-shell argv construction, SSRF guard. |
 | `broker/proc.py` | `ProcessSupervisor`: no-shell child-process lifecycle for broker-managed runtimes; `stop()` reports whether the process group actually exited (ADR 0020). |
 | `broker/resources.py` | Vendor-neutral `ResourceTelemetry` providers (ADR 0020): `off`/`nvidia`/`amd`/`host`/`auto`, argv-only + allow-listed + defensive parsing; `resources_probe.py` CLI. Feeds measured release and memory-aware admission (ADR 0022). |
+| `broker/admission.py` | `AdmissionQueue` (ADR 0023): bounded/timed/fair admission-queue scheduler — ordering (FIFO-per-key + round-robin + priority/aging), depth bounds, wake selection, and `/status` stats. The manager owns the overload probes + semaphore acquisition. |
 | `broker/config.py` | Typed, fail-fast `Settings` (env prefix `BROKER_`). |
 | `broker/auth.py` | API-key auth (Bearer / `X-API-Key`, constant-time compare). |
 | `broker/errors.py` | Structured error hierarchy → OpenAI-style error envelopes. |
@@ -130,6 +131,21 @@ auto/cascade — `/v1/embeddings` and `/v1/rerank`):
    per-model semaphore caps per-model concurrency. With
    `load_concurrency_policy=reject`, a saturated per-model semaphore returns
    HTTP 429 instead of queueing.
+
+   **Admission queue (ADR 0023, opt-in)** — when `BROKER_QUEUE_ENABLED` is on, the
+   whole admit step (memory/count eviction, ready, and the two semaphores) is
+   wrapped by a **bounded, timed, fair** queue (`broker/admission.py`). A request
+   that cannot be admitted now — concurrency saturation, queueable capacity
+   (ADR 0022), a model mid load/release, or a measured overload signal (device
+   memory / host load / backend backpressure) — waits in the queue instead of
+   blocking a semaphore, acquiring the slots only when it is its turn and no
+   overload is active. FIFO within an API key, round-robin across keys, optional
+   per-key priority with aging. Full → 429 `queue_full`; wait-timeout → 503
+   `queue_timeout` (both + `Retry-After`). It composes with eviction/release,
+   retries/failover (a queue verdict is terminal), the cache (hits bypass it), the
+   auto-router (resolved before queueing — never switches model), and streaming
+   (the wait is before the first byte). `exceeds_device_capacity` fails fast. OFF
+   == v0.6.0.
 10. **Serve + record** — the model transitions `ready → busy`; the adapter runs
     `chat` (or `stream_chat` for SSE) under a per-request timeout; `inflight` is
     tracked and the model returns to `ready` when drained. The response `model` is

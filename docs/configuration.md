@@ -328,6 +328,37 @@ declared budget below. See [model-registry.md](model-registry.md) and the
 | `BROKER_GPU_MEMORY_BUDGET_MIB` | str? | _(none)_ | Declared per-device budget (MiB) used when telemetry is OFF. A single integer (`40000`, every device) or a per-device map (`0=24000,1=48000`; key `default` covers unpinned models). |
 | `BROKER_GPU_MEMORY_HEADROOM_MIB` | int | `1024` | Headroom subtracted from **measured** free memory before admitting a sized model, so a load never consumes the last sliver of a device. |
 
+## Admission queue under overload (ADR 0023)
+
+Opt-in, **default OFF** (OFF == exact v0.6.0 concurrency behavior). When enabled, a
+request that cannot be admitted *right now* waits in a **bounded, timed, fair**
+queue instead of blocking a concurrency semaphore unboundedly or failing. It is
+served in turn when capacity frees, or rejected with a clear status + `Retry-After`.
+Per-key quota 429s (rpm/tpm/budget, ADR 0008/0016) are a different concern and are
+**never** queued. See the [request queueing guide](guides/request-queueing.md).
+
+| Env var | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_QUEUE_ENABLED` | bool | `false` | Master switch. OFF keeps v0.6.0 behavior exactly. |
+| `BROKER_QUEUE_MAX_DEPTH` | int | `128` | Max requests waiting globally. A new request over the bound is rejected with **429** `queue_full` + `Retry-After` (never enqueued). 0 = unbounded. |
+| `BROKER_QUEUE_MAX_DEPTH_PER_MODEL` | int | `32` | Same bound, per model. 0 = unbounded. |
+| `BROKER_QUEUE_MAX_WAIT_SECONDS` | float | `30.0` | Max time a request waits before giving up with **503** `queue_timeout` + `Retry-After` naming the trigger. 0 = wait forever (bounded only by the request timeout). |
+| `BROKER_QUEUE_RETRY_AFTER_SECONDS` | float | `5.0` | `Retry-After` value advertised on a queue-full 429 or a wait-timeout 503. |
+| `BROKER_QUEUE_PUMP_INTERVAL_SECONDS` | float | `0.25` | Background re-check interval so a telemetry/host overload that clears (no completion event) still drains the queue promptly. |
+| `BROKER_QUEUE_PRIORITY_AGING_SECONDS` | float | `10.0` | A waiter's **effective** priority rises by 1 every this many seconds, so a low-priority request still progresses (no starvation). 0 disables aging. |
+| `BROKER_QUEUE_TRIGGER_CONCURRENCY` | bool | `true` | Queue when the global or per-model concurrency semaphore is saturated. |
+| `BROKER_QUEUE_TRIGGER_CAPACITY` | bool | `true` | Queue when memory-aware admission (ADR 0022) or `max_loaded_models` can't fit now but a holder may go idle. (`exceeds_device_capacity` — never fits — fails fast, never queued.) |
+| `BROKER_QUEUE_TRIGGER_DEVICE_MEMORY` | bool | `false` | Queue on measured device-memory pressure (needs `BROKER_GPU_TELEMETRY` on; inactive otherwise). |
+| `BROKER_QUEUE_DEVICE_FREE_MIB_MIN` | int | `0` | Queue while a relevant device's measured free memory is below this (MiB). 0 disables this sub-check. |
+| `BROKER_QUEUE_DEVICE_USED_FRACTION_MAX` | float | `0.0` | Queue while a relevant device's used fraction is above this (0.0–1.0). 0 disables. |
+| `BROKER_QUEUE_TRIGGER_HOST` | bool | `false` | Queue on host overload (1-min load average per CPU, cross-platform via `os.getloadavg`; inactive where unavailable, e.g. Windows). |
+| `BROKER_QUEUE_HOST_LOAD_PER_CPU_MAX` | float | `0.0` | Load-average-per-CPU threshold for the host trigger. 0 disables. |
+| `BROKER_QUEUE_TRIGGER_BACKEND` | bool | `false` | Queue on backend backpressure (vLLM `num_requests_waiting` via `collect_load`, or an upstream 429/Retry-After window from ADR 0017). |
+| `BROKER_QUEUE_BACKEND_WAITING_MAX` | int | `0` | Backend queued-request threshold for the backend trigger. 0 disables the waiting-count sub-check (the upstream-429 window still applies). |
+
+Per-key `priority` is set in the keys file (ADR 0016); see
+[keys.example.yaml](../keys.example.yaml).
+
 ## Cache / tmp
 
 | Env var | Type | Default | Description |

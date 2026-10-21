@@ -40,6 +40,8 @@ from .errors import (
     ConcurrencyLimitError,
     InsufficientQuotaError,
     ModelLoadError,
+    QueueFullError,
+    QueueTimeoutError,
     RateLimitExceededError,
     TimeoutError_,
 )
@@ -76,6 +78,12 @@ def classify_error(exc: BaseException) -> ErrorClass:
         return ErrorClass.TIMEOUT
     if isinstance(exc, ModelLoadError):
         return ErrorClass.SERVER_ERROR
+    # Admission-queue verdicts (ADR 0023) are terminal: the queue already waited
+    # on the whole pool's capacity, so a queue-full (429) or wait-timeout (503)
+    # must NOT fail over to another member and re-queue there. Classify as OTHER
+    # (never retried, never benched) so it propagates straight to the client.
+    if isinstance(exc, (QueueFullError, QueueTimeoutError)):
+        return ErrorClass.OTHER
     # Typed upstream HTTP error: classify by the UPSTREAM status, never the
     # broker-facing http_status (which it remaps for the client envelope). This is
     # what makes a client's own bad request (4xx) stop at one member instead of

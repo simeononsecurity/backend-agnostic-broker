@@ -60,6 +60,27 @@ Off by default. See the [GPU memory guide](guides/gpu-memory.md).
   cannot be evicted — returns `429 capacity_unavailable` with a `reason`/`holder`.
   Recent admission decisions are in `/status` → `resources.admission.recent`.
 
+## Request queueing under overload (ADR 0023) — opt-in
+
+Off by default (OFF == v0.6.0). See the
+[request queueing guide](guides/request-queueing.md).
+
+- **Enable**: `BROKER_QUEUE_ENABLED=true`. A request that can't be admitted now
+  waits in a bounded, timed, fair queue instead of blocking or failing. Tune
+  `BROKER_QUEUE_MAX_DEPTH[_PER_MODEL]` (full → `429 queue_full`) and
+  `BROKER_QUEUE_MAX_WAIT_SECONDS` (timeout → `503 queue_timeout`); both carry
+  `Retry-After` (`BROKER_QUEUE_RETRY_AFTER_SECONDS`).
+- **Watch it live**: `/status` → `queue` (depth per model/key, oldest wait, active
+  triggers, `rejections_by_reason`, `timeouts_by_reason`); Prometheus
+  `broker_queue_*`; response header `x-broker-queue-wait-ms` (+ `-trigger`).
+- **Triggers** are individually configurable (concurrency + capacity on by
+  default; device-memory needs telemetry on; host + backend opt-in). Rising
+  `timeouts_by_reason` for a trigger means that overload is sustained — add
+  capacity or raise the threshold/wait.
+- **Not queued**: per-key quota 429s (`rate_limit_exceeded`/`insufficient_quota`)
+  and `exceeds_device_capacity` (never fits) fail fast by design.
+- **Multi-replica**: each replica queues locally; size depth per replica.
+
 ## Handling failures
 
 - A model that fails to start transitions to `failed`, its process is torn down,

@@ -38,6 +38,29 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CapacityUnavailableError` (429, with `reason` + `holder`) that the ADR 0023 queue
   can wait on. Unsized models keep v0.6.0 behavior.
 - New guide `docs/guides/gpu-memory.md` and tested `examples/gpu-memory/`.
+- **Bounded, fair request queueing under overload (ADR 0023, opt-in, default OFF).**
+  With `BROKER_QUEUE_ENABLED`, a request that cannot be admitted right now —
+  because of concurrency saturation, memory-aware capacity (ADR 0022), a model mid
+  load/release, or a measured overload signal — waits in a **bounded, timed, fair**
+  admission queue instead of blocking a semaphore unboundedly or failing. Bounds
+  (`BROKER_QUEUE_MAX_DEPTH[_PER_MODEL]`) → **429** `queue_full` + `Retry-After`;
+  wait timeout (`BROKER_QUEUE_MAX_WAIT_SECONDS`) → **503** `queue_timeout` +
+  `Retry-After` naming the trigger. Fairness is FIFO within an API key and
+  round-robin across keys, with an optional per-key `priority` (keys file) and
+  aging so low-priority requests never starve. Overload triggers (concurrency,
+  capacity, measured device memory, host load average, backend backpressure) are
+  **each individually configurable**; telemetry-based ones are inert when telemetry
+  is off, and `exceeds_device_capacity` (never fits) fails fast instead of queueing.
+  It composes with the existing semaphores (no double-limiting), retries/failover
+  (a queue verdict is terminal), cache hits (bypass the queue), the auto-router (no
+  silent cross-model switch), streaming (the wait is before the first byte), and
+  Redis multi-replica (each replica queues locally). Client disconnect frees the
+  slot immediately. Visibility: `x-broker-queue-wait-ms` (+ trigger) header, a
+  `/status` `queue` block, new `broker_queue_*` Prometheus series (`/metrics`
+  exposure unchanged), and an OTel span attribute. Per-key quota 429s (rpm/tpm/
+  budget) are a different concern and are **never** queued.
+- New module `broker/admission.py`, guide `docs/guides/request-queueing.md`, tested
+  `examples/request-queueing/`, and a labeled simulated benchmark `scripts/bench_queue.py`.
 
 ### Notes
 

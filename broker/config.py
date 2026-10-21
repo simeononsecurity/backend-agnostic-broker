@@ -413,6 +413,62 @@ class Settings(BaseSettings):
     # model, so a load never consumes the last sliver of a device.
     gpu_memory_headroom_mib: int = 1024
 
+    # --- Admission queue under overload (ADR 0023; opt-in, default OFF) ---
+    # When OFF (default) behavior == v0.6.0: a request that cannot be admitted now
+    # either waits on the concurrency semaphores (load_concurrency_policy="queue")
+    # or 429s ("reject"), with no bound/timeout/fairness. When ON, a request that
+    # cannot be admitted *right now* enters a bounded, timed, FAIR queue instead of
+    # blocking unboundedly or failing — it is served in turn when capacity frees, or
+    # rejected with a clear status + Retry-After. Quota 429s (ADR 0008/0016 per-key
+    # rpm/tpm/budget) are a DIFFERENT concern and are NEVER queued.
+    queue_enabled: bool = False
+    # Max requests waiting in the admission queue, globally and per model. A newly
+    # arriving request that would exceed either bound is rejected immediately with
+    # HTTP 429 + Retry-After (it never joins the queue). 0 disables that bound.
+    queue_max_depth: int = 128
+    queue_max_depth_per_model: int = 32
+    # Max time (seconds) a request may wait in the queue before giving up. On
+    # timeout the request fails with HTTP 503 + Retry-After naming the trigger.
+    # 0 = wait forever (bounded only by the request/client timeout).
+    queue_max_wait_seconds: float = 30.0
+    # Retry-After (seconds) advertised on a queue-full 429 or a wait-timeout 503.
+    queue_retry_after_seconds: float = 5.0
+    # Background re-check interval (seconds): how often queued waiters are re-woken
+    # to retry admission, so a telemetry/host overload that clears (no completion
+    # event) still drains the queue promptly. Keep small.
+    queue_pump_interval_seconds: float = 0.25
+    # Fairness aging: a waiter's EFFECTIVE priority rises by 1 every this many
+    # seconds it waits, so a low-priority request still progresses (no starvation).
+    # 0 disables aging (strict priority — not recommended).
+    queue_priority_aging_seconds: float = 10.0
+
+    # Overload triggers — each decides INDEPENDENTLY whether a request waits in the
+    # queue. All are no-ops unless queue_enabled. Telemetry-based triggers
+    # (device_memory) are additionally inactive unless BROKER_GPU_TELEMETRY is on.
+    # Concurrency saturation (global or per-model semaphore full) and capacity
+    # (memory-aware admission / max_loaded_models) are the intrinsic triggers.
+    queue_trigger_concurrency: bool = True
+    queue_trigger_capacity: bool = True
+    # Measured device memory pressure (ADR 0020 telemetry): queue when a relevant
+    # device's free memory drops below queue_device_free_mib_min OR its used
+    # fraction rises above queue_device_used_fraction_max. Inactive when telemetry
+    # is off. 0 / 0.0 disables that sub-check.
+    queue_trigger_device_memory: bool = False
+    queue_device_free_mib_min: int = 0
+    queue_device_used_fraction_max: float = 0.0
+    # Host overload: queue when the 1-minute load average per CPU exceeds
+    # queue_host_load_per_cpu_max, measured cheaply and cross-platform
+    # (os.getloadavg; unavailable on Windows -> this trigger is simply inactive).
+    # 0.0 disables.
+    queue_trigger_host: bool = False
+    queue_host_load_per_cpu_max: float = 0.0
+    # Backend backpressure: queue when the selected member reports more than
+    # queue_backend_waiting_max queued requests (vLLM num_requests_waiting via
+    # collect_load) or is in an upstream-429/Retry-After backpressure window (ADR
+    # 0017). 0 disables the waiting-count sub-check.
+    queue_trigger_backend: bool = False
+    queue_backend_waiting_max: int = 0
+
     # --- Cache / tmp ---
     cache_dir: str = "/var/cache/broker"
     tmp_dir: str = "/tmp/broker"
@@ -652,6 +708,28 @@ class Settings(BaseSettings):
             raise ConfigError("BROKER_RELEASE_TIMEOUT_SECONDS must be >= 0 (0 = don't wait)")
         if self.gpu_memory_headroom_mib < 0:
             raise ConfigError("BROKER_GPU_MEMORY_HEADROOM_MIB must be >= 0")
+        # Admission queue (ADR 0023): all no-ops unless queue_enabled, but validate
+        # the numbers eagerly so a misconfiguration fails fast at startup.
+        if self.queue_max_depth < 0:
+            raise ConfigError("BROKER_QUEUE_MAX_DEPTH must be >= 0 (0 = unbounded)")
+        if self.queue_max_depth_per_model < 0:
+            raise ConfigError("BROKER_QUEUE_MAX_DEPTH_PER_MODEL must be >= 0 (0 = unbounded)")
+        if self.queue_max_wait_seconds < 0:
+            raise ConfigError("BROKER_QUEUE_MAX_WAIT_SECONDS must be >= 0 (0 = wait forever)")
+        if self.queue_retry_after_seconds < 0:
+            raise ConfigError("BROKER_QUEUE_RETRY_AFTER_SECONDS must be >= 0")
+        if self.queue_pump_interval_seconds <= 0:
+            raise ConfigError("BROKER_QUEUE_PUMP_INTERVAL_SECONDS must be > 0")
+        if self.queue_priority_aging_seconds < 0:
+            raise ConfigError("BROKER_QUEUE_PRIORITY_AGING_SECONDS must be >= 0 (0 = no aging)")
+        if self.queue_device_free_mib_min < 0:
+            raise ConfigError("BROKER_QUEUE_DEVICE_FREE_MIB_MIN must be >= 0")
+        if not 0.0 <= self.queue_device_used_fraction_max <= 1.0:
+            raise ConfigError("BROKER_QUEUE_DEVICE_USED_FRACTION_MAX must be in [0.0, 1.0]")
+        if self.queue_host_load_per_cpu_max < 0:
+            raise ConfigError("BROKER_QUEUE_HOST_LOAD_PER_CPU_MAX must be >= 0")
+        if self.queue_backend_waiting_max < 0:
+            raise ConfigError("BROKER_QUEUE_BACKEND_WAITING_MAX must be >= 0")
         for _tool_path in (
             self.gpu_telemetry_nvidia_smi_path,
             self.gpu_telemetry_amd_smi_path,
