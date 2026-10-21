@@ -19,6 +19,11 @@ docker pull ghcr.io/simeononsecurity/backend-agnostic-broker:latest
 
 Your existing `registry.yaml`, `keys.yaml`, and `.env` keep working unchanged.
 
+The new features added alongside this branch — GPU-safe model swapping
+(ADR 0020/0022), request queueing (ADR 0023), and crash recovery / restart
+reconciliation (ADR 0021) — are likewise **opt-in and default-off**, so none of
+them changes behavior unless you enable them (see the adopting table below).
+
 ## The three behavior changes to know
 
 These are the **only** non-default-off changes since v0.5.0. Both are documented in
@@ -85,6 +90,9 @@ Everything else in the v0.5.0 suite passes unchanged (including
 | Multi-replica shared state | `BROKER_REDIS_URL` | [redis-multi-replica](redis-multi-replica.md) |
 | Cascade / latency budget / placement | `router.mode`, headers | [auto-router](auto-router.md) |
 | Tracing | `BROKER_TRACING_ENABLED=true` | [observability](observability.md) |
+| GPU-safe model swapping (telemetry, measured release, sized models) | `BROKER_GPU_TELEMETRY` + `memory_mib` on models | [gpu-memory](gpu-memory.md) |
+| Request queueing under overload | `BROKER_QUEUE_ENABLED=true` | [request-queueing](request-queueing.md) |
+| Crash recovery / restart reconciliation | `BROKER_RUNTIME_RECONCILE=adopt\|stop` | [restart-and-recovery](restart-and-recovery.md) |
 
 ## Verify the upgrade
 
