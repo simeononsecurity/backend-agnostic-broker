@@ -1,0 +1,14 @@
+# Memory-aware admission demo (ADR 0020 + 0022) — fake backend, no GPU needed.
+# Two sized models that can't both fit the declared 1000 MiB budget.
+models:
+  - alias: small-a
+    backend: fake
+    runtime_model_id: fake-a
+    memory_mib: 600
+    idle_timeout_seconds: 60
+
+  - alias: small-b
+    backend: fake
+    runtime_model_id: fake-b
+    memory_mib: 600
+    idle_timeout_seconds: 60

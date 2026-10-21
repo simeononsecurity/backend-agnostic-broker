@@ -129,6 +129,11 @@ class HTTPBackendAdapter(BackendAdapter):
         self._supervisor: ProcessSupervisor | None = None
         self._client: httpx.AsyncClient | None = None
         self._inflight: dict[str, asyncio.Event] = {}
+        # ADR 0020: PID/pgid of the last spawned runtime kept after stop() so the
+        # measured-release wait can match telemetry holders; release-ok flag set
+        # False when stop() left the process alive after SIGKILL.
+        self._last_pid: int | None = None
+        self._last_release_ok: bool = True
 
     # --- helpers ---------------------------------------------------------
     def _base_url(self) -> str:
@@ -204,12 +209,28 @@ class HTTPBackendAdapter(BackendAdapter):
         template[0] = "{exe}"
         return build_argv(template, subs)
 
+    def _device_env_var(self) -> str:
+        """Device-isolation env var for the active telemetry provider (ADR 0020).
+
+        Explicit ``BROKER_GPU_DEVICE_ENV_VAR`` wins; otherwise the AMD provider
+        uses ``ROCR_VISIBLE_DEVICES`` (the ROCm runtime-level isolation var on
+        Linux) and every other provider — including the default OFF — uses
+        ``CUDA_VISIBLE_DEVICES`` (the portable default, unchanged from v0.6.0).
+        """
+        override = getattr(self.settings, "gpu_device_env_var", None)
+        if override:
+            return override
+        if getattr(self.settings, "gpu_telemetry", "off") == "amd":
+            return "ROCR_VISIBLE_DEVICES"
+        return "CUDA_VISIBLE_DEVICES"
+
     def _process_env(self) -> dict[str, str]:
         env: dict[str, str] = {}
+        var = self._device_env_var()
         if self.entry.gpu.device_ids:
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in self.entry.gpu.device_ids)
+            env[var] = ",".join(str(d) for d in self.entry.gpu.device_ids)
         elif self.settings.cuda_visible_devices is not None:
-            env["CUDA_VISIBLE_DEVICES"] = self.settings.cuda_visible_devices
+            env[var] = self.settings.cuda_visible_devices
         return env
 
     # --- configuration ---------------------------------------------------
@@ -238,7 +259,10 @@ class HTTPBackendAdapter(BackendAdapter):
             alias=self.entry.alias,
             backend=self.name,
         )
-        return await self._supervisor.start()
+        pid = await self._supervisor.start()
+        self._last_pid = pid
+        self._last_release_ok = True
+        return pid
 
     async def wait_until_ready(self, timeout: float) -> None:
         probe = self.entry.readiness
@@ -292,11 +316,23 @@ class HTTPBackendAdapter(BackendAdapter):
 
     async def stop(self) -> None:
         if self._supervisor:
-            await self._supervisor.stop(grace=self.settings.shutdown_timeout_seconds)
+            released = await self._supervisor.stop(grace=self.settings.shutdown_timeout_seconds)
+            self._last_release_ok = released
             self._supervisor = None
         if self._client:
             await self._client.aclose()
             self._client = None
+
+    def process_pid(self) -> int | None:
+        if self._supervisor is not None:
+            return self._supervisor.pid
+        return self._last_pid
+
+    async def process_alive(self) -> bool:
+        return self._supervisor is not None and self._supervisor.is_running()
+
+    def last_release_ok(self) -> bool:
+        return self._last_release_ok
 
     # --- inference -------------------------------------------------------
     def _request_body(self, payload: dict[str, Any]) -> dict[str, Any]:

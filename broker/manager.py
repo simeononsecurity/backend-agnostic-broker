@@ -52,6 +52,7 @@ import json
 import logging
 import random
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -63,17 +64,20 @@ from .errors import (
     AuthorizationError,
     BackendUnavailableError,
     BrokerError,
+    CapacityUnavailableError,
     ConcurrencyLimitError,
     ModelBusyError,
     ModelLoadError,
     ModelNotFoundError,
     PlacementDeniedError,
+    ReleaseStuckError,
     TimeoutError_,
     ValidationError,
 )
 from .lifecycle import LifecycleMachine, State
 from .registry import ModelEntry, Registry, load_registry
 from .reliability import ErrorClass, RetryPolicy, classify_error, retry_after_seconds
+from .resources import TelemetrySample, make_telemetry
 from .router import AutoRouter, should_escalate
 from .state import make_state_store
 from .tracing import make_tracer
@@ -233,6 +237,7 @@ class ManagedModel:
             self.machine.to(State.UNLOADING)
             try:
                 await self.adapter.unload()
+                self.machine.survived_kill = not self.adapter.last_release_ok()
                 self.machine.to(State.UNLOADED)
                 log.info("model %s unloaded", self.entry.alias)
             except Exception as exc:  # noqa: BLE001
@@ -305,6 +310,17 @@ class ModelManager:
         self._sweeper: asyncio.Task | None = None
         self._health_task: asyncio.Task | None = None
         self._stopping = False
+        # Resource telemetry (ADR 0020): a provider selected by BROKER_GPU_TELEMETRY
+        # ("off" by default => disabled). Samples are cached for
+        # gpu_telemetry_poll_seconds so a status read or admission check does not
+        # re-shell the driver tool on every call.
+        self.telemetry = make_telemetry(settings)
+        self._telemetry_cache: TelemetrySample | None = None
+        self._telemetry_cache_at: float = 0.0
+        self._telemetry_lock = asyncio.Lock()
+        # Recent memory-aware admission decisions (ADR 0022), newest last, for
+        # /status visibility and debugging.
+        self._admissions: deque[dict[str, Any]] = deque(maxlen=50)
 
     # --- validation ------------------------------------------------------
     def validate_all(self) -> None:
@@ -536,23 +552,333 @@ class ModelManager:
         return resolved.hops[0]
 
     # --- eviction --------------------------------------------------------
+    # --- telemetry (ADR 0020) -------------------------------------------
+    def telemetry_enabled(self) -> bool:
+        return getattr(self.telemetry, "name", "off") != "off"
+
+    async def telemetry_sample(self, *, force: bool = False) -> TelemetrySample:
+        """Return a cached telemetry sample, re-probing at most every poll window.
+
+        The provider's blocking ``sample()`` runs in a thread so the event loop is
+        never stalled by a driver-tool subprocess. Never raises — a failed probe
+        yields an ``unavailable`` sample.
+        """
+        now = time.monotonic()
+        ttl = self.settings.gpu_telemetry_poll_seconds
+        if (
+            not force
+            and self._telemetry_cache is not None
+            and (now - self._telemetry_cache_at) < ttl
+        ):
+            return self._telemetry_cache
+        async with self._telemetry_lock:
+            now = time.monotonic()
+            if (
+                not force
+                and self._telemetry_cache is not None
+                and (now - self._telemetry_cache_at) < ttl
+            ):
+                return self._telemetry_cache
+            try:
+                sample = await asyncio.to_thread(self.telemetry.sample)
+            except Exception as exc:  # noqa: BLE001 - provider must never crash the broker
+                log.warning("telemetry sample failed: %s", exc)
+                sample = TelemetrySample(
+                    provider=getattr(self.telemetry, "name", "unknown"),
+                    status="unavailable",
+                    reason=str(exc),
+                )
+            self._telemetry_cache = sample
+            self._telemetry_cache_at = now
+            return sample
+
+    def _record_admission(self, alias: str, decision: str, detail: dict[str, Any]) -> None:
+        self._admissions.append(
+            {"alias": alias, "decision": decision, "detail": detail, "at": time.time()}
+        )
+
+    # --- admission + eviction (ADR 0020 measured release + ADR 0022) -----
     async def _maybe_evict(self, keep_alias: str) -> None:
+        """Make room to load ``keep_alias``: memory-aware admission then count.
+
+        ADR 0022 memory admission runs first (a no-op for an unsized model or when
+        neither telemetry nor a declared budget is configured), then the v0.6.0
+        count-based LRU limit. Every eviction is followed by the ADR 0020 measured
+        release wait. Models without ``memory_mib`` and with telemetry off keep
+        exactly v0.6.0 behavior.
+        """
+        m = self.get(keep_alias)
+        await self._guard_release_stuck(m)
+        await self._admit_memory(m)
+        await self._evict_for_count(keep_alias)
+
+    async def _evict_for_count(self, keep_alias: str) -> None:
         if self.loaded_count() < self.settings.max_loaded_models:
             return
-        # Evict the LRU idle model (not the one we're about to load).
         candidates = [
-            m
-            for a, m in self.models.items()
-            if a != keep_alias and m.machine.state == State.READY and m.machine.inflight == 0
+            mm
+            for a, mm in self.models.items()
+            if a != keep_alias and mm.machine.state == State.READY and mm.machine.inflight == 0
         ]
         if not candidates:
             raise ConcurrencyLimitError(
                 "max loaded models reached and no idle model to evict",
                 remediation="raise BROKER_MAX_LOADED_MODELS or wait",
             )
-        victim = min(candidates, key=lambda m: m.machine.last_used)
+        victim = min(candidates, key=lambda mm: mm.machine.last_used)
         log.info("evicting LRU model %s to make room for %s", victim.entry.alias, keep_alias)
+        await self._evict_model(victim)
+
+    async def _guard_release_stuck(self, m: ManagedModel) -> None:
+        """Fail a load fast if another model on its device(s) is release_stuck.
+
+        Only active when telemetry is on: the stuck holder's memory is still out,
+        so loading into the same device would race an OOM. Returns a clear 503.
+        """
+        if not self.telemetry_enabled():
+            return
+        keys = set(m.adapter.device_keys())
+        for other in self.models.values():
+            if other is m:
+                continue
+            if other.machine.state != State.RELEASE_STUCK:
+                continue
+            if keys & set(other.adapter.device_keys()):
+                info = other.machine.release_info or {}
+                raise ReleaseStuckError(
+                    f"device still held by release-stuck model {other.entry.alias!r}",
+                    model=m.entry.alias,
+                    state="release_stuck",
+                    remediation=(
+                        "the previous runtime did not release its device; inspect "
+                        f"pid {info.get('pid')} on device {info.get('device')} "
+                        "(it may be a zombie) then retry"
+                    ),
+                )
+
+    async def _evict_model(self, victim: ManagedModel) -> None:
+        """Unload ``victim`` then wait for its device to be released (ADR 0020)."""
+        pid = victim.adapter.process_pid()
+        keys = victim.adapter.device_keys()
         await victim.unload()
+        await self._await_release(victim, pid, keys)
+
+    async def _await_release(self, victim: ManagedModel, pid: int | None, keys: list[str]) -> None:
+        """Wait until ``victim`` has released its device, or mark it release_stuck.
+
+        Gated on telemetry being on (telemetry off keeps v0.6.0 timing; ``stop()``
+        already reports a surviving process). Released == the process is gone AND
+        the device no longer reports ``pid`` among its holders, bounded by
+        ``BROKER_RELEASE_TIMEOUT_SECONDS``. On timeout the model enters
+        ``release_stuck`` and :class:`ReleaseStuckError` (503) is raised naming the
+        held device/MiB. The broker never force-resets a GPU or kills a foreign PID.
+        """
+        if not self.telemetry_enabled():
+            return
+        timeout = self.settings.release_timeout_seconds
+        if timeout <= 0:
+            return
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        poll = max(0.05, min(self.settings.gpu_telemetry_poll_seconds, 1.0))
+        last_held_mib: int | None = None
+        last_device: str | None = None
+        while loop.time() < deadline:
+            proc_gone = not await victim.adapter.process_alive()
+            sample = await self.telemetry_sample(force=True)
+            held_mib, device = self._pid_holding(sample, pid, keys)
+            last_held_mib, last_device = held_mib, device
+            if proc_gone and held_mib is None:
+                return
+            await asyncio.sleep(poll)
+        # Timed out: surface a visible release_stuck state and fail the load 503.
+        info = {
+            "pid": pid,
+            "device": last_device,
+            "mib_held": last_held_mib,
+            "timeout_seconds": timeout,
+        }
+        victim.machine.release_info = info
+        victim.machine.survived_kill = True
+        try:
+            victim.machine.to(State.RELEASE_STUCK)
+        except Exception:  # noqa: BLE001 - never let a state guard mask the 503
+            victim.machine.state = State.RELEASE_STUCK
+        log.error(
+            "model %s is release_stuck: pid=%s still holds %s MiB on device %s after %ss",
+            victim.entry.alias,
+            pid,
+            last_held_mib,
+            last_device,
+            timeout,
+        )
+        raise ReleaseStuckError(
+            f"runtime for {victim.entry.alias!r} did not release device "
+            f"{last_device} within {timeout}s",
+            model=victim.entry.alias,
+            state="release_stuck",
+            remediation=(
+                f"pid {pid} still holds ~{last_held_mib} MiB (possible zombie CUDA/ROCm "
+                "context); free it or raise BROKER_RELEASE_TIMEOUT_SECONDS"
+            ),
+        )
+
+    def _relevant_devices(self, sample: TelemetrySample, keys: list[str]) -> list[Any]:
+        matched = [d for d in sample.devices if d.index in keys]
+        return matched if matched else list(sample.devices)
+
+    def _pid_holding(
+        self, sample: TelemetrySample, pid: int | None, keys: list[str]
+    ) -> tuple[int | None, str | None]:
+        """If ``pid`` still holds memory on a relevant device, return (mib, device)."""
+        if pid is None or not sample.ok:
+            return None, None
+        for d in self._relevant_devices(sample, keys):
+            if pid in d.processes:
+                return d.processes.get(pid, 0), d.index
+        return None, None
+
+    async def _admit_memory(self, m: ManagedModel) -> None:
+        """Memory-aware admission for a sized model (ADR 0022).
+
+        No-op unless the model declares ``memory_mib`` AND accounting is possible
+        (telemetry on, or a declared budget configured). Evicts idle models on the
+        same device(s) — each with a measured release wait — until the model fits,
+        else raises :class:`CapacityUnavailableError` (429) naming the holder.
+        """
+        need = m.entry.memory_mib
+        if need is None:
+            return
+        measured = self.telemetry_enabled()
+        if not measured and not self.settings.gpu_memory_budget_map():
+            return  # sized but no budget/telemetry: fall back to count-only
+        keys = m.adapter.device_keys()
+        while True:
+            fits, detail = await self._fits(m, need, keys, measured)
+            if fits:
+                self._record_admission(m.entry.alias, "fits", detail)
+                return
+            victim = self._pick_memory_victim(m, keys)
+            if victim is None:
+                self._record_admission(m.entry.alias, "blocked", detail)
+                raise CapacityUnavailableError(
+                    f"not enough memory to load {m.entry.alias!r}: {detail.get('summary')}",
+                    reason=detail.get("reason"),
+                    holder=detail.get("holder"),
+                    model=m.entry.alias,
+                    remediation=(
+                        "wait for an in-flight model to go idle, raise the device "
+                        "budget/headroom, or pin the model to another device"
+                    ),
+                )
+            log.info(
+                "admission: evicting idle %s to fit %s (%s MiB)",
+                victim.entry.alias,
+                m.entry.alias,
+                need,
+            )
+            await self._evict_model(victim)
+            self._record_admission(m.entry.alias, f"evicted {victim.entry.alias}", detail)
+
+    def _resident_on(self, key: str, exclude: ManagedModel) -> list[ManagedModel]:
+        out = []
+        for mm in self.models.values():
+            if mm is exclude:
+                continue
+            if mm.machine.state not in (
+                State.LOADING,
+                State.READY,
+                State.BUSY,
+                State.UNLOADING,
+            ):
+                continue
+            if key in mm.adapter.device_keys():
+                out.append(mm)
+        return out
+
+    async def _fits(
+        self, m: ManagedModel, need: int, keys: list[str], measured: bool
+    ) -> tuple[bool, dict[str, Any]]:
+        """Return (fits, detail). Measured uses telemetry free; declared uses budgets."""
+        if measured:
+            sample = await self.telemetry_sample()
+            if not sample.ok:
+                # Telemetry on but unavailable: fall back to declared accounting if
+                # a budget exists, else do not block (honest: we cannot measure).
+                if not self.settings.gpu_memory_budget_map():
+                    return True, {"reason": "telemetry_unavailable", "summary": "no measurement"}
+                measured = False
+            else:
+                headroom = self.settings.gpu_memory_headroom_mib
+                worst: dict[str, Any] | None = None
+                for key in keys:
+                    devs = [d for d in sample.devices if d.index == key] or list(sample.devices)
+                    avails = [
+                        (d.free_mib - headroom, d.index) for d in devs if d.free_mib is not None
+                    ]
+                    if not avails:
+                        continue
+                    # Pinned key: the matched device must fit. Unpinned: best device.
+                    if any(d.index == key for d in sample.devices):
+                        avail, dev = min(avails)
+                    else:
+                        avail, dev = max(avails)
+                    if need > avail:
+                        worst = {
+                            "reason": "measured_insufficient",
+                            "device": dev,
+                            "free_minus_headroom_mib": avail,
+                            "need_mib": need,
+                            "holder": f"device {dev}",
+                            "summary": f"device {dev} has {avail} MiB free (headroom "
+                            f"{headroom}), need {need}",
+                        }
+                        break
+                if worst is not None:
+                    return False, worst
+                return True, {
+                    "reason": "measured_fits",
+                    "need_mib": need,
+                    "summary": f"{need} MiB fits measured free memory",
+                }
+        # Declared accounting (telemetry off or unavailable-with-budget).
+        for key in keys:
+            budget = self.settings.budget_for_device(key)
+            if budget is None:
+                continue
+            residents = self._resident_on(key, exclude=m)
+            used = sum((r.entry.memory_mib or 0) for r in residents)
+            if need + used > budget:
+                return False, {
+                    "reason": "declared_insufficient",
+                    "device": key,
+                    "budget_mib": budget,
+                    "used_mib": used,
+                    "need_mib": need,
+                    "holder": ", ".join(r.entry.alias for r in residents) or "none",
+                    "summary": f"device {key}: budget {budget} MiB, used {used}, need {need}",
+                }
+        return True, {
+            "reason": "declared_fits",
+            "need_mib": need,
+            "summary": f"{need} MiB fits the declared budget",
+        }
+
+    def _pick_memory_victim(self, m: ManagedModel, keys: list[str]) -> ManagedModel | None:
+        """LRU idle model sharing a device with ``m`` (never ``m``, never busy)."""
+        keyset = set(keys)
+        candidates = [
+            mm
+            for mm in self.models.values()
+            if mm is not m
+            and mm.machine.state == State.READY
+            and mm.machine.inflight == 0
+            and not mm.draining
+            and keyset & set(mm.adapter.device_keys())
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda mm: mm.machine.last_used)
 
     # --- routing ---------------------------------------------------------
     def _least_busy(self, tier: list[ManagedModel]) -> ManagedModel:
@@ -1740,7 +2066,11 @@ class ModelManager:
             *(self._backend_health_entry(m) for m in self.models.values())
         )
         overall = "degraded" if any(r["status"] == "unhealthy" for r in results) else "ok"
-        return {"status": overall, "backends": list(results)}
+        return {
+            "status": overall,
+            "backends": list(results),
+            "resources": await self.resources_block(),
+        }
 
     async def _backend_health_entry(self, m: ManagedModel) -> dict[str, Any]:
         probe = await self._probe_member(m)
@@ -1796,6 +2126,91 @@ class ModelManager:
         await asyncio.gather(*(m.stop() for m in self.models.values()), return_exceptions=True)
         await self.state.close()
 
+    # --- resources (ADR 0020 / 0022) ------------------------------------
+    async def resources_block(self) -> dict[str, Any]:
+        """The /status + /healthz/backends ``resources`` block.
+
+        Measured memory (``source: measured``) when telemetry is on; a provider
+        status with a reason when it degraded; per-model attribution; declared
+        admission budgets and recent decisions; and any ``release_stuck`` holders.
+        Ollama/external-daemon memory is reported separately, labeled ``reported``,
+        and never mixed into the measured devices.
+        """
+        enabled = self.telemetry_enabled()
+        budgets = self.settings.gpu_memory_budget_map()
+        block: dict[str, Any] = {
+            "telemetry": {
+                "provider": self.settings.gpu_telemetry,
+                "enabled": enabled,
+                "poll_seconds": self.settings.gpu_telemetry_poll_seconds,
+            },
+            "release": {"timeout_seconds": self.settings.release_timeout_seconds},
+            "admission": {
+                "budget_mib": budgets or None,
+                "headroom_mib": self.settings.gpu_memory_headroom_mib,
+                "recent": list(self._admissions)[-10:],
+            },
+        }
+        if enabled:
+            sample = await self.telemetry_sample()
+            block["source"] = "measured"
+            block["sample"] = {
+                "provider": sample.provider,
+                "status": sample.status,
+                "reason": sample.reason,
+                "captured_at": sample.captured_at,
+            }
+            block["devices"] = [d.to_dict() for d in sample.devices]
+        else:
+            block["source"] = None
+            block["sample"] = {"status": "off"}
+            block["devices"] = []
+        # Broker-owned models that are stuck or survived a kill (visible, not hidden).
+        stuck = []
+        for mm in self.models.values():
+            if mm.machine.state == State.RELEASE_STUCK or mm.machine.survived_kill:
+                stuck.append(
+                    {
+                        "alias": mm.entry.alias,
+                        "state": mm.machine.state.value,
+                        "survived_kill": mm.machine.survived_kill,
+                        "release_info": mm.machine.release_info,
+                    }
+                )
+        block["release_stuck"] = stuck
+        # Ollama/external daemons: reported (not measured) VRAM, clearly labeled.
+        reported = await self._reported_daemon_memory()
+        if reported:
+            block["reported"] = {"source": "reported", "daemons": reported}
+        return block
+
+    async def _reported_daemon_memory(self) -> list[dict[str, Any]]:
+        """Per-daemon ``/api/ps`` size_vram for Ollama models, labeled ``reported``.
+
+        Only runs when Ollama models exist (no network otherwise). Never raises.
+        """
+        if not any(m.adapter.name == "ollama" for m in self.models.values()):
+            return []
+        try:
+            ps = await self.ollama_ps()
+        except Exception:  # noqa: BLE001 - best effort; status must not fail
+            return []
+        out: list[dict[str, Any]] = []
+        for daemon in ps.get("daemons", []):
+            models = daemon.get("models") or []
+            sized = []
+            if isinstance(models, list):
+                for entry in models:
+                    if isinstance(entry, dict):
+                        sized.append(
+                            {
+                                "name": entry.get("name") or entry.get("model"),
+                                "size_vram": entry.get("size_vram"),
+                            }
+                        )
+            out.append({"base_url": daemon.get("base_url"), "models": sized})
+        return out
+
     # --- status ----------------------------------------------------------
     async def status(self) -> dict[str, Any]:
         cooldowns_on = self.settings.cooldown_failures > 0
@@ -1844,6 +2259,7 @@ class ModelManager:
             "pools": {
                 name: [mm.entry.alias for mm in members] for name, members in self.pools.items()
             },
+            "resources": await self.resources_block(),
             "models": models,
             "timestamp": time.time(),
         }

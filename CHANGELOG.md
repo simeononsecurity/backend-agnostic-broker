@@ -4,6 +4,46 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Vendor-neutral GPU/host resource telemetry (ADR 0020, opt-in, default OFF).**
+  A pluggable `ResourceTelemetry` provider selected by `BROKER_GPU_TELEMETRY`
+  (`off` | `nvidia` | `amd` | `host` | `auto`) measures per-device memory and, where
+  the driver exposes it, which PIDs hold it. Providers shell out argv-only to an
+  absolute/allow-listed binary (`nvidia-smi` query mode, `amd-smi`/`rocm-smi` JSON,
+  Linux `/proc/meminfo`, macOS `sysctl`+`vm_stat`) with a timeout and parse
+  defensively; a failed probe degrades to `unavailable` (never a crash, never an
+  invented number). Samples carry `source: measured`. New `python -m
+  broker.resources_probe <provider>` CLI. `/status` and `/healthz/backends` gain a
+  `resources` block; Ollama daemon memory is reported separately, labeled `reported`.
+- **Measured release on model swap (ADR 0020).** After evicting a broker-spawned
+  runtime, the next load on the same device waits (bounded by
+  `BROKER_RELEASE_TIMEOUT_SECONDS`) for the process group to exit and — when
+  telemetry is on — for the device to stop reporting its PIDs. If the memory never
+  comes back the model enters a visible `release_stuck` state and the load fails
+  **503** instead of OOMing. `ProcessSupervisor.stop()` now reports (logs + returns)
+  when a process survives SIGKILL instead of silently returning. The broker never
+  resets a GPU or kills a process it did not start.
+- **Vendor-correct device env var (ADR 0020).** `gpu.device_ids` is set into the var
+  the active provider expects — `ROCR_VISIBLE_DEVICES` for `amd`, `CUDA_VISIBLE_DEVICES`
+  otherwise (the portable default, unchanged) — overridable with
+  `BROKER_GPU_DEVICE_ENV_VAR`.
+- **Memory-aware admission (ADR 0022, opt-in, default OFF).** An optional per-model
+  `memory_mib` admits a load only if it fits the device budget — measured free
+  memory (minus `BROKER_GPU_MEMORY_HEADROOM_MIB`) when telemetry is on, else the
+  declared `BROKER_GPU_MEMORY_BUDGET_MIB` (integer or `0=…,1=…` map). It evicts LRU
+  idle models on the same device(s) to fit, else raises a typed
+  `CapacityUnavailableError` (429, with `reason` + `holder`) that the ADR 0023 queue
+  can wait on. Unsized models keep v0.6.0 behavior.
+- New guide `docs/guides/gpu-memory.md` and tested `examples/gpu-memory/`.
+
+### Notes
+
+- Default behavior is byte-for-byte v0.6.0: with `BROKER_GPU_TELEMETRY=off` (the
+  default) and no `memory_mib`/budget, nothing new runs. No version bump.
+
 ## [0.6.0] - 2026-10-19
 
 ### Added

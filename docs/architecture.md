@@ -19,7 +19,8 @@ tensor/layer split, and caching are all configurable.
 | `broker/adapters/` | Backend adapter contract (`base.py`), shared HTTP adapter (`httpbase.py`), and one adapter per backend (`fake`, `ollama`, `vllm`, `llamacpp`, `strata`). |
 | `broker/registry.py` | Declarative, pydantic-validated model registry (YAML/JSON). |
 | `broker/security.py` | Trust boundaries: executable allow-list, model-path validation, request-flag rejection, no-shell argv construction, SSRF guard. |
-| `broker/proc.py` | `ProcessSupervisor`: no-shell child-process lifecycle for broker-managed runtimes. |
+| `broker/proc.py` | `ProcessSupervisor`: no-shell child-process lifecycle for broker-managed runtimes; `stop()` reports whether the process group actually exited (ADR 0020). |
+| `broker/resources.py` | Vendor-neutral `ResourceTelemetry` providers (ADR 0020): `off`/`nvidia`/`amd`/`host`/`auto`, argv-only + allow-listed + defensive parsing; `resources_probe.py` CLI. Feeds measured release and memory-aware admission (ADR 0022). |
 | `broker/config.py` | Typed, fail-fast `Settings` (env prefix `BROKER_`). |
 | `broker/auth.py` | API-key auth (Bearer / `X-API-Key`, constant-time compare). |
 | `broker/errors.py` | Structured error hierarchy → OpenAI-style error envelopes. |
@@ -34,14 +35,17 @@ unloaded  → loading, stopping
 loading   → ready, failed, stopping
 ready     → busy, unloading, stopping, failed
 busy      → ready, unloading, stopping, failed
-unloading → unloaded, failed, stopping
+unloading → unloaded, failed, stopping, release_stuck
 failed    → unloaded, loading, stopping
 stopping  → unloaded, failed
+unloaded  → loading, stopping, release_stuck
+release_stuck → unloaded, loading, stopping
 ```
 
 Any illegal transition raises `LifecycleError` (an internal bug signal) instead
 of silently corrupting state. The machine is pure (no I/O); the manager drives
-transitions.
+transitions. `release_stuck` (ADR 0020) marks a model whose device memory did not
+come back after eviction; `/status` carries the stuck PID/device/MiB.
 
 ## Request flow (chat completion)
 
@@ -100,9 +104,22 @@ auto/cascade — `/v1/embeddings` and `/v1/rerank`):
    `least_busy`. Transparent **retries** with full-jitter backoff and per-member
    **cooldowns** (ADR 0009) stay **within the requested model's pool** (never a
    different model). The member's in-flight slot is reserved under a route lock.
-8. **Acquire the member**:
-   - `_maybe_evict(alias)` unloads the LRU idle model if `max_loaded_models` is
-     reached (raises `ConcurrencyLimitError` if nothing can be evicted).
+8. **Acquire the member** — `_maybe_evict(alias)` makes room, in order (ADR 0020 /
+   0022):
+   - **Memory-aware admission** (ADR 0022): a model declaring `memory_mib` is
+     admitted only if it fits its device budget — measured free memory (minus
+     `BROKER_GPU_MEMORY_HEADROOM_MIB`) when telemetry is on, else the declared
+     `BROKER_GPU_MEMORY_BUDGET_MIB`. It evicts LRU idle models **on the same
+     device(s)** to fit, else raises a typed `CapacityUnavailableError` (429,
+     `reason` + `holder`). Unsized models skip this step.
+   - **Measured release** (ADR 0020): every eviction is followed — when telemetry
+     is on — by a wait until the evicted process group is gone **and** the device
+     stops reporting its PID, bounded by `BROKER_RELEASE_TIMEOUT_SECONDS`. On
+     timeout the victim enters `release_stuck` and the load fails 503 rather than
+     OOMing. The broker never resets a GPU or kills a foreign process.
+   - **Count limit** (v0.6.0): the LRU idle model is unloaded if
+     `max_loaded_models` is reached (raises `ConcurrencyLimitError` if nothing can
+     be evicted).
    - `ensure_ready()` starts + readies the model **exactly once** under an
      `asyncio.Lock` (`load_lock`). A previously `failed` model is reset to
      `unloaded` and retried.

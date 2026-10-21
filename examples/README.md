@@ -26,6 +26,7 @@ no external daemon**, then swap in real backends for production.
 | [otel](otel/) | OpenTelemetry tracing → Collector → Jaeger | [observability](../docs/guides/observability.md) |
 | [rerank](rerank/) | The `/v1/rerank` endpoint | [embeddings-and-rerank](../docs/guides/embeddings-and-rerank.md) |
 | [rag-pipeline](rag-pipeline/) | embed → retrieve → rerank → chat | [embeddings-and-rerank](../docs/guides/embeddings-and-rerank.md) |
+| [gpu-memory](gpu-memory/) | Telemetry, measured release, sized models (ADR 0020/0022) | [gpu-memory](../docs/guides/gpu-memory.md) |
 
 ## How these are tested
 

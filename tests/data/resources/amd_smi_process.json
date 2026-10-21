@@ -1,0 +1,14 @@
+[
+  {
+    "gpu": 0,
+    "process_list": [
+      {"process_info": {"pid": 4321, "name": "python", "memory_usage": {"value": 1024, "unit": "MB"}}}
+    ]
+  },
+  {
+    "gpu": 1,
+    "process_list": [
+      {"process_info": {"pid": 8888, "name": "vllm", "memory_usage": {"value": 190000, "unit": "MB"}}}
+    ]
+  }
+]

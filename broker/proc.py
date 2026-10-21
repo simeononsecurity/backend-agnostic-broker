@@ -9,11 +9,14 @@ are detected and cleaned up.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 from collections.abc import Sequence
 
 from .errors import ModelLoadError
+
+log = logging.getLogger("broker.proc")
 
 
 class ProcessSupervisor:
@@ -40,6 +43,16 @@ class ProcessSupervisor:
     @property
     def pid(self) -> int | None:
         return self._proc.pid if self._proc else None
+
+    @property
+    def pgid(self) -> int | None:
+        """Process-group id of the spawned tree, or None if not running/available."""
+        if not self._proc:
+            return None
+        try:
+            return os.getpgid(self._proc.pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            return None
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
@@ -108,11 +121,17 @@ class ProcessSupervisor:
             remediation="increase startup_timeout or check runtime logs",
         )
 
-    async def stop(self, grace: float = 10.0) -> None:
-        """Terminate the process group: SIGTERM, then SIGKILL after ``grace``."""
+    async def stop(self, grace: float = 10.0) -> bool:
+        """Terminate the process group: SIGTERM, then SIGKILL after ``grace``.
+
+        Returns ``True`` when the process is confirmed gone, ``False`` when it is
+        still alive after SIGKILL + a short reap wait. ADR 0020: a surviving
+        process is **logged at error level and reported** to the caller instead of
+        being silently swallowed (the old behavior), so a stuck teardown is visible.
+        """
         if not self._proc or self._proc.returncode is not None:
             await self._cleanup_reader()
-            return
+            return True
         pid = self._proc.pid
         try:
             pgid = os.getpgid(pid)
@@ -138,6 +157,16 @@ class ProcessSupervisor:
             except TimeoutError:
                 pass
         await self._cleanup_reader()
+        alive = self._proc.returncode is None
+        if alive:
+            log.error(
+                "process for %s (backend=%s pid=%s) is still alive after SIGKILL; "
+                "its device memory may not be released",
+                self.alias or "?",
+                self.backend or "?",
+                pid,
+            )
+        return not alive
 
     async def _cleanup_reader(self) -> None:
         if self._reader_task and not self._reader_task.done():

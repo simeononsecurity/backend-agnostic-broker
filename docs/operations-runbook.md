@@ -40,6 +40,26 @@
 - Each broker-managed backend model = one child process holding GPU/RAM while
   resident.
 
+## GPU/host memory safety (ADR 0020 / 0022) — opt-in
+
+Off by default. See the [GPU memory guide](guides/gpu-memory.md).
+
+- **Enable telemetry**: `BROKER_GPU_TELEMETRY=nvidia|amd|host|auto`. Verify with
+  `python -m broker.resources_probe <provider>` (exit 0 = ok, 2 = unavailable) and
+  read `/status` → `resources`. A failed probe degrades to `unavailable` with a
+  reason; it never crashes the broker.
+- **Measured release**: with telemetry on, an eviction waits (≤
+  `BROKER_RELEASE_TIMEOUT_SECONDS`) for the old runtime's device memory to come
+  back before the next load. If it never does, the model shows `release_stuck` in
+  `/status` (`resources.release_stuck`) and the waiting load returns `503`. Inspect
+  the named PID/device (likely a zombie CUDA/ROCm context), free it, then retry —
+  the broker never resets the GPU or kills a process it did not start.
+- **Sized models**: set `memory_mib` per model and either enable telemetry
+  (measured free memory, minus `BROKER_GPU_MEMORY_HEADROOM_MIB`) or a declared
+  `BROKER_GPU_MEMORY_BUDGET_MIB`. A model that cannot fit — and whose device holder
+  cannot be evicted — returns `429 capacity_unavailable` with a `reason`/`holder`.
+  Recent admission decisions are in `/status` → `resources.admission.recent`.
+
 ## Handling failures
 
 - A model that fails to start transitions to `failed`, its process is torn down,

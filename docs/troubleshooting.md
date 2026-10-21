@@ -48,5 +48,18 @@ Errors are structured (`broker/errors.py`) and carry a `remediation` hint and a
 - `GET /healthz/backends` shows per-member liveness and `cooldown`
   (`failures`, `in_cooldown`, `seconds_remaining`, `ejections`).
 - `GET /metrics` shows request/latency/in-flight/loaded gauges.
+- `GET /status` → `resources` (ADR 0020/0022, when `BROKER_GPU_TELEMETRY` is on):
+  measured per-device memory (`source: measured`), per-PID holders, declared
+  admission budgets + recent decisions, and any `release_stuck`/`survived_kill`
+  holders. Ollama memory appears under `resources.reported` (`source: reported`).
 - Logs: set `BROKER_LOG_LEVEL=DEBUG` for verbose output.
 - Reproduce the full local check suite via `docs/EVIDENCE.md`.
+
+## GPU memory issues (ADR 0020 / 0022)
+
+| Symptom | Cause / fix |
+|---------|-------------|
+| `503 release_stuck` on a load | The previous runtime's device memory didn't come back (lazy reclaim or a zombie CUDA/ROCm context). Inspect `resources.release_stuck` (PID/device/MiB), free the holder, then retry — or raise `BROKER_RELEASE_TIMEOUT_SECONDS`. The broker never resets a GPU or kills a foreign process. |
+| `429 capacity_unavailable` | A sized model (`memory_mib`) does not fit and the device holder can't be evicted. Raise the budget/headroom, pin to another device, or wait for the holder to go idle. The `reason`/`holder` fields name why. |
+| `resources.sample.status: unavailable` | The driver tool isn't at an absolute/allow-listed path, timed out, or returned nothing. Run `python -m broker.resources_probe <provider>` and read the `reason`. |
+| A model shows `survived_kill: true` | `stop()` could not confirm the process exited after SIGKILL. Check for a wedged runtime holding the device. |
