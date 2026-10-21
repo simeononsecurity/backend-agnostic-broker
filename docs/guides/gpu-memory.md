@@ -86,6 +86,23 @@ starting into an OOM:
 
 The broker **never resets the GPU and never kills a process it did not start** — it
 surfaces the holder so you can investigate (`nvidia-smi`, `kill` the zombie, etc.).
+Release is judged on the runtime's whole **process group** (parent *and* children —
+a vLLM runtime holds VRAM in child workers) **and** on the device's free memory
+recovering, so a lingering child or a container PID namespace that hides the holder
+is caught rather than mistaken for a release.
+
+**`release_stuck` auto-recovers.** You do **not** need to restart the broker: the
+next load attempt on that device, and the periodic idle/telemetry tick, re-check the
+holder and flip it back to `unloaded` as soon as its group PIDs are gone and the
+device's free memory has returned. A load for the stuck model itself is refused until
+its old memory is actually freed.
+
+> **Container caveat.** Inside a container whose PID namespace hides the GPU
+> processes, `nvidia-smi` may list no (or host-namespace) PIDs. Release then falls
+> back to free-memory recovery alone. If another tenant grabs the freed memory
+> immediately, the broker conservatively reports `release_stuck` (a clear 503)
+> rather than risking an OOM; it clears once free memory recovers. Run the broker in
+> the host PID namespace (`--pid=host`) if you want exact per-process attribution.
 
 With telemetry **off**, swap timing is identical to v0.6.0 — the only change is that
 a process still alive after SIGKILL is now logged and shown as `survived_kill` in
@@ -125,6 +142,15 @@ does not fit it returns **429 `capacity_unavailable`** with a `reason` and a
            "holder": "device 0", "message": "not enough memory to load 'mistral-vllm': ..."}}
 ```
 
+Eviction is **not** needless: the broker evicts only when evicting the idle
+candidates on the device could actually make room. If a model is **larger than the
+device can ever hold** (its `memory_mib` exceeds the declared budget, or measured
+total − headroom), the load fails fast with `reason=exceeds_device_capacity` and
+**evicts nothing** — it would never fit, so idle tenants are left alone. Concurrent
+loads are serialized through an admission lock and account for each other's
+in-flight reservations, so two differently-sized models can't both pass against the
+same free reading and overcommit the device.
+
 Count-based `BROKER_MAX_LOADED_MODELS` still applies as an additional limit. Models
 **without** `memory_mib` keep v0.6.0 behavior. Recent admission decisions
 (`fits` / `evicted X` / `blocked`) are shown in `/status` under
@@ -136,8 +162,9 @@ Count-based `BROKER_MAX_LOADED_MODELS` still applies as an additional limit. Mod
 |---------|-------------|
 | `resources.telemetry.enabled` is false | `BROKER_GPU_TELEMETRY` is `off` (default) or an invalid value. |
 | `sample.status: unavailable` | The driver tool isn't on the allow-list/absolute path, timed out, or returned no devices. Run `python -m broker.resources_probe <provider>` and read the `reason`. |
-| A model is stuck in `release_stuck` | A previous runtime's VRAM never came back (lazy reclaim or a zombie). Inspect the PID/device in `resources.release_stuck`, free it, then retry; or raise `BROKER_RELEASE_TIMEOUT_SECONDS`. |
-| `429 capacity_unavailable` on every load | The device budget is too small for the model, or the holder can't be evicted (it's serving). Raise the budget/headroom, pin to another device, or wait for the holder to go idle. |
+| A model is stuck in `release_stuck` | A previous runtime's VRAM hasn't come back yet (lazy reclaim, a zombie, a lingering child, or a container PID namespace). It **auto-clears** on the next load or the periodic tick once the group PIDs are gone and free memory recovers — no restart. To force it, free the holder in `resources.release_stuck`; or raise `BROKER_RELEASE_TIMEOUT_SECONDS`. |
+| `429 capacity_unavailable`, `reason=exceeds_device_capacity` | The model's `memory_mib` is larger than the device can ever hold. Pin it to a bigger device, lower `memory_mib`, or raise the budget — eviction can't help (and none happens). |
+| `429 capacity_unavailable`, `reason=*_insufficient` | The device is full and the holder can't be evicted (it's serving). Raise the budget/headroom, pin to another device, or wait for the holder to go idle. |
 | Sized model never engages admission | Neither telemetry nor `BROKER_GPU_MEMORY_BUDGET_MIB` is set — the broker can't account memory, so it keeps count-only behavior. |
 
 See also: [configuration.md](../configuration.md), [model-registry.md](../model-registry.md),

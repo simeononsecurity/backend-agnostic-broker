@@ -37,20 +37,33 @@ memory-aware admission step in front of loading (`broker/manager.py`,
    bucket when unpinned. For measured unpinned models, best-fit picks the device
    with the most free memory; pinned models must fit each pinned device.
 
-2. **Admission.** Before loading a model with `memory_mib`: if it does not fit,
-   **evict LRU idle models on the same device(s)** — each eviction followed by the
-   ADR 0020 measured-release wait — until it fits; else raise a typed
-   **`CapacityUnavailableError`** (HTTP **429**) carrying `reason`
-   (`measured_insufficient` / `declared_insufficient`) and `holder` (the device or
-   the resident aliases). Count-based `max_loaded_models` **stays** as an additional
-   limit, applied after memory admission. Models **without** `memory_mib`, or with
-   `memory_mib` but neither telemetry nor a declared budget configured, keep exactly
-   v0.6.0 count-only behavior.
+2. **Admission (atomic, with reservations).** The whole admit → evict → reserve
+   decision runs under one global admission lock, so two concurrent loads cannot
+   both measure the same free memory and double-book a device. In **measured** mode
+   the memory of models still in `loading` (and, for a grace window, just-`ready`
+   ones the driver's telemetry has not yet reflected) is subtracted from free as an
+   **outstanding reservation**. Before loading a model with `memory_mib`:
+   - if the need **exceeds the device's total capacity** (declared budget, or
+     measured total − headroom) it can never fit → fail fast with
+     `CapacityUnavailableError`, `reason=exceeds_device_capacity`, evicting nothing;
+   - otherwise **evict LRU idle models on the same device(s)** — each eviction
+     followed by the ADR 0020 measured-release wait — but **only while evicting the
+     evictable candidates could actually make it fit** (no needless eviction); if it
+     still won't fit, raise `CapacityUnavailableError` with `reason`
+     (`measured_insufficient` / `declared_insufficient`) and `holder`.
+
+   Count-based `max_loaded_models` **stays** as an additional limit, applied after
+   memory admission. Models **without** `memory_mib`, or with `memory_mib` but
+   neither telemetry nor a declared budget configured, keep exactly v0.6.0
+   count-only behavior.
 
 3. **Typed capacity signal for ADR 0023.** `CapacityUnavailableError` subclasses
    `ConcurrencyLimitError` (so existing 429 handling is unchanged) but is a distinct
    type with `reason` + `holder`, so the request-queue card can wait on a clean
-   "capacity unavailable" predicate instead of a bare 429 string. Admission
+   "capacity unavailable" predicate instead of a bare 429 string. Its type, HTTP
+   status (429), `reason`, `holder` and envelope are unchanged by this follow-up —
+   only a new `reason` **value** (`exceeds_device_capacity`) is added, which a
+   waiting queue must treat as non-waitable (the model can never fit). Admission
    decisions (`fits` / `evicted X` / `blocked by Y`) are recorded and exposed in the
    `/status` `resources.admission` block and logs.
 
@@ -90,5 +103,8 @@ memory-aware admission step in front of loading (`broker/manager.py`,
   the `/status` `resources` block shape (provider, enabled, budget map, source).
 - `tests/test_measured_release.py` — admission eviction uses the ADR 0020 measured
   release wait.
+- `tests/test_resources_followup.py` — concurrent admission does not overcommit,
+  declared (P1) and measured (P2); an impossible request (need > device capacity)
+  fails fast with `reason=exceeds_device_capacity` and evicts nothing (P5).
 - `tests/test_registry.py` / `tests/test_config.py` — `memory_mib` validation and
   `BROKER_GPU_MEMORY_*` parsing/validation.

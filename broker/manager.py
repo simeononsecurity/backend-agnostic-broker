@@ -318,6 +318,11 @@ class ModelManager:
         self._telemetry_cache: TelemetrySample | None = None
         self._telemetry_cache_at: float = 0.0
         self._telemetry_lock = asyncio.Lock()
+        # Serializes memory-aware admission (admit -> evict -> reserve) across ALL
+        # models so two concurrent loads cannot both pass against the same free
+        # reading and double-book a device (ADR 0022 follow-up). Held only for the
+        # admission decision + eviction wait, never across a model's whole load.
+        self._admission_lock = asyncio.Lock()
         # Recent memory-aware admission decisions (ADR 0022), newest last, for
         # /status visibility and debugging.
         self._admissions: deque[dict[str, Any]] = deque(maxlen=50)
@@ -601,16 +606,38 @@ class ModelManager:
     async def _maybe_evict(self, keep_alias: str) -> None:
         """Make room to load ``keep_alias``: memory-aware admission then count.
 
-        ADR 0022 memory admission runs first (a no-op for an unsized model or when
-        neither telemetry nor a declared budget is configured), then the v0.6.0
-        count-based LRU limit. Every eviction is followed by the ADR 0020 measured
-        release wait. Models without ``memory_mib`` and with telemetry off keep
-        exactly v0.6.0 behavior.
+        The whole decision runs under a single global ``_admission_lock`` so two
+        concurrent loads cannot both measure the same free memory and double-book a
+        device. ADR 0022 memory admission runs first (a no-op for an unsized model
+        or when neither telemetry nor a declared budget is configured), then the
+        v0.6.0 count-based LRU limit. Every eviction is followed by the ADR 0020
+        measured release wait. Finally the model is *reserved* (transitioned to
+        LOADING) while the lock is still held, so a concurrent admission accounts
+        for it. Models without ``memory_mib`` and with telemetry off keep exactly
+        v0.6.0 behavior. The lock is released before the model's actual load.
         """
         m = self.get(keep_alias)
-        await self._guard_release_stuck(m)
-        await self._admit_memory(m)
-        await self._evict_for_count(keep_alias)
+        async with self._admission_lock:
+            await self._guard_release_stuck(m)
+            await self._admit_memory(m)
+            await self._evict_for_count(keep_alias)
+            self._reserve(m)
+
+    def _reserve(self, m: ManagedModel) -> None:
+        """Mark a just-admitted model LOADING so a concurrent admission sees it.
+
+        Done under the admission lock: the model's ``memory_mib`` then counts as an
+        outstanding reservation (see :meth:`_outstanding_reservation`) before its
+        driver memory is visible to telemetry. ``ensure_ready`` later finds it
+        already LOADING and proceeds without re-transitioning.
+        """
+        st = m.machine.state
+        if st in (State.READY, State.BUSY, State.LOADING):
+            return
+        if st in (State.FAILED, State.RELEASE_STUCK):
+            m.machine.to(State.UNLOADED)
+        if m.machine.state == State.UNLOADED:
+            m.machine.to(State.LOADING)
 
     async def _evict_for_count(self, keep_alias: str) -> None:
         if self.loaded_count() < self.settings.max_loaded_models:
@@ -630,45 +657,207 @@ class ModelManager:
         await self._evict_model(victim)
 
     async def _guard_release_stuck(self, m: ManagedModel) -> None:
-        """Fail a load fast if another model on its device(s) is release_stuck.
+        """Clear or enforce release_stuck holders on ``m``'s device(s) before a load.
 
-        Only active when telemetry is on: the stuck holder's memory is still out,
-        so loading into the same device would race an OOM. Returns a clear 503.
+        Only active when telemetry is on. Each ``release_stuck`` model sharing a
+        device (including ``m`` itself) is **re-checked** first: if its group PIDs
+        are gone and the device's free memory has recovered, it is transitioned
+        RELEASE_STUCK -> UNLOADED and cleared (the memory came back). Any holder
+        still holding memory fails the load fast with a clear 503 — loading into
+        the same device would race an OOM, and the stuck model itself must not
+        reload while its old memory is still out.
         """
         if not self.telemetry_enabled():
             return
         keys = set(m.adapter.device_keys())
+        # The model itself: a stuck model may only reload once its memory returns.
+        if m.machine.state == State.RELEASE_STUCK and not await self._recheck_release_stuck(m):
+            info = m.machine.release_info or {}
+            raise ReleaseStuckError(
+                f"model {m.entry.alias!r} has not released its previous device yet",
+                model=m.entry.alias,
+                state="release_stuck",
+                remediation=(
+                    f"its runtime (pid {info.get('pid')}) still holds "
+                    f"~{info.get('mib_held')} MiB on device {info.get('device')}; "
+                    "free it or wait for the memory to return"
+                ),
+            )
         for other in self.models.values():
-            if other is m:
+            if other is m or other.machine.state != State.RELEASE_STUCK:
                 continue
-            if other.machine.state != State.RELEASE_STUCK:
+            if not (keys & set(other.adapter.device_keys())):
                 continue
-            if keys & set(other.adapter.device_keys()):
-                info = other.machine.release_info or {}
-                raise ReleaseStuckError(
-                    f"device still held by release-stuck model {other.entry.alias!r}",
-                    model=m.entry.alias,
-                    state="release_stuck",
-                    remediation=(
-                        "the previous runtime did not release its device; inspect "
-                        f"pid {info.get('pid')} on device {info.get('device')} "
-                        "(it may be a zombie) then retry"
-                    ),
-                )
+            if await self._recheck_release_stuck(other):
+                continue  # recovered: memory came back, holder cleared
+            info = other.machine.release_info or {}
+            raise ReleaseStuckError(
+                f"device still held by release-stuck model {other.entry.alias!r}",
+                model=m.entry.alias,
+                state="release_stuck",
+                remediation=(
+                    "the previous runtime did not release its device; inspect "
+                    f"pid {info.get('pid')} on device {info.get('device')} "
+                    "(it may be a zombie) then retry"
+                ),
+            )
+
+    async def _recheck_release_stuck(self, m: ManagedModel) -> bool:
+        """Re-test a release_stuck model; clear it to UNLOADED if memory returned.
+
+        Returns True when the model is not (or no longer) stuck — either it was
+        never stuck, or its group PIDs are now absent AND the device's free memory
+        has recovered, so it is transitioned RELEASE_STUCK -> UNLOADED with
+        ``survived_kill`` / ``release_info`` cleared. Returns False while the memory
+        is still held. Needs telemetry to verify recovery; without it the model
+        stays stuck (we cannot prove the memory came back).
+        """
+        if m.machine.state != State.RELEASE_STUCK:
+            return True
+        if not self.telemetry_enabled():
+            return False
+        info = m.machine.release_info or {}
+        snapshot = info.get("snapshot") or {}
+        group_pids = set(info.get("group_pids") or [])
+        if not group_pids and info.get("pid") is not None:
+            group_pids = {int(info["pid"])}
+        sample = await self.telemetry_sample(force=True)
+        released, _detail = self._release_state(sample, group_pids, snapshot)
+        proc_gone = not await m.adapter.process_alive()
+        if not (proc_gone and released):
+            return False
+        try:
+            m.machine.to(State.UNLOADED)
+        except Exception:  # noqa: BLE001 - never let a state guard strand recovery
+            m.machine.state = State.UNLOADED
+        m.machine.survived_kill = False
+        m.machine.release_info = None
+        log.info("model %s recovered from release_stuck: device memory returned", m.entry.alias)
+        self._record_admission(m.entry.alias, "release_recovered", {"device": info.get("device")})
+        return True
+
+    async def _recheck_all_release_stuck(self) -> None:
+        """Periodic pass (idle sweep): clear any release_stuck model that recovered."""
+        if not self.telemetry_enabled():
+            return
+        for m in list(self.models.values()):
+            if m.machine.state == State.RELEASE_STUCK:
+                try:
+                    await self._recheck_release_stuck(m)
+                except Exception as exc:  # noqa: BLE001 - never let recovery break the sweep
+                    log.warning("release_stuck recheck for %s failed: %s", m.entry.alias, exc)
 
     async def _evict_model(self, victim: ManagedModel) -> None:
         """Unload ``victim`` then wait for its device to be released (ADR 0020)."""
         pid = victim.adapter.process_pid()
+        group_pids = set(victim.adapter.process_group_pids())
         keys = victim.adapter.device_keys()
+        snapshot: dict[str, Any] = {}
+        if self.telemetry_enabled():
+            pre = await self.telemetry_sample(force=True)
+            snapshot = self._snapshot_hold(pre, victim, group_pids, keys)
         await victim.unload()
-        await self._await_release(victim, pid, keys)
+        await self._await_release(victim, pid, group_pids, snapshot)
 
-    async def _await_release(self, victim: ManagedModel, pid: int | None, keys: list[str]) -> None:
+    def _snapshot_hold(
+        self,
+        sample: TelemetrySample,
+        victim: ManagedModel,
+        group_pids: set[int],
+        keys: list[str],
+    ) -> dict[str, Any]:
+        """Snapshot what ``victim`` holds BEFORE it is stopped (ADR 0020 follow-up).
+
+        Records, across the victim's relevant device(s): the held amount (the sum
+        of its group PIDs' memory if the driver attributes any, else its declared
+        ``memory_mib``, else ``None`` = unknown) and the device free memory at this
+        instant. The release wait compares against this to confirm the memory came
+        back — not just that the parent PID disappeared.
+        """
+        relevant = self._relevant_devices(sample, keys)
+        holders: dict[int, int] = {}
+        for d in relevant:
+            holders.update(d.processes)
+        present = [gp for gp in group_pids if gp in holders]
+        if present:
+            held: int | None = sum(holders[gp] for gp in present)
+        elif victim.entry.memory_mib:
+            held = victim.entry.memory_mib
+        else:
+            held = None
+        frees = [d.free_mib for d in relevant if d.free_mib is not None]
+        free_before = sum(frees) if frees else None
+        dev_indices = [d.index for d in relevant]
+        return {
+            "devices": dev_indices,
+            "device": dev_indices[0] if dev_indices else None,
+            "held_mib": held,
+            "free_before": free_before,
+            "group_pids": sorted(group_pids),
+        }
+
+    def _release_state(
+        self, sample: TelemetrySample, group_pids: set[int], snapshot: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any]]:
+        """Whether the evicted runtime has released its device memory (ADR 0020).
+
+        Released ==  **none** of the runtime's group PIDs still appear as holders
+        AND the device's free memory has recovered. Recovery uses the snapshot: if
+        we know the held amount, free must have come back by at least
+        ``gpu_release_recovery_fraction`` of it (tolerating another tenant taking a
+        slice); if the amount is unknown (no PID attribution — e.g. a container
+        where nvidia-smi lists no PIDs), any real increase over the pre-stop free
+        counts, so memory that never comes back is correctly flagged stuck.
+        """
+        if not sample.ok:
+            # No measurement right now: fall back to PID-only (best effort).
+            return (True, {"reason": "telemetry_unavailable"})
+        dev_indices = set(snapshot.get("devices") or [])
+        relevant = [d for d in sample.devices if d.index in dev_indices] or list(sample.devices)
+        holders: dict[int, int] = {}
+        for d in relevant:
+            holders.update(d.processes)
+        present = any(gp in holders for gp in group_pids)
+        frees = [d.free_mib for d in relevant if d.free_mib is not None]
+        free_now = sum(frees) if frees else None
+        held = snapshot.get("held_mib")
+        free_before = snapshot.get("free_before")
+        if present:
+            recovered = False
+        elif held is not None and held > 0:
+            if free_before is None or free_now is None:
+                recovered = True  # pids gone, cannot measure delta -> trust
+            else:
+                frac = self.settings.gpu_release_recovery_fraction
+                recovered = free_now >= free_before + frac * held
+        else:  # held unknown (no PID attribution)
+            if free_before is None or free_now is None:
+                recovered = True
+            else:
+                recovered = free_now > free_before
+        released = (not present) and recovered
+        info = {
+            "device": snapshot.get("device"),
+            "group_present": present,
+            "free_now": free_now,
+            "free_before": free_before,
+            "held_mib": held,
+        }
+        return released, info
+
+    async def _await_release(
+        self,
+        victim: ManagedModel,
+        pid: int | None,
+        group_pids: set[int],
+        snapshot: dict[str, Any],
+    ) -> None:
         """Wait until ``victim`` has released its device, or mark it release_stuck.
 
         Gated on telemetry being on (telemetry off keeps v0.6.0 timing; ``stop()``
         already reports a surviving process). Released == the process is gone AND
-        the device no longer reports ``pid`` among its holders, bounded by
+        :meth:`_release_state` confirms none of the runtime's **group** PIDs still
+        hold memory AND the device free memory recovered, bounded by
         ``BROKER_RELEASE_TIMEOUT_SECONDS``. On timeout the model enters
         ``release_stuck`` and :class:`ReleaseStuckError` (503) is raised naming the
         held device/MiB. The broker never force-resets a GPU or kills a foreign PID.
@@ -681,21 +870,24 @@ class ModelManager:
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         poll = max(0.05, min(self.settings.gpu_telemetry_poll_seconds, 1.0))
-        last_held_mib: int | None = None
-        last_device: str | None = None
+        last_info: dict[str, Any] = {}
         while loop.time() < deadline:
             proc_gone = not await victim.adapter.process_alive()
             sample = await self.telemetry_sample(force=True)
-            held_mib, device = self._pid_holding(sample, pid, keys)
-            last_held_mib, last_device = held_mib, device
-            if proc_gone and held_mib is None:
+            released, last_info = self._release_state(sample, group_pids, snapshot)
+            if proc_gone and released:
                 return
             await asyncio.sleep(poll)
         # Timed out: surface a visible release_stuck state and fail the load 503.
+        device = last_info.get("device") or snapshot.get("device")
+        held_mib = snapshot.get("held_mib")
         info = {
             "pid": pid,
-            "device": last_device,
-            "mib_held": last_held_mib,
+            "group_pids": sorted(group_pids),
+            "device": device,
+            "mib_held": held_mib,
+            "free_before": snapshot.get("free_before"),
+            "snapshot": snapshot,
             "timeout_seconds": timeout,
         }
         victim.machine.release_info = info
@@ -705,21 +897,25 @@ class ModelManager:
         except Exception:  # noqa: BLE001 - never let a state guard mask the 503
             victim.machine.state = State.RELEASE_STUCK
         log.error(
-            "model %s is release_stuck: pid=%s still holds %s MiB on device %s after %ss",
+            "model %s is release_stuck: group %s still holds device %s "
+            "(~%s MiB, free %s->%s) after %ss",
             victim.entry.alias,
-            pid,
-            last_held_mib,
-            last_device,
+            sorted(group_pids),
+            device,
+            held_mib,
+            snapshot.get("free_before"),
+            last_info.get("free_now"),
             timeout,
         )
         raise ReleaseStuckError(
-            f"runtime for {victim.entry.alias!r} did not release device "
-            f"{last_device} within {timeout}s",
+            f"runtime for {victim.entry.alias!r} did not release device {device} within {timeout}s",
             model=victim.entry.alias,
             state="release_stuck",
             remediation=(
-                f"pid {pid} still holds ~{last_held_mib} MiB (possible zombie CUDA/ROCm "
-                "context); free it or raise BROKER_RELEASE_TIMEOUT_SECONDS"
+                f"group {sorted(group_pids)} still holds ~{held_mib} MiB (possible "
+                "zombie CUDA/ROCm context, a lingering child, or a container PID "
+                "namespace hiding the holder); free it or raise "
+                "BROKER_RELEASE_TIMEOUT_SECONDS"
             ),
         )
 
@@ -727,24 +923,17 @@ class ModelManager:
         matched = [d for d in sample.devices if d.index in keys]
         return matched if matched else list(sample.devices)
 
-    def _pid_holding(
-        self, sample: TelemetrySample, pid: int | None, keys: list[str]
-    ) -> tuple[int | None, str | None]:
-        """If ``pid`` still holds memory on a relevant device, return (mib, device)."""
-        if pid is None or not sample.ok:
-            return None, None
-        for d in self._relevant_devices(sample, keys):
-            if pid in d.processes:
-                return d.processes.get(pid, 0), d.index
-        return None, None
-
     async def _admit_memory(self, m: ManagedModel) -> None:
-        """Memory-aware admission for a sized model (ADR 0022).
+        """Memory-aware admission for a sized model (ADR 0022 + follow-up).
 
         No-op unless the model declares ``memory_mib`` AND accounting is possible
-        (telemetry on, or a declared budget configured). Evicts idle models on the
-        same device(s) — each with a measured release wait — until the model fits,
-        else raises :class:`CapacityUnavailableError` (429) naming the holder.
+        (telemetry on, or a declared budget configured). First a hard capacity
+        check: if the need exceeds a device's total capacity it can NEVER fit, so
+        fail fast with ``exceeds_device_capacity`` and evict nothing. Then evict
+        idle models on the same device(s) — each with a measured release wait —
+        until the model fits, but only while evicting the evictable candidates
+        could actually make room; otherwise fail fast (no needless eviction). On
+        no-fit raises :class:`CapacityUnavailableError` naming the holder.
         """
         need = m.entry.memory_mib
         if need is None:
@@ -753,13 +942,26 @@ class ModelManager:
         if not measured and not self.settings.gpu_memory_budget_map():
             return  # sized but no budget/telemetry: fall back to count-only
         keys = m.adapter.device_keys()
+        cap = await self._exceeds_capacity(m, need, keys, measured)
+        if cap is not None:
+            self._record_admission(m.entry.alias, "blocked", cap)
+            raise CapacityUnavailableError(
+                f"cannot load {m.entry.alias!r}: {cap.get('summary')}",
+                reason=cap.get("reason"),
+                holder=cap.get("holder"),
+                model=m.entry.alias,
+                remediation=(
+                    "this model is larger than the device can ever hold; pin it to "
+                    "a bigger device, lower its memory_mib, or raise the budget"
+                ),
+            )
         while True:
             fits, detail = await self._fits(m, need, keys, measured)
             if fits:
                 self._record_admission(m.entry.alias, "fits", detail)
                 return
             victim = self._pick_memory_victim(m, keys)
-            if victim is None:
+            if victim is None or not self._eviction_can_help(m, need, keys, measured):
                 self._record_admission(m.entry.alias, "blocked", detail)
                 raise CapacityUnavailableError(
                     f"not enough memory to load {m.entry.alias!r}: {detail.get('summary')}",
@@ -780,6 +982,105 @@ class ModelManager:
             await self._evict_model(victim)
             self._record_admission(m.entry.alias, f"evicted {victim.entry.alias}", detail)
 
+    def _measured_capacity(self, key: str, sample: TelemetrySample) -> int | None:
+        """Best relevant device's total capacity minus headroom (measured), or None."""
+        devs = [d for d in sample.devices if d.index == key] or list(sample.devices)
+        headroom = self.settings.gpu_memory_headroom_mib
+        caps = [d.total_mib - headroom for d in devs if d.total_mib is not None]
+        return max(caps) if caps else None
+
+    async def _exceeds_capacity(
+        self, m: ManagedModel, need: int, keys: list[str], measured: bool
+    ) -> dict[str, Any] | None:
+        """If ``need`` is larger than a device can EVER hold, return a block detail.
+
+        Uses measured total (minus headroom) when telemetry is available, else the
+        declared budget. This is the "impossible request" guard: it must run before
+        any eviction so a 5000 MiB model never evicts the idle 600 MiB tenant of a
+        1000 MiB device only to 429 anyway.
+        """
+        sample = await self.telemetry_sample() if measured else None
+        use_measured = measured and sample is not None and sample.ok
+        for key in keys:
+            cap: int | None = None
+            if use_measured and sample is not None:
+                cap = self._measured_capacity(key, sample)
+            if cap is None:
+                cap = self.settings.budget_for_device(key)
+            if cap is not None and need > cap:
+                return {
+                    "reason": "exceeds_device_capacity",
+                    "device": key,
+                    "capacity_mib": cap,
+                    "need_mib": need,
+                    "holder": f"device {key} (capacity {cap} MiB)",
+                    "summary": (f"model needs {need} MiB but device {key} capacity is {cap} MiB"),
+                }
+        return None
+
+    def _evictable_candidates(self, m: ManagedModel, keys: list[str]) -> list[ManagedModel]:
+        """Idle, non-draining READY models sharing a device with ``m`` (never ``m``)."""
+        keyset = set(keys)
+        return [
+            mm
+            for mm in self.models.values()
+            if mm is not m
+            and mm.machine.state == State.READY
+            and mm.machine.inflight == 0
+            and not mm.draining
+            and keyset & set(mm.adapter.device_keys())
+        ]
+
+    def _eviction_can_help(
+        self, m: ManagedModel, need: int, keys: list[str], measured: bool
+    ) -> bool:
+        """Whether evicting the evictable candidates could actually make ``m`` fit.
+
+        Prevents needless eviction: with no evictable candidate, or when even
+        reclaiming all of them still leaves the model unable to fit (e.g. a busy
+        non-evictable holder occupies the device), we fail fast instead of evicting
+        for nothing. Precise for declared accounting; for measured accounting it is
+        conservative — it only blocks when it is confident eviction cannot help
+        (every candidate's footprint is known and still insufficient).
+        """
+        candidates = self._evictable_candidates(m, keys)
+        if not candidates:
+            return False
+        if not measured:
+            for key in keys:
+                budget = self.settings.budget_for_device(key)
+                if budget is None:
+                    continue
+                residents = self._resident_on(key, exclude=m)
+                used = sum((r.entry.memory_mib or 0) for r in residents)
+                reclaimable = sum(
+                    (c.entry.memory_mib or 0)
+                    for c in candidates
+                    if key in set(c.adapter.device_keys())
+                )
+                if need + (used - reclaimable) > budget:
+                    return False
+            return True
+        # Measured: only block when every candidate footprint is known and the
+        # measured free plus the reclaimable total still cannot fit the need.
+        cache = self._telemetry_cache
+        if cache is None or not cache.ok:
+            return True
+        headroom = self.settings.gpu_memory_headroom_mib
+        for key in keys:
+            devs = [d for d in cache.devices if d.index == key] or list(cache.devices)
+            avails = [d.free_mib - headroom for d in devs if d.free_mib is not None]
+            if not avails:
+                continue
+            avail = max(avails)
+            on_key = [c for c in candidates if key in set(c.adapter.device_keys())]
+            if any(c.entry.memory_mib is None for c in on_key):
+                continue  # unknown footprint: do not rule eviction out
+            reclaimable = sum((c.entry.memory_mib or 0) for c in on_key)
+            if avail + reclaimable < need:
+                return False
+        return True
+
     def _resident_on(self, key: str, exclude: ManagedModel) -> list[ManagedModel]:
         out = []
         for mm in self.models.values():
@@ -795,6 +1096,33 @@ class ModelManager:
             if key in mm.adapter.device_keys():
                 out.append(mm)
         return out
+
+    def _outstanding_reservation(self, key: str, exclude: ManagedModel) -> int:
+        """Reserved MiB on ``key`` not yet reflected in measured free memory.
+
+        A sized model counts while it is LOADING (its driver memory is not up yet),
+        and for ``gpu_memory_reservation_seconds`` after it became READY (the
+        telemetry poll may not have caught the allocation). This is what makes two
+        concurrent admissions serialize correctly against a single free reading
+        without double-booking the device.
+        """
+        now = time.monotonic()
+        grace = self.settings.gpu_memory_reservation_seconds
+        total = 0
+        for mm in self.models.values():
+            if mm is exclude:
+                continue
+            mib = mm.entry.memory_mib or 0
+            if mib <= 0 or key not in mm.adapter.device_keys():
+                continue
+            st = mm.machine.state
+            if st == State.LOADING:
+                total += mib
+            elif st in (State.READY, State.BUSY):
+                la = mm.machine.loaded_at
+                if la is not None and (now - la) < grace:
+                    total += mib
+        return total
 
     async def _fits(
         self, m: ManagedModel, need: int, keys: list[str], measured: bool
@@ -813,8 +1141,14 @@ class ModelManager:
                 worst: dict[str, Any] | None = None
                 for key in keys:
                     devs = [d for d in sample.devices if d.index == key] or list(sample.devices)
+                    # Subtract outstanding reservations (sized models in LOADING, or
+                    # just-made-READY within the grace window) so two concurrent
+                    # admissions cannot both spend the same free reading.
+                    reserved = self._outstanding_reservation(key, exclude=m)
                     avails = [
-                        (d.free_mib - headroom, d.index) for d in devs if d.free_mib is not None
+                        (d.free_mib - headroom - reserved, d.index)
+                        for d in devs
+                        if d.free_mib is not None
                     ]
                     if not avails:
                         continue
@@ -828,10 +1162,11 @@ class ModelManager:
                             "reason": "measured_insufficient",
                             "device": dev,
                             "free_minus_headroom_mib": avail,
+                            "reserved_mib": reserved,
                             "need_mib": need,
                             "holder": f"device {dev}",
                             "summary": f"device {dev} has {avail} MiB free (headroom "
-                            f"{headroom}), need {need}",
+                            f"{headroom}, reserved {reserved}), need {need}",
                         }
                         break
                 if worst is not None:
@@ -1958,6 +2293,9 @@ class ModelManager:
 
     # --- idle sweep ------------------------------------------------------
     async def _sweep_once(self) -> None:
+        # Clear any release_stuck model whose device memory has come back (ADR 0020
+        # follow-up): a stuck holder must not strand its device until a restart.
+        await self._recheck_all_release_stuck()
         for m in list(self.models.values()):
             if m.machine.state != State.READY or m.machine.inflight > 0:
                 continue

@@ -39,10 +39,19 @@ class ProcessSupervisor:
         self._proc: asyncio.subprocess.Process | None = None
         self._log_lines: list[str] = []
         self._reader_task: asyncio.Task | None = None
+        # ADR 0020: the process-group id captured at spawn (start_new_session makes
+        # the child a group leader, so pgid == pid). Kept after stop() so the
+        # measured-release wait can still scan /proc for lingering group members.
+        self._started_pgid: int | None = None
 
     @property
     def pid(self) -> int | None:
         return self._proc.pid if self._proc else None
+
+    @property
+    def started_pgid(self) -> int | None:
+        """The process-group id recorded at spawn (survives stop/exit)."""
+        return self._started_pgid
 
     @property
     def pgid(self) -> int | None:
@@ -87,6 +96,10 @@ class ProcessSupervisor:
                 remediation="install the runtime or fix its configured path",
             ) from exc
         self._reader_task = asyncio.ensure_future(self._drain_output())
+        try:
+            self._started_pgid = os.getpgid(self._proc.pid)
+        except OSError:  # pragma: no cover - race if the child exited instantly
+            self._started_pgid = self._proc.pid
         return self._proc.pid
 
     async def _drain_output(self) -> None:

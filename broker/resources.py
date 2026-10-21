@@ -26,7 +26,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import subprocess  # noqa: S404 - argv-only, absolute path, no shell (see _run)
 import sys
 import time
@@ -126,7 +125,10 @@ def resolve_tool(name: str, override: str | None = None) -> str | None:
 
     An ``override`` is honored only when it is an absolute path to an existing
     executable file. Otherwise the fixed allow-list in :data:`_TOOL_CANDIDATES`
-    is searched. PATH is intentionally never consulted.
+    is searched. **PATH is never consulted** (a relative override or a PATH lookup
+    could let an attacker-controlled PATH redirect a privileged driver query), so
+    an operator who installs a tool outside the allow-list must point the matching
+    ``BROKER_GPU_TELEMETRY_*_PATH`` setting at its absolute path.
     """
     if override:
         if os.path.isabs(override) and os.path.isfile(override) and os.access(override, os.X_OK):
@@ -138,11 +140,55 @@ def resolve_tool(name: str, override: str | None = None) -> str | None:
     for cand in _TOOL_CANDIDATES.get(name, ()):  # pragma: no branch
         if os.path.isfile(cand) and os.access(cand, os.X_OK):
             return cand
-    # Last resort: shutil.which, but only accept an absolute result.
-    found = shutil.which(name)
-    if found and os.path.isabs(found):
-        return found
     return None
+
+
+def process_group_pids(pgid: int | None, main_pid: int | None = None) -> set[int]:
+    """Best-effort set of PIDs belonging to a runtime's process group (ADR 0020).
+
+    A broker-spawned runtime is started in its own session/process-group (so the
+    group id equals the leader's PID). The GPU memory a runtime holds is often
+    attributed by the driver to **child** processes (vLLM's EngineCore / TP
+    workers), not the parent, so matching only the parent PID misses the holder.
+
+    On Linux every live PID whose ``/proc/<pid>/stat`` ``pgrp`` field equals
+    ``pgid`` is included. On other platforms (or when ``/proc`` is unavailable)
+    this degrades to just ``main_pid`` — a documented best-effort limitation that
+    the measured-release memory check compensates for.
+    """
+    pids: set[int] = set()
+    if main_pid is not None:
+        pids.add(main_pid)
+    if pgid is None:
+        return pids
+    if sys.platform.startswith("linux") and os.path.isdir("/proc"):
+        try:
+            entries = os.listdir("/proc")
+        except OSError:  # pragma: no cover - defensive
+            return pids
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", encoding="utf-8") as fh:
+                    data = fh.read()
+            except OSError:
+                continue  # process vanished or is not readable
+            # Fields after the "(comm)" token: state ppid pgrp session ...
+            # comm may itself contain spaces/parens, so split after the LAST ')'.
+            rparen = data.rfind(")")
+            if rparen == -1:
+                continue
+            rest = data[rparen + 1 :].split()
+            if len(rest) < 3:
+                continue
+            try:
+                pgrp = int(rest[2])
+            except ValueError:
+                continue
+            if pgrp == pgid:
+                pids.add(int(entry))
+    return pids
 
 
 def run_tool(argv: Sequence[str], timeout: float) -> str:

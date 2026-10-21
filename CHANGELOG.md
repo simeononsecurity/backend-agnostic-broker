@@ -20,12 +20,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `resources` block; Ollama daemon memory is reported separately, labeled `reported`.
 - **Measured release on model swap (ADR 0020).** After evicting a broker-spawned
   runtime, the next load on the same device waits (bounded by
-  `BROKER_RELEASE_TIMEOUT_SECONDS`) for the process group to exit and — when
-  telemetry is on — for the device to stop reporting its PIDs. If the memory never
-  comes back the model enters a visible `release_stuck` state and the load fails
-  **503** instead of OOMing. `ProcessSupervisor.stop()` now reports (logs + returns)
-  when a process survives SIGKILL instead of silently returning. The broker never
-  resets a GPU or kills a process it did not start.
+  `BROKER_RELEASE_TIMEOUT_SECONDS`) for the runtime's **process group** (parent and
+  children) to stop holding memory **and** for the device's free memory to recover
+  (≥ `BROKER_GPU_RELEASE_RECOVERY_FRACTION`), so a child worker (vLLM) or a container
+  PID namespace that hides the holder can't be mistaken for a release. If the memory
+  never comes back the model enters a visible `release_stuck` state and the load
+  fails **503** instead of OOMing; `release_stuck` **auto-recovers** to `unloaded`
+  (next load or periodic tick) once the memory returns, with no restart.
+  `ProcessSupervisor.stop()` now reports (logs + returns) when a process survives
+  SIGKILL instead of silently returning. The broker never resets a GPU or kills a
+  process it did not start.
 - **Vendor-correct device env var (ADR 0020).** `gpu.device_ids` is set into the var
   the active provider expects — `ROCR_VISIBLE_DEVICES` for `amd`, `CUDA_VISIBLE_DEVICES`
   otherwise (the portable default, unchanged) — overridable with
@@ -33,10 +37,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Memory-aware admission (ADR 0022, opt-in, default OFF).** An optional per-model
   `memory_mib` admits a load only if it fits the device budget — measured free
   memory (minus `BROKER_GPU_MEMORY_HEADROOM_MIB`) when telemetry is on, else the
-  declared `BROKER_GPU_MEMORY_BUDGET_MIB` (integer or `0=…,1=…` map). It evicts LRU
-  idle models on the same device(s) to fit, else raises a typed
+  declared `BROKER_GPU_MEMORY_BUDGET_MIB` (integer or `0=…,1=…` map). Admission is
+  **atomic** (a global lock serializes admit→evict→reserve, and in-flight loads are
+  counted as reservations so concurrent loads can't double-book a device) and
+  **evicts no more than necessary**: a model larger than the device can ever hold
+  fails fast with `reason=exceeds_device_capacity` and evicts nothing, and eviction
+  runs only when it could actually make room. Otherwise it raises a typed
   `CapacityUnavailableError` (429, with `reason` + `holder`) that the ADR 0023 queue
   can wait on. Unsized models keep v0.6.0 behavior.
+- New tunables: `BROKER_GPU_RELEASE_RECOVERY_FRACTION` (default `0.9`) and
+  `BROKER_GPU_MEMORY_RESERVATION_SECONDS` (default `10.0`).
 - New guide `docs/guides/gpu-memory.md` and tested `examples/gpu-memory/`.
 
 ### Notes
