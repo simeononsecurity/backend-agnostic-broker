@@ -50,12 +50,15 @@ import asyncio
 import itertools
 import json
 import logging
+import os
 import random
+import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import runtime_identity as rid
 from .adapters import make_adapter
 from .cache_routing import CacheRouter
 from .config import Settings
@@ -64,6 +67,7 @@ from .errors import (
     BackendUnavailableError,
     BrokerError,
     ConcurrencyLimitError,
+    ConfigError,
     ModelBusyError,
     ModelLoadError,
     ModelNotFoundError,
@@ -71,6 +75,7 @@ from .errors import (
     TimeoutError_,
     ValidationError,
 )
+from .ledger import LedgerOwnerLock, LockOwner, RuntimeLedger, RuntimeRecord, argv_hash
 from .lifecycle import LifecycleMachine, State
 from .registry import ModelEntry, Registry, load_registry
 from .reliability import ErrorClass, RetryPolicy, classify_error, retry_after_seconds
@@ -164,7 +169,15 @@ def _result_to_sse_chunks(result: dict, model: str) -> list[bytes]:
 
 
 class ManagedModel:
-    def __init__(self, entry: ModelEntry, settings: Settings) -> None:
+    def __init__(
+        self,
+        entry: ModelEntry,
+        settings: Settings,
+        ledger: RuntimeLedger | None = None,
+        broker_instance_id: str = "",
+        broker_pid: int | None = None,
+        broker_start_time: str | None = None,
+    ) -> None:
         self.entry = entry
         self.settings = settings
         self.adapter = make_adapter(entry, settings)
@@ -174,6 +187,16 @@ class ManagedModel:
         # Routing / health state.
         self.public_name = entry.public_name
         self.healthy = True
+        # Runtime-identity / restart-reconciliation state (ADR 0021).
+        self.ledger = ledger
+        self.broker_instance_id = broker_instance_id
+        #: The owning broker process's identity, stamped onto each ledger record.
+        self.broker_pid = broker_pid if broker_pid is not None else os.getpid()
+        self.broker_start_time = broker_start_time
+        #: Normalized process start time of the current runtime (identity anchor).
+        self.process_start_time: str | None = None
+        #: True when the current runtime was ADOPTED at startup, not spawned.
+        self.adopted = False
         # Set True while an admin unload/reload is draining this member: selection
         # skips it so in-flight requests finish without new ones piling on.
         self.draining = False
@@ -203,6 +226,8 @@ class ManagedModel:
                 self.machine.to(State.READY)
                 self.machine.touch()
                 self.healthy = True
+                self.adopted = False
+                self._record_runtime(pid)
                 log.info("model %s ready (pid=%s)", self.entry.alias, pid)
             except Exception as exc:  # noqa: BLE001
                 self.machine.to(State.FAILED, error=str(exc))
@@ -222,6 +247,92 @@ class ManagedModel:
                     remediation="check runtime logs and registry startup_command",
                 ) from exc
 
+    def _record_runtime(self, pid: int | None) -> None:
+        """Persist a ledger record for a freshly-spawned broker-managed runtime.
+
+        No-op for backends that do not spawn a broker-owned process (no pid, no
+        startup_command, or no ledger configured) — e.g. the fake backend and
+        external daemons like Ollama, so default/test behavior is unchanged.
+        """
+        if self.ledger is None or pid is None or not self.entry.startup_command:
+            return
+        start_time = rid.process_start_time(pid)
+        self.process_start_time = start_time
+        record = RuntimeRecord(
+            alias=self.entry.alias,
+            pid=pid,
+            pgid=rid.pgid_of(pid),
+            start_time=start_time,
+            port=rid.port_from_url(self.entry.base_url),
+            argv_sha256=argv_hash(self.adapter.runtime_argv()),
+            broker_instance_id=self.broker_instance_id,
+            base_url=self.entry.base_url,
+            spawned_at=time.time(),
+            broker_pid=self.broker_pid,
+            broker_start_time=self.broker_start_time,
+        )
+        try:
+            self.ledger.upsert(record)
+        except Exception as exc:  # noqa: BLE001 - ledger failure must not break a load
+            log.warning("failed to record runtime %s in ledger: %s", self.entry.alias, exc)
+
+    def _forget_runtime(self) -> None:
+        """Drop this model's ledger record on a clean stop/unload."""
+        self.process_start_time = None
+        self.adopted = False
+        if self.ledger is None:
+            return
+        try:
+            self.ledger.remove(self.entry.alias)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("failed to remove runtime %s from ledger: %s", self.entry.alias, exc)
+
+    async def adopt(self, record: RuntimeRecord) -> bool:
+        """Adopt a recorded, still-alive orphaned runtime (ADR 0021, adopt mode).
+
+        Preconditions (ALL required, checked by the caller's identity gate plus
+        here): the process is alive with a matching start time, the registry argv
+        still matches the recorded hash (no drift), and the runtime's port answers
+        the readiness probe. On success the model is marked READY **without
+        spawning** and the ledger record is kept. Returns False (no adoption) if
+        any check fails — the caller then surfaces it as an orphan instead.
+        """
+        # Registry drift check: the current spawn argv must hash to the record.
+        planned = self.adapter.planned_argv()
+        if planned is None or argv_hash(planned) != record.argv_sha256:
+            log.info("cannot adopt %s: registry argv no longer matches record", self.entry.alias)
+            return False
+        # Probe readiness BEFORE taking ownership (the probe uses base_url, not the
+        # process handle), so a failed probe leaves no adopted state to unwind.
+        try:
+            health = await self.adapter.health()
+        except Exception as exc:  # noqa: BLE001
+            log.info("cannot adopt %s: readiness probe errored: %s", self.entry.alias, exc)
+            return False
+        if not health.healthy:
+            log.info("cannot adopt %s: port did not answer readiness probe", self.entry.alias)
+            return False
+        # Take ownership of the live process so a later stop() can terminate it.
+        self.adapter.mark_adopted(record.pid, record.pgid, record.start_time)
+        # Mark READY without spawning (UNLOADED -> LOADING -> READY).
+        if self.machine.state == State.FAILED:
+            self.machine.to(State.UNLOADED)
+        if self.machine.state == State.UNLOADED:
+            self.machine.to(State.LOADING)
+        self.machine.to(State.READY)
+        self.machine.pid = record.pid
+        self.machine.touch()
+        self.healthy = True
+        self.adopted = True
+        self.process_start_time = record.start_time
+        log.info(
+            "adopted orphaned runtime for model %s (pid=%s, port=%s)",
+            self.entry.alias,
+            record.pid,
+            record.port,
+        )
+        return True
+
     async def unload(self) -> None:
         if not self.machine.is_active():
             return
@@ -234,6 +345,7 @@ class ManagedModel:
             try:
                 await self.adapter.unload()
                 self.machine.to(State.UNLOADED)
+                self._forget_runtime()
                 log.info("model %s unloaded", self.entry.alias)
             except Exception as exc:  # noqa: BLE001
                 self.machine.to(State.FAILED, error=str(exc))
@@ -248,6 +360,7 @@ class ManagedModel:
             try:
                 await self.adapter.stop()
             finally:
+                self._forget_runtime()
                 try:
                     self.machine.to(State.UNLOADED)
                 except Exception:  # noqa: BLE001
@@ -258,8 +371,33 @@ class ModelManager:
     def __init__(self, registry: Registry, settings: Settings) -> None:
         self.settings = settings
         self.registry = registry
+        # Runtime ledger + this broker's instance id (ADR 0021). The ledger lives
+        # under cache_dir and records every broker-spawned runtime so a restart can
+        # reconcile orphans; a unique instance id tags which broker spawned each.
+        self.broker_instance_id = secrets.token_hex(8)
+        # This broker process's own durable identity (PID + start time), stamped
+        # onto every ledger record and the ownership lock so reconcile can tell a
+        # dead owner's orphans from a live sibling's runtimes (ADR 0021).
+        self.broker_pid = os.getpid()
+        self.broker_start_time = rid.process_start_time(self.broker_pid)
+        self.ledger: RuntimeLedger | None = RuntimeLedger(self._ledger_path(settings))
+        #: Broker-lifetime exclusive lock enforcing one live broker per cache dir.
+        self._owner_lock = LedgerOwnerLock(self._owner_lock_path(settings))
+        #: Set when the ledger was disabled because a live sibling owns it; shown
+        #: in /status so an operator sees why reconciliation is inert here.
+        self.reconcile_disabled_reason: str | None = None
+        #: Summary of the last startup reconciliation, surfaced in /status.
+        self.last_reconciliation: dict[str, Any] = {}
         self.models: dict[str, ManagedModel] = {
-            e.alias: ManagedModel(e, settings) for e in registry.models
+            e.alias: ManagedModel(
+                e,
+                settings,
+                self.ledger,
+                self.broker_instance_id,
+                self.broker_pid,
+                self.broker_start_time,
+            )
+            for e in registry.models
         }
         # Public name -> ordered list of member ManagedModels (a pool).
         self.pools: dict[str, list[ManagedModel]] = {}
@@ -311,6 +449,95 @@ class ModelManager:
         """Validate every adapter config at startup (no model loads)."""
         for m in self.models.values():
             m.adapter.validate_config()
+
+    # --- runtime ledger / reconciliation (ADR 0021) ----------------------
+    @staticmethod
+    def _ledger_path(settings: Settings) -> str:
+        """Host-local path of the runtime ledger under BROKER_CACHE_DIR."""
+        return f"{settings.cache_dir.rstrip('/')}/runtime-ledger.json"
+
+    @staticmethod
+    def _owner_lock_path(settings: Settings) -> str:
+        """Path of the broker-lifetime ledger ownership lock, next to the ledger."""
+        return f"{settings.cache_dir.rstrip('/')}/runtime-ledger.owner.lock"
+
+    def acquire_ledger_ownership(self) -> None:
+        """Take the broker-lifetime ownership lock on the runtime ledger (ADR 0021).
+
+        Enforces one live broker per ``BROKER_CACHE_DIR``. Called once from the app
+        lifespan BEFORE :meth:`reconcile`. If a live sibling broker already owns the
+        ledger (e.g. two local brokers accidentally sharing the default cache dir):
+
+        * ``adopt`` / ``stop`` — refuse to start with a :class:`ConfigError` naming
+          the cache dir and the owner PID. The operator opted into signalling or
+          adopting runtimes, so acting on a sibling's runtimes is unsafe: fail
+          closed.
+        * ``report`` (default) / ``off`` — start normally but disable this
+          instance's ledger and reconciliation, emitting one WARNING and surfacing
+          ``reconciliation.disabled_reason`` in ``/status``. This preserves v0.6.0
+          compatibility: two brokers sharing a dir must keep starting.
+
+        A stale lock (previous owner dead) is taken over automatically — an
+        advisory ``flock`` frees when the owning fd closes, including on process
+        death — so no manual liveness check is needed here.
+        """
+        if self.ledger is None or not self.ledger.path:
+            return
+        owner = LockOwner(
+            pid=self.broker_pid,
+            start_time=self.broker_start_time,
+            instance_id=self.broker_instance_id,
+            acquired_at=time.time(),
+        )
+        try:
+            held_by = self._owner_lock.acquire(owner)
+        except OSError as exc:
+            # The lock file could not be created/locked (e.g. an unwritable cache
+            # dir, or a filesystem without flock). This is a local IO problem, not
+            # a sibling: degrade to no-ledger (as the ledger itself does on write
+            # failure) rather than failing startup — preserves v0.6.0 behavior.
+            reason = f"runtime ledger unavailable ({exc}); running without a ledger"
+            log.warning("%s", reason)
+            self._disable_ledger(reason)
+            return
+        if held_by is None:
+            return  # we own the ledger
+        mode = self.settings.runtime_reconcile
+        cache_dir = self.settings.cache_dir
+        if mode in ("adopt", "stop"):
+            raise ConfigError(
+                f"another broker (pid {held_by.pid}) already owns the runtime "
+                f"ledger under BROKER_CACHE_DIR {cache_dir!r}; refusing to start "
+                f"with BROKER_RUNTIME_RECONCILE={mode!r} because reconciliation "
+                f"would signal or adopt that live broker's runtimes",
+                remediation="give each broker its own BROKER_CACHE_DIR",
+            )
+        reason = (
+            f"another broker (pid {held_by.pid}) owns the runtime ledger under "
+            f"BROKER_CACHE_DIR {cache_dir!r}; this instance runs without a ledger "
+            f"(give each broker its own BROKER_CACHE_DIR)"
+        )
+        log.warning("runtime ledger ownership unavailable: %s", reason)
+        self._disable_ledger(reason)
+
+    def _disable_ledger(self, reason: str) -> None:
+        """Drop the ledger for this instance (no writes, no reconciliation)."""
+        self.reconcile_disabled_reason = reason
+        self.ledger = None
+        for m in self.models.values():
+            m.ledger = None
+
+    async def reconcile(self) -> dict[str, Any]:
+        """Reconcile ledgered runtimes at startup per BROKER_RUNTIME_RECONCILE.
+
+        Called once from the app lifespan BEFORE the sweeper/health loops start.
+        Never loads a model (adoption marks an already-live runtime READY without
+        spawning). The result is stored for /status.
+        """
+        from .reconcile import reconcile_runtimes
+
+        self.last_reconciliation = await reconcile_runtimes(self)
+        return self.last_reconciliation
 
     def get(self, alias: str) -> ManagedModel:
         m = self.models.get(alias)
@@ -1587,7 +1814,14 @@ class ModelManager:
         # 2. Build + validate new ManagedModels for added/changed BEFORE mutating.
         fresh: dict[str, ManagedModel] = {}
         for a in added + changed:
-            mm = ManagedModel(new_by[a], self.settings)
+            mm = ManagedModel(
+                new_by[a],
+                self.settings,
+                self.ledger,
+                self.broker_instance_id,
+                self.broker_pid,
+                self.broker_start_time,
+            )
             mm.adapter.validate_config()  # raises → propagates, nothing mutated yet
             fresh[a] = mm
 
@@ -1794,6 +2028,9 @@ class ModelManager:
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
         await asyncio.gather(*(m.stop() for m in self.models.values()), return_exceptions=True)
+        # Release the broker-lifetime ledger ownership lock (ADR 0021) so a
+        # restart on the same cache dir takes it over cleanly.
+        self._owner_lock.release()
         await self.state.close()
 
     # --- status ----------------------------------------------------------
@@ -1806,6 +2043,12 @@ class ModelManager:
             snap["backend"] = m.adapter.name
             snap["healthy"] = m.healthy
             snap["last_health"] = m.last_health
+            # Per-model runtime process identity (ADR 0021).
+            snap["process"] = {
+                "pid": m.machine.pid,
+                "start_time": m.process_start_time,
+                "adopted": m.adopted,
+            }
             if cooldowns_on:
                 cd_dict = (await self.state.get_cooldown(m.entry.alias)).to_dict()
                 if self.settings.cooldown_half_open_single_trial:
@@ -1841,6 +2084,12 @@ class ModelManager:
             ),
             "tracing_enabled": self.tracer.enabled,
             "router": self.router.status() if self.router else {"enabled": False},
+            "reconciliation": {
+                "runtime_reconcile": self.settings.runtime_reconcile,
+                "ledger_owned": self._owner_lock.held,
+                "disabled_reason": self.reconcile_disabled_reason,
+                "last": self.last_reconciliation,
+            },
             "pools": {
                 name: [mm.entry.alias for mm in members] for name, members in self.pools.items()
             },

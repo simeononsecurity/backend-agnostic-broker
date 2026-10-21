@@ -1,0 +1,41 @@
+# Restart & recovery example (ADR 0021) — a broker-managed llama.cpp runtime.
+#
+# Because this entry has a `startup_command` + `base_url`, the broker SPAWNS and
+# OWNS the runtime, so it is recorded in the runtime ledger and participates in
+# restart reconciliation. (An `ollama` entry, by contrast, is an external daemon
+# the broker never spawns and never ledgers.) Replace the paths/ports for your
+# host; the model file must sit under BROKER_ALLOWED_MODEL_ROOTS (default /models).
+models:
+  - alias: qwen-llamacpp
+    backend: llamacpp
+    runtime_model_id: qwen2.5-7b-instruct
+    model_path: /models/qwen2.5-7b-instruct-q4_k_m.gguf
+    base_url: http://127.0.0.1:8081
+    context_limit: 8192
+    output_limit: 2048
+    idle_timeout_seconds: 300
+    # argv TEMPLATE. {exe}/{model_path}/{context_limit}/{layer_split} are
+    # substituted by the broker; no request can inject flags. The exact argv is
+    # hashed into the ledger so a registry change is detected before adoption.
+    startup_command:
+      - /usr/local/bin/llama-server
+      - --model
+      - "{model_path}"
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8081"
+      - --ctx-size
+      - "{context_limit}"
+      - --n-gpu-layers
+      - "{layer_split}"
+    readiness:
+      kind: http
+      path: /health
+      expect_status: 200
+      timeout_seconds: 120
+    gpu:
+      required: true
+      device_ids: [0]
+      layer_split: "35"
+    supports_streaming: true

@@ -122,6 +122,32 @@ constant-time byte compare, no key material in logs/metrics/errors):
 An unknown model alias raises `ModelNotFoundError` (404). The broker never
 substitutes a different model.
 
+## Runtime identity: never signal a foreign process (ADR 0021)
+
+The broker spawns backend runtimes as detached, own-session children and records
+each in a host-local ledger so a restart can reconcile the ones orphaned by an
+unclean death. The security-critical rule is **never kill a process the broker did
+not start** — and because the kernel recycles PID numbers, a bare PID is not a
+safe handle: a record written before a crash can, by restart time, point at an
+unrelated process.
+
+Identity is therefore **PID + process start time** (`/proc/<pid>/stat` field 22 on
+Linux; `ps -o lstart=` on macOS), plus the process-group id and an argv hash. Before
+the broker signals *anything* it re-reads the live start time and requires it to
+equal the recorded one (`identity_matches`); `kill(pid, 0)` liveness is only one
+clause of that gate, never sufficient alone. Consequences:
+
+- A PID whose start time no longer matches is **dropped as stale and never
+  signalled** — PID reuse can never cause friendly fire.
+- The broker only ever touches processes **it recorded itself**; a process it never
+  spawned is never signalled, in any reconcile mode.
+- `stop` mode signals the recorded **process group** (`SIGTERM`→grace→`SIGKILL`) so
+  it reaps only the runtime tree it owns.
+- A **corrupt/unparsable ledger is ignored with a warning** (fail-safe): the broker
+  never kills on the strength of bad data.
+- The ledger holds no secrets — pids, ports, start-time tokens and hashes only —
+  and is written `0600`.
+
 ## Placement / data-residency pinning (fail-closed)
 
 Per-model `placement` labels in the registry (e.g. `local`, `trusted`,

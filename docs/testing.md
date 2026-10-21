@@ -28,6 +28,8 @@ too (the remaining 2 skips are import-guard paths that only fire when a package 
 | `tests/test_registry.py` | 14 | Registry parsing/validation, unknown-field rejection, duplicate-alias detection, backend filtering, pool + router config, `router.weights.cost_normalized` default-off + parse (ADR 0019), `supports_rerank` capability parse/default (ADR 0013), `pricing` block (ADR 0008) parse + negative rejection. |
 | `tests/test_lifecycle.py` | 5 | State machine legal/illegal transitions, idle timing, snapshots. |
 | `tests/test_adapters.py` | 5 | Adapter contract conformance + fake backend behavior. |
+| `tests/test_runtime_identity.py` | 15 | Runtime identity + ledger (ADR 0021): Linux/macOS start-time parsers against fixtures (`comm` with spaces/parens, `btime`, port helpers), `kill(0)` liveness + fail-closed identity gate and identity-gated process-group termination against **real** child processes (wrong start time ⇒ never signalled), zombie-aware termination; the atomic `0600` + `flock` ledger round-trip and corrupt/unknown-version/`None`-path fail-safes. |
+| `tests/test_runtime_reconcile.py` | 8 | Restart reconciliation with **real** orphaned `http.server` children (ADR 0021): `adopt` marks READY without spawning and shutdown clears the ledger, `stop` reaps the group + clears, `report` lists without signalling, **PID reuse** (wrong start time) dropped as stale with the live process untouched, corrupt ledger never kills, port pre-check fails fast naming the port, argv-drift refuses adoption, and `python -m broker` runs a graceful lifespan shutdown on `SIGTERM`. |
 | `tests/test_api.py` | 10 | `/v1/models`, `/v1/chat/completions`, `/healthz`, `/readyz`, `/status`, `/metrics`, structured errors, request IDs, size limit. |
 | `tests/test_routing.py` | 8 | Load-balancing pools: single public model, concurrent spread, failover, streaming failover, round-robin, pool/alias collision. |
 | `tests/test_sticky.py` | 9 | Sticky session routing: pin by header/`user`/IP, distinct-session spread, re-pin on failure, LRU bound, `/status`. |
@@ -81,10 +83,10 @@ too (the remaining 2 skips are import-guard paths that only fire when a package 
 | `tests/test_links.py` | 92 | **No dead relative links** in `docs/` and `examples/` — parametrized per Markdown file; external (`http(s)`/`mailto`), in-page anchors, and `${...}`/`<...>` placeholders are skipped. |
 | `tests/test_docs_examples.py` | 6 | README/api-reference examples work against the real API (fake backend), plus **execution of the `<!-- runnable -->` blocks in `docs/getting-started.md` Track C** — the documented registry loads and every marked curl is replayed against the fake backend. |
 
-**Total: `pytest -q` reports 1033 passed, 62 skipped in the shared CPU venv** (the
+**Total: `pytest -q` reports 1069 passed, 62 skipped in the shared CPU venv** (the
 skips are the optional redis/otel paths — see the note above; `tests/test_cache_redis_ttl.py`
 collects only with the `[redis]` extra). The all-extras venv / Python 3.11 container
-(`pip install -e '.[dev,redis,otel]'`) runs those paths too: **1096 passed, 2 skipped**
+(`pip install -e '.[dev,redis,otel]'`) runs those paths too: **1132 passed, 2 skipped**
 (only the 2 import-guard paths that fire when a package is *absent*). Per-file counts
 above are the extras-inclusive collected numbers.
 

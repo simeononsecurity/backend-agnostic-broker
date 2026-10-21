@@ -106,6 +106,13 @@ configured in the **registry**, not the image — see [auto-router.md](auto-rout
   `BROKER_TMP_DIR=/tmp/broker` are created and owned by `broker`, so the root fs
   can be mounted read-only with these as tmpfs/volumes.
 - **Healthcheck**: calls the broker's own `/healthz` via `python -c` (no shell).
+- **Signals / graceful stop (ADR 0021)**: the exec-form entrypoint makes python
+  PID 1, so `docker stop`'s `SIGTERM` reaches it directly (explicit
+  `STOPSIGNAL SIGTERM`). uvicorn runs the FastAPI lifespan shutdown, which stops
+  every broker-managed runtime and clears the runtime ledger — no init shim or
+  signal-forwarding is needed. The runtime ledger lives under `BROKER_CACHE_DIR`;
+  mount it as a **persistent volume** (not tmpfs) if you want an *unclean* restart
+  to be able to reconcile orphaned runtimes (`BROKER_RUNTIME_RECONCILE`).
 
 ## Run (hardened, fake backend)
 

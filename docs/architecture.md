@@ -141,6 +141,26 @@ auto/cascade — `/v1/embeddings` and `/v1/rerank`):
 See `docs/backends/` for per-backend detail and `docs/backend-adapter.md` for
 the contract.
 
+## Runtime identity & restart reconciliation (ADR 0021)
+
+Broker-managed runtimes are spawned in their own session/process-group, so they
+**outlive an unclean broker death** (SIGKILL / OOM / crash / container restart),
+holding VRAM and their port with no in-memory record left. To recover safely the
+broker records every runtime it spawns in a **host-local ledger**
+(`<BROKER_CACHE_DIR>/runtime-ledger.json`, `0600`, atomic + `flock`), keyed by a
+durable **identity = PID + process start time** (`broker/runtime_identity.py`)
+plus the process-group id and an argv hash. A bare PID is never trusted — the
+kernel recycles PID numbers — so a record whose re-read start time does not match
+is treated as stale and never signalled.
+
+On startup (`broker/reconcile.py`, from the lifespan, before the sweeper/health
+loops, never loading a model) the broker reconciles the ledger per
+`BROKER_RUNTIME_RECONCILE`: `off`, `report` (default — list orphans in `/status`),
+`adopt` (reuse a still-healthy orphan: mark READY without spawning), or `stop`
+(`SIGTERM`→grace→`SIGKILL` the recorded group). A clean shutdown stops every
+runtime and clears the ledger. The scope is per host (local processes), so the
+ledger is never shared via Redis. See `docs/guides/restart-and-recovery.md`.
+
 ## Security boundaries
 
 Every externally-influenced value crosses a boundary in `broker/security.py`:

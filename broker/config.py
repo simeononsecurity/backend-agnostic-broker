@@ -403,6 +403,28 @@ class Settings(BaseSettings):
     usage_log_enabled: bool = True
     usage_log_path: str | None = None
 
+    # --- Runtime process identity & restart reconciliation (ADR 0021) ---
+    # The broker records every runtime it spawns (vLLM/llama.cpp/Strata) in a
+    # small, host-local ledger under cache_dir (identity = PID + process start
+    # time + pgid + argv hash, so a reused PID is never mistaken for ours). On
+    # startup it reconciles the ledger against the live process table:
+    #   off     — ignore the ledger; only the port pre-check guards spawns.
+    #   report  — list still-alive, identity-matched runtimes as `orphaned` in
+    #             /status; never signal, never adopt (DEFAULT). With a fresh/empty
+    #             ledger this is silent and byte-for-byte v0.6.0 behavior.
+    #   adopt   — if a recorded runtime is alive with matching identity, the
+    #             registry argv still matches, and its port answers readiness,
+    #             mark the model READY WITHOUT spawning (reuse the orphan).
+    #   stop    — SIGTERM->grace->SIGKILL the recorded process group, then clear.
+    # In EVERY mode the broker never signals a PID whose recorded start time does
+    # not match the live one (it drops the stale record), and never touches a
+    # process it did not itself record.
+    runtime_reconcile: str = "report"
+    # Before spawning a broker-managed runtime, fail fast with a clear error if the
+    # target port (from the registry base_url) is already bound, instead of a
+    # confusing readiness timeout. Non-loading TCP connect probe only.
+    runtime_port_precheck: bool = True
+
     # --- Docker / networking hints (documented, used by compose) ---
     docker_network_mode: str = "bridge"
 
@@ -434,6 +456,13 @@ class Settings(BaseSettings):
     def _router_backend(cls, v: str) -> str:
         if v not in ("auto", "llm", "heuristic", "off"):
             raise ValueError("router_backend must be 'auto', 'llm', 'heuristic', or 'off'")
+        return v
+
+    @field_validator("runtime_reconcile")
+    @classmethod
+    def _runtime_reconcile(cls, v: str) -> str:
+        if v not in ("off", "report", "adopt", "stop"):
+            raise ValueError("runtime_reconcile must be 'off', 'report', 'adopt', or 'stop'")
         return v
 
     def validate_runtime(self) -> None:

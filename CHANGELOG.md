@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Runtime process identity + restart reconciliation (ADR 0021).** The broker now
+  records every runtime it spawns (vLLM / llama.cpp / Strata) in a host-local,
+  `0600`, atomic + `flock` ledger under `BROKER_CACHE_DIR`
+  (`runtime-ledger.json`), keyed by a durable identity of **PID + process start
+  time** (`/proc/<pid>/stat` field 22 on Linux; `ps -o lstart=` on macOS) plus the
+  process-group id and an argv hash — never a bare PID. On startup it reconciles
+  runtimes orphaned by an unclean exit (SIGKILL / OOM / crash / container restart)
+  per `BROKER_RUNTIME_RECONCILE`: `off`, `report` (default — list orphans in
+  `/status`, never signal/adopt), `adopt` (reuse a still-healthy orphan: mark the
+  model READY without spawning), or `stop` (`SIGTERM`→grace→`SIGKILL` the recorded
+  process group). In every mode a PID whose recorded start time no longer matches
+  is dropped as stale and **never signalled**, and a process the broker did not
+  record is never touched; a corrupt ledger is ignored with a warning (fail-safe).
+- **Port pre-check before spawn** (`BROKER_RUNTIME_PORT_PRECHECK`, default on): a
+  broker-managed runtime whose target port is already bound fails fast with a clear
+  error naming the port instead of a confusing readiness timeout.
+- `GET /status` now carries a per-model `process` object `{pid, start_time,
+  adopted}` and a top-level `reconciliation` summary of the last startup.
+- **Multi-replica ledger safety (ADR 0021).** A live broker that shares another
+  broker's `BROKER_CACHE_DIR` can never have its runtimes stopped or adopted. Each
+  broker takes an exclusive, lifetime `flock` on
+  `runtime-ledger.owner.lock`; if a live sibling holds it, `adopt`/`stop` refuse to
+  start (clear `ConfigError` naming the cache dir + owner PID — fail closed) and
+  `report`/`off` start without a ledger (one warning;
+  `reconciliation.disabled_reason` + `ledger_owned` in `/status`), preserving v0.6.0
+  behavior. As defense in depth every record now carries its owning broker's
+  identity, and reconciliation acts only on records whose owner broker is dead
+  (others are listed as `owned_by_live_broker`). A stale lock from a crashed owner
+  is taken over automatically.
+- New config: `BROKER_RUNTIME_RECONCILE`, `BROKER_RUNTIME_PORT_PRECHECK`
+  (`docs/configuration.md`, `.env.example`). New guide
+  `docs/guides/restart-and-recovery.md` and tested `examples/restart-recovery/`.
+
+### Changed
+
+- Graceful shutdown (FastAPI lifespan / `SIGTERM` to `python -m broker`, incl.
+  `docker stop`) now also clears the runtime ledger after stopping runtimes. The
+  Docker image declares `STOPSIGNAL SIGTERM` explicitly (exec-form entrypoint
+  already made python PID 1).
+
 ## [0.6.0] - 2026-10-19
 
 ### Added

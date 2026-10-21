@@ -90,4 +90,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import os,urllib.request,sys; \
     urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"BROKER_PORT\",\"8080\")}/healthz', timeout=3); sys.exit(0)" || exit 1
 
+# Exec-form entrypoint so python is PID 1 and receives SIGTERM directly; uvicorn's
+# SIGTERM handler drives the FastAPI lifespan shutdown, which stops every runtime
+# and clears the runtime ledger (ADR 0021). No init shim / signal-forwarding is
+# needed. STOPSIGNAL is the default but set explicitly for clarity.
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["python", "-m", "broker"]
