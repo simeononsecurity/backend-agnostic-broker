@@ -62,18 +62,36 @@ plus a **measured-release** wait on eviction. (`broker/resources.py`,
    (the portable default, unchanged from v0.6.0). `BROKER_GPU_DEVICE_ENV_VAR`
    overrides (e.g. `HIP_VISIBLE_DEVICES`). `BROKER_CUDA_VISIBLE_DEVICES` still works.
 
-3. **Measured release.** After evicting a broker-spawned runtime, the next load on
-   the same device(s) waits until (a) the process group is gone **and** (b) — when
-   telemetry is on — the device no longer reports that runtime's PID, bounded by
-   `BROKER_RELEASE_TIMEOUT_SECONDS`. On timeout the model enters a visible
-   **`release_stuck`** lifecycle state (PID, device, MiB held) and the waiting load
-   fails with a clear **503** (`ReleaseStuckError`) naming it, rather than starting
-   into an OOM. A subsequent load onto a still-stuck device is refused fast by the
-   same 503. **With telemetry off, timing equals v0.6.0** — the only change is that
+3. **Measured, group- and memory-aware release.** After evicting a broker-spawned
+   runtime, the next load on the same device(s) waits until (a) the process group
+   is gone **and** (b) — when telemetry is on — **none of that runtime's
+   process-group PIDs** still hold device memory **and** the device's **free memory
+   has recovered** by ≥ `BROKER_GPU_RELEASE_RECOVERY_FRACTION` (default 0.9) of what
+   the runtime held, bounded by `BROKER_RELEASE_TIMEOUT_SECONDS`. Two real cases
+   drove this over watching only the parent PID: a runtime whose VRAM is held by
+   **child** processes (vLLM's EngineCore / TP workers), and a **container**
+   deployment where `nvidia-smi` lists host-namespace or no PIDs — in both the
+   parent PID is absent yet the memory is still out. The group is the pgid recorded
+   at spawn (`/proc/*/stat` scan on Linux; best effort elsewhere); where no PID can
+   be attributed at all, memory recovery alone decides. On timeout the model enters
+   a visible **`release_stuck`** state (PID/group, device, MiB held) and the waiting
+   load fails with a clear **503** (`ReleaseStuckError`), rather than starting into
+   an OOM. **`release_stuck` auto-clears**: each later load attempt on that device,
+   and the periodic idle/telemetry tick, re-checks the holder and transitions it
+   `release_stuck → unloaded` once its group PIDs are gone and memory has returned
+   (no restart needed); a load for the stuck model itself is refused until then. A
+   subsequent load onto a still-stuck device is refused fast by the same 503.
+   **With telemetry off, timing equals v0.6.0** — the only change is that
    `ProcessSupervisor.stop()` now **returns a released flag and logs at error level**
    when a process is still alive after SIGKILL (surfaced as `survived_kill`), instead
    of silently returning. The broker **never force-resets a GPU and never kills a
    process it did not start** — it waits and surfaces the stuck holder.
+
+   > **Container caveat.** Inside a container whose PID namespace hides the GPU
+   > holders, release is judged by free-memory recovery alone. If another tenant
+   > immediately claims the freed memory, recovery can read as incomplete and the
+   > model is (conservatively) flagged `release_stuck` with a clear 503 rather than
+   > risking an OOM; it auto-clears once free memory returns.
 
 4. **`/status` and `/healthz/backends` gain a `resources` block**: provider +
    status, measured devices (`source: measured`), per-PID holders, declared
@@ -96,9 +114,12 @@ plus a **measured-release** wait on eviction. (`broker/resources.py`,
 - **Gate the release wait even with telemetry off.** Rejected: that would change
   v0.6.0 swap timing. With telemetry off we rely on `stop()`'s existing termination
   plus the new survival report.
-- **Free-memory recovery as the release gate.** Rejected as the primary signal:
-  a zombie keeps the context even after the process is gone, so PID-presence on the
-  device is the honest gate (source 8); free memory is reported for visibility.
+- **Free-memory recovery as the *sole* release gate.** Rejected as the *only*
+  signal: a zombie can keep the context after the process is gone, so group-PID
+  presence is checked too. But watching PIDs *alone* was also wrong (children and
+  container PID namespaces hide the holder), so release now requires **both** —
+  group PIDs absent **and** free memory recovered — with memory recovery as the
+  fallback when no PID can be attributed (source 8).
 
 ## Consequences
 
@@ -108,7 +129,9 @@ plus a **measured-release** wait on eviction. (`broker/resources.py`,
   (memory-aware admission) and ADR 0023 (overload-triggered queueing).
 - Telemetry depends on external tools whose output can drift; parsing is defensive
   and fixture-tested, and any failure degrades to `unavailable`, never a crash.
-- A new `release_stuck` lifecycle state and a `ReleaseStuckError` (503).
+- A new `release_stuck` lifecycle state and a `ReleaseStuckError` (503), which
+  **auto-clears** back to `unloaded` once the device memory returns (on the next
+  load attempt or the periodic tick) — never a restart-to-recover.
 
 ## Confirmation
 
@@ -122,6 +145,11 @@ plus a **measured-release** wait on eviction. (`broker/resources.py`,
   loads; a never-releasing holder → `release_stuck` + 503 visible in `/status`; a
   second load on a stuck device fails fast; telemetry-off keeps v0.6.0 timing but
   reports `survived_kill`.
+- `tests/test_resources_followup.py` — group/memory-aware release: a child PID
+  (vLLM worker) and a no-PID container view both keep the device held → 503 (not a
+  false release); `release_stuck` auto-recovers to `unloaded` once memory returns;
+  a normal release still proceeds promptly; plus the atomic-admission and
+  no-needless-eviction cases (see ADR 0022).
 - `tests/test_proc_release.py` — `stop()` returns a released flag.
 - `tests/test_admission.py` — vendor-correct device env var (`CUDA_VISIBLE_DEVICES`
   default, `ROCR_VISIBLE_DEVICES` for `amd`, explicit override).

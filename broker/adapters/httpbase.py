@@ -144,6 +144,7 @@ class HTTPBackendAdapter(BackendAdapter):
         # measured-release wait can match telemetry holders; release-ok flag set
         # False when stop() left the process alive after SIGKILL.
         self._last_pid: int | None = None
+        self._last_pgid: int | None = None
         self._last_release_ok: bool = True
 
     # --- helpers ---------------------------------------------------------
@@ -275,6 +276,7 @@ class HTTPBackendAdapter(BackendAdapter):
         )
         pid = await self._supervisor.start()
         self._last_pid = pid
+        self._last_pgid = self._supervisor.started_pgid
         self._last_release_ok = True
         return pid
 
@@ -394,6 +396,21 @@ class HTTPBackendAdapter(BackendAdapter):
         if self._supervisor is not None:
             return self._supervisor.pid
         return self._last_pid
+
+    def process_group_pids(self) -> set[int]:
+        """The spawned runtime's process group (parent + children), best effort.
+
+        Uses the pgid recorded at spawn to scan ``/proc`` on Linux so a runtime
+        whose GPU memory is held by child processes (vLLM EngineCore / TP workers)
+        is still attributed. Falls back to the main PID elsewhere.
+        """
+        from ..resources import process_group_pids as _scan
+
+        pid = self.process_pid()
+        pgid = self._supervisor.started_pgid if self._supervisor is not None else self._last_pgid
+        if pgid is None:
+            pgid = pid
+        return _scan(pgid, pid)
 
     async def process_alive(self) -> bool:
         return self._supervisor is not None and self._supervisor.is_running()

@@ -315,6 +315,7 @@ probe degrades to `unavailable` (never a crash, never an invented number).
 | `BROKER_GPU_TELEMETRY_ROCM_SMI_PATH` | str? | _(none)_ | Absolute path override for `rocm-smi`. |
 | `BROKER_GPU_DEVICE_ENV_VAR` | str? | _(none)_ | Device-isolation env var set for a broker-spawned runtime. Unset ⇒ derived from the provider: `amd` → `ROCR_VISIBLE_DEVICES`, else `CUDA_VISIBLE_DEVICES` (the portable default). Override e.g. with `HIP_VISIBLE_DEVICES`. |
 | `BROKER_RELEASE_TIMEOUT_SECONDS` | float | `30.0` | After evicting a broker-spawned runtime, how long the next load on the same device waits for the process group to exit and (telemetry on) the device to stop reporting its PIDs. On timeout the model enters `release_stuck` and the load fails **503** instead of OOMing. `0` = don't wait. |
+| `BROKER_GPU_RELEASE_RECOVERY_FRACTION` | float | `0.9` | Fraction of an evicted runtime's held memory that must return before its device counts as released. The remainder tolerates another tenant taking a slice of the freed memory first. Must be in `(0, 1]`. |
 
 ## Memory-aware admission (ADR 0022)
 
@@ -327,6 +328,7 @@ declared budget below. See [model-registry.md](model-registry.md) and the
 |---------|------|---------|-------------|
 | `BROKER_GPU_MEMORY_BUDGET_MIB` | str? | _(none)_ | Declared per-device budget (MiB) used when telemetry is OFF. A single integer (`40000`, every device) or a per-device map (`0=24000,1=48000`; key `default` covers unpinned models). |
 | `BROKER_GPU_MEMORY_HEADROOM_MIB` | int | `1024` | Headroom subtracted from **measured** free memory before admitting a sized model, so a load never consumes the last sliver of a device. |
+| `BROKER_GPU_MEMORY_RESERVATION_SECONDS` | float | `10.0` | In **measured** admission, how long a just-admitted sized model's `memory_mib` is reserved against measured free memory (until the driver's telemetry reflects the load). Stops two concurrent admissions from double-booking the same free reading. Models in `loading` are always reserved. |
 
 ## Admission queue under overload (ADR 0023)
 

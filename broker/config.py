@@ -401,6 +401,11 @@ class Settings(BaseSettings):
     # telemetry is on) for the device to stop reporting its PIDs. On timeout the
     # model enters `release_stuck` and the waiting load fails 503 instead of OOMing.
     release_timeout_seconds: float = 30.0
+    # Measured release is considered complete when none of the evicted runtime's
+    # process-group PIDs still hold device memory AND the device's free memory has
+    # recovered by at least this fraction of what the runtime held (the remainder
+    # tolerates other tenants grabbing some of the freed memory first).
+    gpu_release_recovery_fraction: float = 0.9
 
     # --- Memory-aware admission (ADR 0022; opt-in, default OFF) ---
     # Declared per-device budget (MiB) used for admission when telemetry is OFF.
@@ -412,6 +417,11 @@ class Settings(BaseSettings):
     # Headroom (MiB) subtracted from MEASURED free memory before admitting a sized
     # model, so a load never consumes the last sliver of a device.
     gpu_memory_headroom_mib: int = 1024
+    # In MEASURED admission, a just-admitted sized model's memory_mib is reserved
+    # against measured free memory for this long (seconds), until the driver's
+    # telemetry reflects the load. This stops two concurrent admissions from
+    # double-booking the same free reading. Models in LOADING are always reserved.
+    gpu_memory_reservation_seconds: float = 10.0
 
     # --- Admission queue under overload (ADR 0023; opt-in, default OFF) ---
     # When OFF (default) behavior == v0.6.0: a request that cannot be admitted now
@@ -759,6 +769,13 @@ class Settings(BaseSettings):
             raise ConfigError("BROKER_QUEUE_HOST_LOAD_PER_CPU_MAX must be >= 0")
         if self.queue_backend_waiting_max < 0:
             raise ConfigError("BROKER_QUEUE_BACKEND_WAITING_MAX must be >= 0")
+        if not 0 < self.gpu_release_recovery_fraction <= 1:
+            raise ConfigError(
+                "BROKER_GPU_RELEASE_RECOVERY_FRACTION must be in (0, 1]",
+                remediation="use a fraction like 0.9 (90% of the held memory must return)",
+            )
+        if self.gpu_memory_reservation_seconds < 0:
+            raise ConfigError("BROKER_GPU_MEMORY_RESERVATION_SECONDS must be >= 0")
         for _tool_path in (
             self.gpu_telemetry_nvidia_smi_path,
             self.gpu_telemetry_amd_smi_path,

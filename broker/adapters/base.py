@@ -117,6 +117,16 @@ class BackendAdapter(abc.ABC):
         """Whether a broker-spawned runtime process is still running."""
         return False
 
+    def process_group_pids(self) -> set[int]:
+        """PIDs belonging to this runtime's process group / descendants (ADR 0020).
+
+        Default: just the main PID (external daemons own no group). Broker-spawned
+        backends override this to include child processes — the GPU memory a
+        runtime holds is frequently attributed to children, not the parent.
+        """
+        pid = self.process_pid()
+        return {pid} if pid is not None else set()
+
     def last_release_ok(self) -> bool:
         """False if the most recent stop() left the process alive after SIGKILL."""
         return True

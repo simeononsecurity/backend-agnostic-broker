@@ -64,8 +64,8 @@ Errors are structured (`broker/errors.py`) and carry a `remediation` hint and a
 
 | Symptom | Cause / fix |
 |---------|-------------|
-| `503 release_stuck` on a load | The previous runtime's device memory didn't come back (lazy reclaim or a zombie CUDA/ROCm context). Inspect `resources.release_stuck` (PID/device/MiB), free the holder, then retry — or raise `BROKER_RELEASE_TIMEOUT_SECONDS`. The broker never resets a GPU or kills a foreign process. |
-| `429 capacity_unavailable` | A sized model (`memory_mib`) does not fit and the device holder can't be evicted. Raise the budget/headroom, pin to another device, or wait for the holder to go idle. The `reason`/`holder` fields name why. |
+| `503 release_stuck` on a load | The previous runtime's device memory hasn't come back yet (lazy reclaim, a zombie CUDA/ROCm context, a lingering child worker, or a container PID namespace hiding the holder). It **auto-clears** on the next load attempt or the periodic tick once the runtime's group PIDs are gone and free memory recovers — no restart needed. To force it, free the holder in `resources.release_stuck` (PID/device/MiB); or raise `BROKER_RELEASE_TIMEOUT_SECONDS`. The broker never resets a GPU or kills a foreign process. |
+| `429 capacity_unavailable` | A sized model (`memory_mib`) does not fit. `reason=exceeds_device_capacity` means it is larger than the device can ever hold (nothing is evicted — pin to a bigger device or lower `memory_mib`); `reason=*_insufficient` means the device is full and the holder can't be evicted (raise the budget/headroom, pin elsewhere, or wait for it to go idle). The `reason`/`holder` fields name why. |
 | `resources.sample.status: unavailable` | The driver tool isn't at an absolute/allow-listed path, timed out, or returned nothing. Run `python -m broker.resources_probe <provider>` and read the `reason`. |
 | A model shows `survived_kill: true` | `stop()` could not confirm the process exited after SIGKILL. Check for a wedged runtime holding the device. |
 
