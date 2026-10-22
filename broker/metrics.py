@@ -62,3 +62,18 @@ QUEUE_WAIT_SECONDS = Histogram(
     "broker_queue_wait_seconds",
     "Time a request spent waiting in the admission queue before admission",
 )
+
+# --- Runtime teardown (ADR 0024) ---
+# Every runtime stop produces an honest teardown result. The outcome label is
+# one of: exited (left on its own before SIGKILL), signalled (SIGTERM reaped it),
+# killed (needed SIGKILL), survivors (something outlived SIGKILL — a stuck
+# device), identity_mismatch (nothing we owned was still there), noop.
+RUNTIME_TEARDOWN = Counter(
+    "broker_runtime_teardown_total",
+    "Runtime teardown outcomes at stop, by outcome",
+    ["outcome"],
+)
+RUNTIME_TEARDOWN_DURATION = Histogram(
+    "broker_runtime_teardown_duration_seconds",
+    "Wall-clock duration of a single runtime teardown",
+)

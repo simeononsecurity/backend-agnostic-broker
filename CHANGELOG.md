@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Bounded, descendant-aware shutdown (ADR 0024) — production-canary blocker.**
+  Stopping the broker is now deadline-driven and tears down each runtime's whole
+  descendant tree, fixing three stop-path defects seen on a production canary and
+  reproduced locally (same on v0.6.0 and the v0.7.0 RC):
+  - `SIGTERM` **during an in-progress load** no longer waits for the load to finish
+    (was up to ~97 s): shutdown now **cancels** the load, kills the spawning
+    runtime, and the model goes to `UNLOADED`. `ManagedModel.stop()` no longer waits
+    unbounded on `load_lock`.
+  - An **escaped `setsid` runtime descendant** (e.g. a GPU worker in a new session)
+    is no longer left holding device memory after the broker exits: descendants are
+    recorded while the runtime lives (Linux `/proc` + child-subreaper; a periodic
+    argv-only `ps` snapshot elsewhere) and the kill set is the process group **plus
+    every recorded descendant**, each identity-gated (PID + start time).
+  - A runtime that ignores `SIGTERM` is now bounded by a total budget instead of
+    only a per-runtime grace: adopted-runtime termination moved off the event loop
+    (no longer blocks the loop during the grace), and uvicorn runs with
+    `timeout_graceful_shutdown` taken from the budget.
+
+### Added
+
+- **`BROKER_SHUTDOWN_BUDGET_SECONDS`** (default `45`, must be > 0): the total
+  wall-clock budget for the whole stop path. Each runtime's SIGTERM grace is
+  `min(BROKER_SHUTDOWN_TIMEOUT_SECONDS, remaining budget)`; at expiry everything
+  left is SIGKILLed and the broker exits. A second `SIGTERM`/`SIGINT` during
+  shutdown escalates immediately to SIGKILL of every runtime tree.
+- Per-stop teardown telemetry: `broker_runtime_teardown_total{outcome}` counter and
+  `broker_runtime_teardown_duration_seconds` histogram; the teardown result
+  (signalled / exited / survivors / duration) is logged and surfaced through
+  `survived_kill` / `release_stuck` in `/status` while survivors exist.
+
+### Changed
+
+- **Behaviour change (on by default — a bug fix to the "stopping the broker stops
+  what it started" invariant, not an opt-in feature):** a model load interrupted by
+  shutdown is abandoned and repeats on the next start; the broker now tears down the
+  runtime's whole descendant tree rather than only its process group. Set the
+  service manager's stop timeout to **≥ `BROKER_SHUTDOWN_BUDGET_SECONDS` + 15 s**
+  (`TimeoutStopSec`, `KillMode=mixed`; see the operations runbook).
+- `ProcessSupervisor.stop()` and the adapter `stop()` contract now return a
+  `TeardownResult` (was a bool on the supervisor) describing the teardown outcome.
+
 ## [0.7.0] - 2026-10-21
 
 ### Added

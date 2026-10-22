@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import httpx
@@ -35,7 +35,6 @@ from ..runtime_identity import (
     host_from_url,
     port_from_url,
     port_in_use,
-    terminate_process_group,
 )
 from ..security import (
     build_argv,
@@ -43,6 +42,7 @@ from ..security import (
     validate_model_path,
     validate_upstream_url,
 )
+from ..teardown import TeardownResult, terminate_tree
 from .base import BackendAdapter, HealthResult
 
 #: Max characters of an upstream error body reflected back to the caller. Upstream
@@ -146,6 +146,8 @@ class HTTPBackendAdapter(BackendAdapter):
         self._last_pid: int | None = None
         self._last_pgid: int | None = None
         self._last_release_ok: bool = True
+        #: ADR 0024: the most recent stop()'s teardown result (outcome/survivors).
+        self._last_teardown: TeardownResult | None = None
 
     # --- helpers ---------------------------------------------------------
     def _base_url(self) -> str:
@@ -355,23 +357,61 @@ class HTTPBackendAdapter(BackendAdapter):
         # Broker-managed runtimes release the model by stopping the process.
         await self.stop()
 
-    async def stop(self) -> None:
+    async def stop(
+        self,
+        *,
+        grace: float | None = None,
+        hard_deadline: float | None = None,
+        sigkill_only: bool = False,
+        force_check: Callable[[], bool] | None = None,
+    ) -> TeardownResult | None:
+        """Bounded, descendant-aware teardown of a broker-spawned runtime.
+
+        ADR 0024: never blocks the event loop (the adopted path's signal/grace
+        wait runs via ``asyncio.to_thread``), bounds the grace by the overall
+        shutdown ``hard_deadline``, and reports a :class:`TeardownResult` whose
+        survivors flip ``last_release_ok()`` so a stuck device stays visible.
+        """
+        if grace is None:
+            grace = self.settings.shutdown_timeout_seconds
+        result: TeardownResult | None = None
         if self._adopted is not None:
-            # An adopted runtime has no Process handle; terminate it by its
-            # process group, identity-gated so we never signal a reused PID.
+            # An adopted runtime has no Process handle and no descendant recorder;
+            # terminate its group identity-gated, off the event loop.
             pid, pgid, start_time = self._adopted
-            terminate_process_group(
-                pid, pgid, start_time, grace=self.settings.shutdown_timeout_seconds
+            result = await asyncio.to_thread(
+                terminate_tree,
+                main_pid=pid,
+                main_start_time=start_time,
+                pgid=pgid,
+                descendants=None,
+                grace=grace,
+                hard_deadline=hard_deadline,
+                sigkill_only=sigkill_only,
+                force_check=force_check,
+                alias=self.entry.alias,
+                backend=self.name,
             )
             self._adopted = None
         if self._supervisor:
-            released = await self._supervisor.stop(grace=self.settings.shutdown_timeout_seconds)
-            self._last_release_ok = released
+            result = await self._supervisor.stop(
+                grace=grace,
+                hard_deadline=hard_deadline,
+                sigkill_only=sigkill_only,
+                force_check=force_check,
+            )
             self._supervisor = None
+        if result is not None:
+            self._last_teardown = result
+            self._last_release_ok = result.ok()
         self._last_argv = None
         if self._client:
             await self._client.aclose()
             self._client = None
+        return result
+
+    def last_teardown(self) -> TeardownResult | None:
+        return self._last_teardown
 
     # --- runtime identity / adoption (ADR 0021) --------------------------
     def runtime_argv(self) -> list[str] | None:

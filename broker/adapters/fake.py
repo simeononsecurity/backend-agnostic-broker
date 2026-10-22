@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from ..errors import BackendUnavailableError, ModelLoadError
+from ..teardown import TeardownResult
 from .base import BackendAdapter, HealthResult
 
 
@@ -41,6 +42,7 @@ class FakeAdapter(BackendAdapter):
         self.simulate_survive_kill = False
         self._proc_alive = False
         self._release_ok = True
+        self._last_teardown: TeardownResult | None = None
         # Simulated real load signal for cache-aware routing tests (ADR 0010);
         # None means "no real signal" so the manager falls back to in-flight.
         self.sim_load: float | None = None
@@ -90,8 +92,32 @@ class FakeAdapter(BackendAdapter):
             self._proc_alive = False
             self._release_ok = True
 
-    async def stop(self) -> None:
+    async def stop(
+        self,
+        *,
+        grace: float | None = None,
+        hard_deadline: float | None = None,
+        sigkill_only: bool = False,
+        force_check: Callable[[], bool] | None = None,
+    ) -> TeardownResult | None:
         await self.unload()
+        pid = self._pid if self._pid is not None else self._last_pid
+        if self.simulate_survive_kill:
+            self._last_teardown = TeardownResult(
+                alias=self.entry.alias,
+                outcome="survivors",
+                survivors=[pid] if pid else [1],
+            )
+        else:
+            self._last_teardown = TeardownResult(
+                alias=self.entry.alias,
+                outcome="signalled",
+                exited=[pid] if pid else [],
+            )
+        return self._last_teardown
+
+    def last_teardown(self) -> TeardownResult | None:
+        return self._last_teardown
 
     def process_pid(self) -> int | None:
         return self._pid if self._pid is not None else self._last_pid

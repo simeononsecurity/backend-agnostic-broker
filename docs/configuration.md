@@ -102,7 +102,8 @@ also be managed over HTTP via the admin key API (`/admin/keys`, ADR 0016 — see
 | `BROKER_PER_MODEL_MAX_CONCURRENCY` | int | `4` | Per-model in-flight cap. |
 | `BROKER_REQUEST_TIMEOUT_SECONDS` | float | `300` | Default per-request timeout. |
 | `BROKER_STARTUP_TIMEOUT_SECONDS` | float | `120` | Default model-start readiness timeout. |
-| `BROKER_SHUTDOWN_TIMEOUT_SECONDS` | float | `30` | Graceful shutdown budget. |
+| `BROKER_SHUTDOWN_TIMEOUT_SECONDS` | float | `30` | Per-runtime SIGTERM grace before SIGKILL, capped by the shutdown budget below. |
+| `BROKER_SHUTDOWN_BUDGET_SECONDS` | float | `45` | ADR 0024: total wall-clock budget for the whole stop (graceful HTTP phase, cancelling loads, terminating every runtime + descendants, releasing ledger/leases/lock). Per-runtime grace is `min(SHUTDOWN_TIMEOUT, remaining budget)`; at expiry everything left is SIGKILLed. Set the service manager's stop timeout to ≥ budget + 15 s. Must be > 0. |
 | `BROKER_IDLE_SWEEP_INTERVAL_SECONDS` | float | `5` | Idle-sweep cadence. |
 | `BROKER_LOAD_CONCURRENCY_POLICY` | str | `queue` | `queue` (wait) or `reject` (429) when per-model concurrency is saturated. |
 

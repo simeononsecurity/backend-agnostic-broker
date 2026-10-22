@@ -21,12 +21,13 @@ Design notes
 from __future__ import annotations
 
 import abc
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from ..config import Settings
 from ..registry import ModelEntry
+from ..teardown import TeardownResult
 
 
 @dataclass
@@ -102,8 +103,27 @@ class BackendAdapter(abc.ABC):
         """Release the loaded model (native unload or stop the child process)."""
 
     @abc.abstractmethod
-    async def stop(self) -> None:
-        """Forcefully stop and clean up any broker-owned process/resources."""
+    async def stop(
+        self,
+        *,
+        grace: float | None = None,
+        hard_deadline: float | None = None,
+        sigkill_only: bool = False,
+        force_check: Callable[[], bool] | None = None,
+    ) -> TeardownResult | None:
+        """Forcefully stop and clean up any broker-owned process/resources.
+
+        ADR 0024: bounded and descendant-aware. ``grace`` is this runtime's
+        SIGTERM window (defaults to ``shutdown_timeout_seconds``); ``hard_deadline``
+        is the overall monotonic shutdown budget; ``sigkill_only`` skips straight
+        to SIGKILL (second-signal escalation); ``force_check`` lets a mid-stop
+        escalation cut the grace short. Returns a :class:`TeardownResult` for
+        broker-spawned runtimes (``None`` for backends that own no process).
+        """
+
+    def last_teardown(self) -> TeardownResult | None:
+        """The most recent stop()'s teardown result, or None (ADR 0024)."""
+        return None
 
     # --- process identity / measured release (ADR 0020) ------------------
     # Default: the backend owns no broker-spawned process (external daemon). These

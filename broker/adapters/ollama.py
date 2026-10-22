@@ -17,11 +17,13 @@ GPU selection and daemon lifetime are controlled by Ollama's own env vars
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import httpx
 
 from ..errors import BackendUnavailableError, TimeoutError_, ValidationError
+from ..teardown import TeardownResult
 from .base import HealthResult
 from .httpbase import HTTPBackendAdapter
 
@@ -105,12 +107,20 @@ class OllamaAdapter(HTTPBackendAdapter):
             # Best-effort; the daemon will still unload after keep_alive.
             pass
 
-    async def stop(self) -> None:
+    async def stop(
+        self,
+        *,
+        grace: float | None = None,
+        hard_deadline: float | None = None,
+        sigkill_only: bool = False,
+        force_check: Callable[[], bool] | None = None,
+    ) -> TeardownResult | None:
         # Don't kill the external daemon; just unload and close our client.
         await self.unload()
         if self._client:
             await self._client.aclose()
             self._client = None
+        return None
 
     async def embeddings(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
         """Translate OpenAI ``/v1/embeddings`` to Ollama's native ``/api/embed``.

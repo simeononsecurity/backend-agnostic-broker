@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import signal
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
+from . import runtime_identity as rid
+from . import teardown
 from .errors import ModelLoadError
+from .teardown import TeardownResult
 
 log = logging.getLogger("broker.proc")
 
@@ -43,6 +45,13 @@ class ProcessSupervisor:
         # the child a group leader, so pgid == pid). Kept after stop() so the
         # measured-release wait can still scan /proc for lingering group members.
         self._started_pgid: int | None = None
+        # ADR 0024: this runtime's own identity anchor (PID + start time) and a
+        # running record of every descendant seen while it was alive, so an escaped
+        # setsid child is still in the kill set after its parent dies.
+        self._main_start_time: str | None = None
+        self._descendants: dict[int, str] = {}
+        self._recorder_task: asyncio.Task | None = None
+        self._recorder_stop: asyncio.Event | None = None
 
     @property
     def pid(self) -> int | None:
@@ -100,7 +109,46 @@ class ProcessSupervisor:
             self._started_pgid = os.getpgid(self._proc.pid)
         except OSError:  # pragma: no cover - race if the child exited instantly
             self._started_pgid = self._proc.pid
+        self._main_start_time = rid.process_start_time(self._proc.pid)
+        self._descendants = {}
+        self._recorder_stop = asyncio.Event()
+        self._recorder_task = asyncio.ensure_future(self._record_descendants())
         return self._proc.pid
+
+    async def _record_descendants(self) -> None:
+        """Periodically record this runtime's descendants while it is alive.
+
+        A descendant that later escapes its group (``setsid``) or is re-parented
+        is remembered here (PID + start time), so teardown can still find and
+        identity-gate it after the parent process is gone. Argv-only ``ps`` off
+        the event loop on non-Linux; ``/proc`` on Linux (ADR 0024).
+        """
+        assert self._recorder_stop is not None
+        main_pid = self._proc.pid if self._proc else None
+        while not self._recorder_stop.is_set():
+            if main_pid is not None:
+                try:
+                    live = await asyncio.to_thread(teardown.enumerate_descendants, main_pid)
+                except Exception:  # noqa: BLE001 - best effort
+                    live = set()
+                for pid in live:
+                    if pid not in self._descendants:
+                        st = await asyncio.to_thread(rid.process_start_time, pid)
+                        if st:
+                            self._descendants[pid] = st
+            try:
+                await asyncio.wait_for(self._recorder_stop.wait(), timeout=1.0)
+            except TimeoutError:
+                pass
+
+    async def _stop_recorder(self) -> None:
+        if self._recorder_stop is not None:
+            self._recorder_stop.set()
+        if self._recorder_task and not self._recorder_task.done():
+            try:
+                await asyncio.wait_for(self._recorder_task, timeout=2.0)
+            except (TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001
+                self._recorder_task.cancel()
 
     async def _drain_output(self) -> None:
         assert self._proc and self._proc.stdout
@@ -134,52 +182,56 @@ class ProcessSupervisor:
             remediation="increase startup_timeout or check runtime logs",
         )
 
-    async def stop(self, grace: float = 10.0) -> bool:
-        """Terminate the process group: SIGTERM, then SIGKILL after ``grace``.
+    async def stop(
+        self,
+        grace: float = 10.0,
+        *,
+        hard_deadline: float | None = None,
+        sigkill_only: bool = False,
+        force_check: Callable[[], bool] | None = None,
+    ) -> TeardownResult:
+        """Tear down the runtime's whole tree within a deadline (ADR 0024).
 
-        Returns ``True`` when the process is confirmed gone, ``False`` when it is
-        still alive after SIGKILL + a short reap wait. ADR 0020: a surviving
-        process is **logged at error level and reported** to the caller instead of
-        being silently swallowed (the old behavior), so a stuck teardown is visible.
+        The kill set is the process group **plus every recorded descendant**
+        (an escaped ``setsid`` child included), each identity-gated. ``SIGTERM``
+        then ``SIGKILL`` once ``grace`` elapses, the overall ``hard_deadline``
+        (monotonic) passes, or ``force_check`` returns True. The blocking signal
+        loop runs off the event loop via ``asyncio.to_thread``. Returns a
+        :class:`TeardownResult` describing what was signalled, what exited, and
+        any survivors (a stuck device), instead of silently swallowing leftovers.
         """
-        if not self._proc or self._proc.returncode is not None:
+        main_pid = self._proc.pid if self._proc else None
+        pgid = self._started_pgid
+        start_time = self._main_start_time
+        # Stop recording first so the descendant snapshot is final, then grab it.
+        await self._stop_recorder()
+        descendants = dict(self._descendants)
+
+        if main_pid is None:
             await self._cleanup_reader()
-            return True
-        pid = self._proc.pid
-        try:
-            pgid = os.getpgid(pid)
-            os.killpg(pgid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
+            return TeardownResult(alias=self.alias or "", outcome="noop")
+
+        result = await asyncio.to_thread(
+            teardown.terminate_tree,
+            main_pid=main_pid,
+            main_start_time=start_time,
+            pgid=pgid,
+            descendants=descendants,
+            grace=grace,
+            hard_deadline=hard_deadline,
+            sigkill_only=sigkill_only,
+            force_check=force_check,
+            alias=self.alias or "",
+            backend=self.backend or "",
+        )
+        # Let asyncio reap our own child so its transport is finalized (no zombie).
+        if self._proc is not None and self._proc.returncode is None:
             try:
-                self._proc.terminate()
-            except ProcessLookupError:
-                pass
-        try:
-            await asyncio.wait_for(self._proc.wait(), timeout=grace)
-        except TimeoutError:
-            try:
-                pgid = os.getpgid(pid)
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                try:
-                    self._proc.kill()
-                except ProcessLookupError:
-                    pass
-            try:
-                await asyncio.wait_for(self._proc.wait(), timeout=5.0)
-            except TimeoutError:
+                await asyncio.wait_for(self._proc.wait(), timeout=1.0)
+            except (TimeoutError, Exception):  # noqa: BLE001
                 pass
         await self._cleanup_reader()
-        alive = self._proc.returncode is None
-        if alive:
-            log.error(
-                "process for %s (backend=%s pid=%s) is still alive after SIGKILL; "
-                "its device memory may not be released",
-                self.alias or "?",
-                self.backend or "?",
-                pid,
-            )
-        return not alive
+        return result
 
     async def _cleanup_reader(self) -> None:
         if self._reader_task and not self._reader_task.done():

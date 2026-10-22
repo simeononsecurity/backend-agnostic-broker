@@ -5,8 +5,35 @@
 - Local: `make run` (expects `registry.yaml` + env). The broker starts with **no
   models loaded**.
 - Docker: `docker compose up -d --build`; `docker compose down -v`.
-- Graceful shutdown drains the idle sweeper and stops all broker-managed
-  processes within `BROKER_SHUTDOWN_TIMEOUT_SECONDS`.
+- Graceful shutdown drains the idle sweeper and tears down every broker-managed
+  runtime (and its descendants) within a **total budget**,
+  `BROKER_SHUTDOWN_BUDGET_SECONDS` (default 45 s). Each runtime's SIGTERM grace is
+  `min(BROKER_SHUTDOWN_TIMEOUT_SECONDS, remaining budget)`; when the budget runs
+  out, anything still alive is SIGKILLed and the broker exits. See ADR 0024.
+
+### Bounded teardown & the service manager (ADR 0024)
+
+Shutdown is deadline-driven and covers the runtime's whole descendant tree (an
+escaped `setsid` worker included), so a stop always completes in a known time and
+leaves no GPU memory held. For the service manager to let that cleanup run **before**
+it force-kills the tree, set its stop timeout to **≥ budget + 15 s** and prefer
+`KillMode=mixed` (SIGTERM to the main process, SIGKILL to the group only on
+timeout) so the broker owns teardown and systemd is defense-in-depth:
+
+```ini
+[Service]
+ExecStart=/usr/bin/python -m broker
+# >= BROKER_SHUTDOWN_BUDGET_SECONDS (45) + 15 s of headroom.
+TimeoutStopSec=60
+# SIGTERM the broker; let IT tear down runtimes. systemd SIGKILLs the whole
+# control group only if the broker overruns TimeoutStopSec.
+KillMode=mixed
+# A stale-lease cleanup ExecStopPost hook is added by ADR 0026.
+Restart=on-failure
+```
+
+A second `systemctl stop` (or `SIGTERM`/`SIGINT`) while the broker is already
+stopping escalates immediately to SIGKILL of every runtime group and descendant.
 
 ## Health & readiness
 

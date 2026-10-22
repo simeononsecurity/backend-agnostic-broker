@@ -1,6 +1,6 @@
 # ADR 0024: Bound shutdown with a deadline and tear down every runtime descendant
 
-Status: Proposed
+Status: Accepted
 Date: 2026-10-21
 Supersedes: —
 Related: ADR 0020 (measured release), ADR 0021 (runtime identity + restart reconciliation),
@@ -42,13 +42,15 @@ The causes in the code:
 We will make shutdown deadline-driven and make teardown cover the runtime's whole descendant
 tree.
 
-1. **One shutdown budget.** A new setting, `BROKER_SHUTDOWN_BUDGET_SECONDS` (default 45),
-   bounds the whole stop: uvicorn's graceful phase, cancelling loads, terminating runtimes, and
-   releasing the ledger, leases and owner lock. Each runtime's `SIGTERM` grace is the smaller
-   of `BROKER_SHUTDOWN_TIMEOUT_SECONDS` and its share of the remaining budget. When the budget
-   runs out, the broker sends `SIGKILL` to every remaining runtime and exits. The docs state
-   the rule: service-manager stop timeout ≥ budget + 15 s. The example unit uses
-   `TimeoutStopSec` and `KillMode=mixed`.
+1. **One shutdown budget.** A new setting, `BROKER_SHUTDOWN_BUDGET_SECONDS` (default 45,
+   validated finite and > 0), bounds the whole stop: uvicorn's graceful phase, cancelling
+   loads, terminating runtimes, and releasing the ledger, leases and owner lock. Runtimes
+   are stopped concurrently; each runtime's `SIGTERM` grace is the smaller of
+   `BROKER_SHUTDOWN_TIMEOUT_SECONDS` and the budget still remaining, and a single shared
+   hard deadline (budget expiry) bounds the whole set. When the budget runs out, the
+   broker sends `SIGKILL` to every remaining runtime and exits. The docs state the rule:
+   service-manager stop timeout ≥ budget + 15 s. The example unit uses `TimeoutStopSec`
+   and `KillMode=mixed`.
 2. **Shutdown preempts loads.** Stopping cancels an in-progress load instead of waiting for
    it: the spawning runtime is killed, and the model goes to `UNLOADED`.
    `ManagedModel.stop()` no longer waits on `load_lock` without a bound.
@@ -102,7 +104,31 @@ stops what it started"), not a new feature.
 
 ## Confirmation
 
-ADR 0027 drills D1–D6 pass on Linux in CI and on macOS locally, repeated three times. They
-cover: exit within the budget, zero leftover runtime or descendant processes, `SIGTERM` during
-a load, a runtime that ignores `SIGTERM`, an escaped descendant, an open stream, and the
-second-signal escalation.
+Implemented in `broker/teardown.py` (identity-gated `terminate_tree`, descendant
+enumeration, Linux child-subreaper), `broker/proc.py` (`ProcessSupervisor` records
+descendants and returns a `TeardownResult`), `broker/manager.py` (budgeted
+`ModelManager.shutdown()`, load preemption, force-escalation), the adapter `stop()`
+contract (`broker/adapters/`), and `broker/__main__.py` (subreaper install, uvicorn
+`timeout_graceful_shutdown`, second-signal escalation).
+
+Real-process drills (`tests/test_shutdown_teardown.py`, with the stand-in runtime
+`tests/fixtures/drill_runtime.py`) spawn a real `python -m broker` and assert:
+
+- `test_sigterm_with_loaded_runtime_exits_fast` — loaded runtime → exit < 2 s, 0 left.
+- `test_runtime_ignoring_sigterm_is_killed_within_budget` — ignores `SIGTERM`, small
+  budget → SIGKILL within budget, 0 left.
+- `test_sigterm_during_slow_load_cancels_and_exits_within_budget` — `SIGTERM` during a
+  slow load → load cancelled, exit within budget, 0 left.
+- `test_escaped_setsid_descendant_is_torn_down` — escaped `setsid` child holding the
+  inherited stdout pipe → killed (0 left; on macOS killed because recorded while its
+  parent lived, else reported as a survivor).
+- `test_open_stream_at_sigterm_exits_within_budget` — open stream → exit within budget.
+- `test_second_sigterm_forces_immediate_kill` — second `SIGTERM` → fast forced exit.
+
+Unit/async tests (`tests/test_teardown.py`): identity gate, descendant enumeration,
+real process-tree `terminate_tree`, the best-effort subreaper, and that an
+adopted-runtime stop keeps the event loop responsive while the grace elapses.
+`tests/test_proc_release.py` covers the new `TeardownResult` supervisor contract.
+
+The Linux-specific descendant paths (`/proc`, subreaper) also run in the project's
+Python 3.11 container gate. ADR 0027 drills D1–D6 build on these fixtures.
