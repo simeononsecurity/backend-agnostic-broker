@@ -60,7 +60,11 @@ adapter spawns or loads, and verify placement after the load where the backend a
    - **External OpenAI-compatible endpoints (no lifecycle):** the broker cannot verify
      placement. `gpu.required: true` there is a **startup configuration error**, unless the
      entry also sets `gpu.verify: declared`, an explicit operator statement that is shown as
-     `declared` in `/status`.
+     `declared` in `/status`. `gpu.verify: declared` is scoped to these external entries: on
+     any backend the broker *can* verify (a broker-managed runtime whose placement is
+     `measured`, or Ollama which `reports` residency) it is itself a **startup configuration
+     error**, so it can never be used as a blanket off-switch that silently disables the
+     enforcement that backend is capable of.
 4. **Visibility.** `/status` shows, per model, `gpu.required`, the inventory source and the
    last verification result. The docs and `registry.example.yaml` describe exactly what is
    enforced per backend.

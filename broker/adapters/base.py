@@ -165,10 +165,29 @@ class BackendAdapter(abc.ABC):
         placement confirmed, so ``gpu.required: true`` there is a configuration
         error unless the operator explicitly sets ``gpu.verify: declared``. Called
         from each adapter's :meth:`validate_config` (fail-fast at startup).
+
+        Conversely, ``gpu.verify: declared`` is ONLY meaningful for an external
+        endpoint: on a backend the broker *can* verify (a broker-managed runtime
+        whose process-group telemetry is ``measured``, or Ollama which ``reports``
+        residency) it would silently disable the required-GPU enforcement that
+        backend is capable of. So ``verify: declared`` on a verifiable backend is
+        itself a configuration error — it must not become a blanket off-switch.
         """
         from ..errors import ConfigError
 
         g = self.entry.gpu
+        if g.verify == "declared" and self.gpu_placement_evidence() != "external":
+            raise ConfigError(
+                f"model {self.entry.alias!r} sets gpu.verify: declared on backend "
+                f"{self.name!r}, which the broker can verify itself",
+                backend=self.name,
+                model=self.entry.alias,
+                remediation=(
+                    "gpu.verify: declared is only for external endpoints the broker "
+                    "cannot verify; remove it so GPU placement is enforced "
+                    "(measured telemetry for a managed runtime, or Ollama size_vram)"
+                ),
+            )
         if not g.required:
             return
         if self.gpu_placement_evidence() == "external" and g.verify != "declared":

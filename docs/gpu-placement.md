@@ -53,7 +53,7 @@ GPU behavior is controlled globally by config and per-model by the registry.
 |-------|---------|---------|
 | `gpu.required` | all | Require a GPU. Enforced at load (ADR 0025): empty inventory or an unknown `device_ids` → 503 `gpu_unavailable`; placement is verified after load where the backend allows it. |
 | `gpu.device_ids` | broker-managed | Sets `CUDA_VISIBLE_DEVICES` for the child; each id must be in the device inventory when `gpu.required`. |
-| `gpu.verify` | external + `required` | Only value: `declared`. Required to set `gpu.required` on an external OpenAI-compatible endpoint the broker cannot verify; asserts placement out-of-band and shows as `declared` in `/status`. |
+| `gpu.verify` | external + `required` | Only value: `declared`. Required to set `gpu.required` on an external OpenAI-compatible endpoint the broker cannot verify; asserts placement out-of-band and shows as `declared` in `/status`. **Rejected (startup `config_error`) on any backend the broker CAN verify** — a broker-managed runtime (`measured`) or Ollama (`reported`) — so it can never silently disable enforcement. |
 | `gpu.gpu_memory_fraction` | vLLM (`--gpu-memory-utilization`) | VRAM budget `(0,1]`. |
 | `gpu.tensor_split` | llama.cpp / strata | See `docs/tensor-split.md`. |
 | `gpu.layer_split` | llama.cpp | See `docs/layer-split.md`. |

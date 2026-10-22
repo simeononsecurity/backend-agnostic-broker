@@ -333,6 +333,52 @@ async def test_external_required_with_declared_starts_and_shows_declared(tmp_pat
 
 
 # --------------------------------------------------------------------------- #
+# gpu.verify: declared must NOT be an off-switch on a verifiable backend.
+# A broker-managed (measured) or Ollama (reported) entry that sets it is a
+# startup ConfigError — otherwise required-GPU enforcement is silently disabled
+# and the model loads on CPU with an empty inventory (the reopened defect).
+# --------------------------------------------------------------------------- #
+async def test_verify_declared_on_managed_backend_is_config_error(tmp_path):
+    settings = _settings(
+        tmp_path,
+        """
+        models:
+          - alias: managed
+            backend: fake
+            runtime_model_id: fake-managed
+            gpu:
+              required: true
+              verify: declared
+        """,
+        # Telemetry off + no declared inventory: without the guard this would
+        # load on CPU despite gpu.required.
+    )
+    with pytest.raises(ConfigError) as ei:
+        _manager(settings)
+    assert "verify" in str(ei.value).lower()
+    # The fake backend stands in for a broker-managed runtime (evidence measured).
+    assert "declared" in (ei.value.remediation or "")
+
+
+async def test_verify_declared_without_required_on_managed_is_config_error(tmp_path):
+    # Even without gpu.required, verify: declared on a verifiable backend is an
+    # error: it has no legitimate use there and must not be silently accepted.
+    settings = _settings(
+        tmp_path,
+        """
+        models:
+          - alias: managed
+            backend: fake
+            runtime_model_id: fake-managed
+            gpu:
+              verify: declared
+        """,
+    )
+    with pytest.raises(ConfigError):
+        _manager(settings)
+
+
+# --------------------------------------------------------------------------- #
 # Pool failover past a gpu_unavailable member to a qualifying one.
 # --------------------------------------------------------------------------- #
 async def test_pool_failover_past_gpu_unavailable_member(tmp_path):
