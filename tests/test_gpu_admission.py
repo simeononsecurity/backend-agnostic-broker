@@ -413,6 +413,46 @@ async def test_pool_failover_past_gpu_unavailable_member(tmp_path):
     await mgr.shutdown()
 
 
+async def test_pool_failover_onto_loaded_member_max_loaded_one(tmp_path):
+    """Regression: a pool with a gpu-unavailable member + max_loaded_models=1.
+
+    Sequential requests must all succeed by failing over to the qualifying
+    member. The unqualified member can never load, so every failover lands on the
+    already-loaded qualifying member; ``_evict_for_count`` must not then 429 the
+    member that is serving the request (it holds its own slot). Pre-fix this
+    produced 200, 503, 429, 503.
+    """
+    settings = _settings(
+        tmp_path,
+        """
+        models:
+          - alias: p-gpu
+            backend: fake
+            runtime_model_id: fake-gpu
+            pool: gp
+            gpu:
+              required: true
+              device_ids: [9]
+          - alias: p-cpu
+            backend: fake
+            runtime_model_id: fake-cpu
+            pool: gp
+        """,
+        gpu_devices="0,1",  # inventory has 0,1 — never 9, so p-gpu is unavailable
+        route_strategy="round_robin",  # keep re-selecting p-gpu first
+        max_loaded_models=1,
+    )
+    mgr = _manager(settings)
+    try:
+        for i in range(4):
+            out = await mgr.chat("gp", {"messages": [{"role": "user", "content": "x"}]}, f"r{i}")
+            assert out["choices"][0]["message"]["content"] == "echo: p-cpu"
+        assert mgr.models["p-gpu"].adapter._load_count == 0  # type: ignore[attr-defined]
+        assert mgr.loaded_count() == 1
+    finally:
+        await mgr.shutdown()
+
+
 async def test_pool_all_members_gpu_unavailable_propagates(tmp_path):
     settings = _settings(
         tmp_path,

@@ -1153,6 +1153,17 @@ class ModelManager:
             m.machine.to(State.LOADING)
 
     async def _evict_for_count(self, keep_alias: str) -> None:
+        # A model that is ALREADY resident holds its slot: serving another request
+        # to it (including a failover landing on an already-loaded pool member)
+        # loads nothing new, so the count limit does not apply and there is no
+        # victim to seek. Without this guard, a request that fails over from a
+        # gpu_unavailable member onto an already-loaded member reaches here with
+        # loaded_count == max and no *other* idle model to evict, and wrongly 429s
+        # the member that is serving it (regression surfaced once ADR 0025 made
+        # the unqualified member fail over instead of silently loading on CPU).
+        keep = self.models.get(keep_alias)
+        if keep is not None and keep.machine.is_active():
+            return
         if self.loaded_count() < self.settings.max_loaded_models:
             return
         candidates = [
