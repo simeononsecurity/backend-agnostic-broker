@@ -97,7 +97,7 @@ too (the remaining 2 skips are import-guard paths that only fire when a package 
 **Total: `pytest -q` reports 1228 passed, 65 skipped in the shared CPU venv** (the
 skips are the optional redis/otel paths — see the note above; `tests/test_cache_redis_ttl.py`
 collects only with the `[redis]` extra). The all-extras venv / Python 3.11 container
-(`pip install -e '.[dev,redis,otel]'`) runs those paths too: **1291 passed, 2 skipped**
+(`pip install -e '.[dev,redis,otel]'`) runs those paths too: **1294 passed, 2 skipped**
 (only the 2 import-guard paths that fire when a package is *absent*). Per-file counts
 above are the extras-inclusive collected numbers. The ADR 0027 lifecycle **drills**
 (`tests/drills/`, marker `drill`) are excluded from these totals and run separately
