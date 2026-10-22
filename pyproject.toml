@@ -54,7 +54,10 @@ broker = ["ui/static/*", "ui/static/**/*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra -m \"not drill\""
+markers = [
+    "drill: real-process lifecycle failure drills (ADR 0027); excluded from the default run, run via scripts/failure_drills.py or `pytest -m drill`",
+]
 
 [tool.ruff]
 line-length = 100
