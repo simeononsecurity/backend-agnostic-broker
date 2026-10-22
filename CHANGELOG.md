@@ -8,6 +8,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Lifecycle failure drills as a release gate (ADR 0027).** A new real-process
+  drill suite (`tests/drills/`, pytest marker `drill`, excluded from the default
+  run) spawns a real `python -m broker` against stand-in runtime processes and
+  asserts teardown, forced-kill recovery and device admission under failure — the
+  paths a fake adapter cannot exercise. Twelve drills (D1–D12) each assert a
+  wall-clock bound, zero leftover processes (by PID + start time), an empty ledger
+  and lease directory, and the typed error where one is expected. A runner
+  (`scripts/failure_drills.py --repeat 3`) fails on any flake, and a path-gated CI
+  job (`.github/workflows/drills.yml`, `ubuntu-latest`, actions pinned to SHAs)
+  runs it ×3 on every PR touching `broker/**`, the drills, or the runner. See
+  [docs/testing.md](docs/testing.md) and the release gate in the production guide.
 - **Host-local device leases (ADR 0026; opt-in, `BROKER_DEVICE_LEASES=off` by
   default).** When on, the broker records one lease file per device it uses under
   `BROKER_DEVICE_LEASE_DIR` (default `<cache_dir>/leases`; atomic + `flock`,

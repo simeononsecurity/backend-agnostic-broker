@@ -83,6 +83,24 @@ curl -s https://broker.example.com/healthz          # {"status":"ok"} over TLS
 curl -s -o /dev/null -w '%{http_code}\n' https://broker.example.com/v1/models   # 401 without a key
 ```
 
+## Release gate & canary — lifecycle failure drills (ADR 0027)
+
+Before a version ships or re-enters a production path, the **lifecycle failure
+drills** (`tests/drills/`, ADR 0027) must be green:
+
+- **Linux CI** — the `drills.yml` job runs `scripts/failure_drills.py --repeat 3`
+  on every PR that touches `broker/**`, the drills, or the runner.
+- **Local macOS** — run `python scripts/failure_drills.py --repeat 3` on a macOS
+  host too (the POSIX teardown paths differ from Linux). **Attach the run log to
+  the release evidence** for that version.
+- **Canary** — a production canary must include at least a **stop-under-load**
+  drill (D4/D5: SIGTERM during a cold load / with an open stream) and a
+  **forced-kill** drill (D10: `SIGKILL` the broker, then `python -m broker
+  cleanup`) before the broker re-enters a production path.
+
+A flaky drill is a defect, not a retry — any failed repetition blocks the release.
+See [testing.md](../testing.md#lifecycle-failure-drills-adr-0027).
+
 ## Troubleshooting
 
 | Symptom | Fix |

@@ -38,7 +38,7 @@ too (the remaining 2 skips are import-guard paths that only fire when a package 
 | `tests/test_shutdown_teardown.py` | 8 | **Real-process shutdown drills (ADR 0024)** — spawn a real `python -m broker` with the stand-in runtime (`tests/fixtures/drill_runtime.py`): SIGTERM with a loaded runtime → exit < 2 s, 0 left; a runtime ignoring SIGTERM → SIGKILL within a small budget, 0 left; SIGTERM during a slow load → load preempted at the first signal, exit < 5 s, 0 left; a client blocked on a cold load → fast **503 `shutting_down`** and broker exit < 5 s (not a hang until the budget); an escaped `setsid` descendant → torn down (0 left; recorded-while-alive on macOS); an open stream at SIGTERM → exit within budget; a second SIGTERM → fast forced exit; and (Linux container gate) **alternating evictions with an escaped grandchild leave 0 zombie children of the broker** while every request is still served. POSIX-gated; the Linux `/proc`/subreaper/`waitpid` paths also run in the 3.11 container. |
 | `tests/test_gpu_admission.py` | 16 | **Required-GPU enforcement (ADR 0025)** on the fake backend + `FakeTelemetry`: empty inventory and an unknown `device_ids` fail with 503 `gpu_unavailable` **before any spawn** and with no eviction; a declared-inventory device loads; measured telemetry with no device memory after ready unloads (503 `gpu_placement_failed`), with memory passes; Ollama `/api/ps` `size_vram == 0` unloads/fails and `> 0` passes; an external endpoint with `required` and no `verify: declared` is a startup `config_error`, with it it starts and shows `declared`; **`verify: declared` on a verifiable (managed/Ollama) backend is itself a `config_error`** so it can't disable enforcement; a pool fails over past a `gpu_unavailable` member to a qualifying one (including **with `max_loaded_models=1` sequentially**, the regression where the already-loaded member was wrongly 429'd), and an all-unqualified pool propagates; a non-required model is unchanged; and `/status` exposes the per-model `gpu` block. |
 | `tests/test_gpu_admission_realproc.py` | 2 | **Required-GPU real-process test (ADR 0025)**: a control spawn proves the stand-in runtime (`tests/fixtures/gpu_stub_runtime.sh`) is a genuine process; then a broker-managed entry with `gpu.required` and an empty declared inventory returns 503 `gpu_unavailable` with the runtime **never spawned** — verified by the sentinel file, `pgrep`, and the runtime ledger. |
-| `tests/test_device_leases.py` | 9 | **Device leases (ADR 0026)** on the fake backend + a real manager: the pure compatibility/classification matrix; leases OFF create no directory; a load writes a `held` lease with the runtime identity and fires the acquire hook once, an unload removes it and fires the release hook once; an exclusive model evicts an idle shared holder and is refused (`device_busy` 503 + `Retry-After`) on a busy holder and on an **external** holder whose real `sleep` process is asserted still alive (never signalled); a stale lease is reaped by `cleanup_stale_leases`; and the shipped `examples/device-leases` hook script runs. |
+| `tests/test_device_leases.py` | 12 | **Device leases (ADR 0026)** on the fake backend + a real manager: the pure compatibility/classification matrix; leases OFF create no directory; a load writes a `held` lease with the runtime identity and fires the acquire hook once, an unload removes it and fires the release hook once; an exclusive model evicts an idle shared holder and is refused (`device_busy` 503 + `Retry-After`) on a busy holder and on an **external** holder whose real `sleep` process is asserted still alive (never signalled); a stale lease is reaped by `cleanup_stale_leases`; the shipped `examples/device-leases` hook script runs; and **lease-hook command validation** — a valid single-string argv template passes, an empty one is a no-op, and a JSON-list value is rejected with a startup warning that **names the setting** (`BROKER_LEASE_ACQUIRE_COMMAND`). |
 | `tests/test_device_leases_realproc.py` | 3 | **Device-lease cleanup real-process test (ADR 0026)**: real `python -m broker cleanup` against a lease whose broker is dead and whose runtime is a real alive session leader — `stop` mode terminates it identity-gated, removes the lease and fires the release hook **within 10 s**; `--report` keeps it `orphaned` and signals nothing; a decoy whose recorded start time does not match is never killed (identity gate). |
 | `tests/test_queue.py` | 18 | **Bounded, fair, timed admission queue (ADR 0023)**: saturation → FIFO serve; fairness (round-robin across keys, no starvation) + priority + aging; max-depth → 429 `queue_full` + Retry-After; max-wait → 503 `queue_timeout` + Retry-After naming the trigger; **client disconnect frees the slot** — the manager's cancellation-safety *and* the app-layer serve guard (`_await_or_disconnect` watches the ASGI `receive` channel for `http.disconnect` and cancels the serve, since uvicorn does not cancel a buffered non-streaming handler on disconnect); quota 429s and `exceeds_device_capacity` never queued; fast-path bypass; device/host-load overload queues then drains; composes with pool failover; never switches model; and queue OFF == v0.6.0. |
 | `tests/test_api.py` | 10 | `/v1/models`, `/v1/chat/completions`, `/healthz`, `/readyz`, `/status`, `/metrics`, structured errors, request IDs, size limit. |
@@ -94,12 +94,14 @@ too (the remaining 2 skips are import-guard paths that only fire when a package 
 | `tests/test_links.py` | 111 | **No dead relative links** in `docs/` and `examples/` — parametrized per Markdown file; external (`http(s)`/`mailto`), in-page anchors, and `${...}`/`<...>` placeholders are skipped. |
 | `tests/test_docs_examples.py` | 6 | README/api-reference examples work against the real API (fake backend), plus **execution of the `<!-- runnable -->` blocks in `docs/getting-started.md` Track C** — the documented registry loads and every marked curl is replayed against the fake backend. |
 
-**Total: `pytest -q` reports 1225 passed, 65 skipped in the shared CPU venv** (the
+**Total: `pytest -q` reports 1228 passed, 65 skipped in the shared CPU venv** (the
 skips are the optional redis/otel paths — see the note above; `tests/test_cache_redis_ttl.py`
 collects only with the `[redis]` extra). The all-extras venv / Python 3.11 container
-(`pip install -e '.[dev,redis,otel]'`) runs those paths too: **1288 passed, 2 skipped**
+(`pip install -e '.[dev,redis,otel]'`) runs those paths too: **1291 passed, 2 skipped**
 (only the 2 import-guard paths that fire when a package is *absent*). Per-file counts
-above are the extras-inclusive collected numbers.
+above are the extras-inclusive collected numbers. The ADR 0027 lifecycle **drills**
+(`tests/drills/`, marker `drill`) are excluded from these totals and run separately
+(`scripts/failure_drills.py`); see the drill section below.
 
 ## Live rerank verification (ADR 0013)
 
@@ -133,6 +135,50 @@ Berlin (~-5.0), then bananas; `top_n=2` was honored, `document` was echoed as
 `{"text": ...}`, results were sorted descending, and an unknown model still
 returned `404`. The container, image, and weights were removed afterwards
 (`python:3.11-slim` kept for the CI gate).
+
+## Lifecycle failure drills (ADR 0027)
+
+The suite above is CPU-only and mostly fake-backed. **Lifecycle failure drills**
+(`tests/drills/`, pytest marker `drill`) complement it with *real* broker
+processes against *real* stand-in runtime processes — the paths a fake cannot
+exercise (teardown under stress, escaped process trees, forced kills, device
+admission). They are **excluded from the default run** (`addopts -m "not drill"`)
+because they spawn processes and add a few minutes; run them explicitly:
+
+```bash
+# the release gate: the whole suite x3, fails on any flake
+python scripts/failure_drills.py --repeat 3
+# or a single pass / a subset, via pytest
+pytest -m drill
+pytest -m drill -k d10
+```
+
+Each drill spawns a real `python -m broker` wired to `tests/fixtures/drill_runtime.py`
+(an env-selected stand-in runtime: `ignore_term`, `slow_start`, `escape`, `crash`,
+`hold_port`, slow stream) and, for the GPU drills, a recorded-fixture `nvidia-smi`
+(`tests/fixtures/fake_nvidia_smi.sh`). Every drill asserts a **wall-clock bound**,
+**zero leftover runtime processes** (by PID + start time), an **empty ledger and
+lease directory** where a clean stop is expected, and the **typed error** where one
+is expected. The harness kills its own stand-ins in a `finally`, identity-gated.
+
+| Drill | Scenario | Assertion |
+|---|---|---|
+| D1 | SIGTERM with a loaded runtime | broker exits well within budget; 0 runtimes; empty ledger/leases |
+| D2 | runtime ignores SIGTERM | SIGKILL escalation within budget; 0 runtimes |
+| D3 | escaped `setsid` descendant | killed (Linux) / killed-or-reported-survivor (macOS); main runtime gone |
+| D4 | SIGTERM during a cold load | load preempted; waiting client gets **503 `shutting_down`**; exit within budget; 0 runtimes |
+| D5 | open stream at SIGTERM | stream ends; exit within budget; 0 runtimes |
+| D6 | second-signal escalation | immediate forced exit (< 15 s) despite an ignore-SIGTERM runtime; 0 runtimes |
+| D7 | `gpu.required`, device not in inventory | **503 `gpu_unavailable`** *before any spawn*; 0 runtimes |
+| D8 | `gpu.required` runtime holds no device memory | post-load verify **503 `gpu_placement_failed`**; model unloaded; 0 runtimes |
+| D9 | lease lifecycle around load + idle unload | `held` lease on load; released (file gone) on idle unload |
+| D10 | broker `SIGKILL`, then `python -m broker cleanup` | runtime + escaped descendant reaped and lease removed within ~10 s; release hook fired |
+| D11 | exclusive model vs. an external lease | **503 `device_busy`**; the external co-tenant process is never signalled |
+| D12 | restart after `SIGKILL` | `report` leaves the orphan untouched; `stop` terminates it identity-gated (ADR 0021) |
+
+Drills are **POSIX-only** (fork / signals). The Linux `/proc` + subreaper paths
+also run in the Python 3.11 container. The runner treats any failed repetition as
+a defect, not a retry — a flaky drill fails the gate.
 
 ## Writing new tests
 

@@ -22,6 +22,24 @@ Triggered on `pull_request` to `main`. Default permissions are `contents: read`;
 
 All third-party actions are pinned to **full commit SHAs**.
 
+## Lifecycle failure drills workflow (`drills.yml`)
+
+Triggered on `pull_request` to `main`, but **path-gated** — it runs only when the
+broker, the drills, the drill fixtures, or the runner change
+(`broker/**`, `tests/drills/**`, `tests/fixtures/drill_runtime.py`,
+`tests/fixtures/fake_nvidia_smi.sh`, `scripts/failure_drills.py`,
+`.github/workflows/drills.yml`), so docs-only PRs skip it. Default permissions are
+`contents: read`; `concurrency` cancels superseded runs.
+
+- **failure-drills** (`ubuntu-latest`) — install `-e ".[dev]"`, then run the ADR
+  0027 lifecycle failure drills **three times** (`python scripts/failure_drills.py
+  --repeat 3`). The drills spawn real broker + stand-in runtime processes and
+  exercise teardown, forced-kill recovery, and device admission; any failed
+  repetition fails the gate (a flaky drill is a defect, not a retry). See
+  [testing.md](testing.md#lifecycle-failure-drills-adr-0027) and ADR 0027.
+
+All third-party actions are pinned to **full commit SHAs**.
+
 ## Release workflow (`release.yml`)
 
 Runs **only** on `v*.*.*` tags (and manual `workflow_dispatch`); never on
@@ -56,6 +74,7 @@ source .venv/bin/activate
 ruff check broker tests
 ruff format --check broker tests
 python -m pytest -q
+python scripts/failure_drills.py --repeat 3   # ADR 0027 lifecycle drills (drills.yml)
 docker compose -f docker-compose.yml config -q
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml config -q
 make docker-build && make docker-smoke

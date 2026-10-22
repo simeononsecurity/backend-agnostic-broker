@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Recorded-fixture nvidia-smi stand-in for ADR 0027 GPU drills (D7/D8).
 #
 # Emits deterministic CSV matching the two queries broker/resources.py NvidiaTelemetry

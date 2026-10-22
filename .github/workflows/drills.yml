@@ -1,0 +1,45 @@
+# Lifecycle failure drills (ADR 0027) — real-process teardown/recovery/admission
+# gate. SAFE FOR FORKS: triggered on `pull_request` (read-only token, no secrets),
+# default read-only permissions, all third-party actions pinned to full commit
+# SHAs, superseded runs cancelled.
+#
+# Path-gated: only runs when the broker, the drills, or the runner change — the
+# drills spawn real processes and add a few minutes, so they do not run on docs-
+# only PRs. The job runs the suite x3 and fails on any flake (a flaky drill is a
+# defect, not a retry — ADR 0027).
+name: drills
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "broker/**"
+      - "tests/drills/**"
+      - "tests/fixtures/drill_runtime.py"
+      - "tests/fixtures/fake_nvidia_smi.sh"
+      - "scripts/failure_drills.py"
+      - ".github/workflows/drills.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drills-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  failure-drills:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.11"
+      - name: "Install"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: "Lifecycle failure drills (x3)"
+        run: python scripts/failure_drills.py --repeat 3

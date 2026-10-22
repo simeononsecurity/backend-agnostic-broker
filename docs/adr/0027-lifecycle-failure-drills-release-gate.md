@@ -1,6 +1,6 @@
 # ADR 0027: Gate releases on repeatable lifecycle failure drills
 
-Status: Proposed
+Status: Accepted
 Date: 2026-10-21
 Supersedes: —
 Related: ADR 0020, ADR 0021, ADR 0024, ADR 0025, ADR 0026, `docs/testing.md`
@@ -84,5 +84,14 @@ real stand-in runtime processes, and we will make it a release gate.
 
 ## Confirmation
 
-The CI drill job is green ×3 on the integration branch. `docs/testing.md` lists each drill
-and its assertion. The release evidence for the next version includes the drill log.
+Implemented on `integration/p5`. The drill suite lives in `tests/drills/`
+(`test_lifecycle_drills.py`, D1–D12) behind the `drill` marker, with the stand-in
+runtime `tests/fixtures/drill_runtime.py` (now also `crash` / `hold_port`), the
+recorded-telemetry `tests/fixtures/fake_nvidia_smi.sh`, and the shared harness
+`tests/drills/harness.py`. The runner `scripts/failure_drills.py --repeat 3` fails
+on any flake; the CI job `.github/workflows/drills.yml` (`ubuntu-latest`, actions
+pinned to SHAs, path-gated on `broker/**` / the drills / the runner) runs it ×3.
+`docs/testing.md` lists each drill and its assertion; the production-deployment
+guide records the release gate (Linux CI + local macOS, log attached to release
+evidence; canary includes a stop-under-load and a forced-kill drill). The drill
+log for the next version is attached to the release evidence.

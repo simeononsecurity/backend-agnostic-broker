@@ -48,7 +48,7 @@ links the ADR that records the decision. Every item below is resolved: ✅ done 
 | 16 | Bounded shutdown + descendant-aware runtime teardown (production canary blocker) | ✅ done | [0024](adr/0024-bounded-shutdown-and-descendant-teardown.md) |
 | 17 | Enforce `gpu.required` / `gpu.device_ids` at load in every adapter | ✅ done | [0025](adr/0025-enforce-required-gpu-admission.md) |
 | 18 | Host-local device leases: exclusive admission + stale-lease cleanup (`python -m broker cleanup`) | ✅ done | [0026](adr/0026-device-leases-and-stale-lease-cleanup.md) |
-| 19 | Lifecycle failure drills as a release gate | 🟡 proposed | [0027](adr/0027-lifecycle-failure-drills-release-gate.md) |
+| 19 | Lifecycle failure drills as a release gate | ✅ done | [0027](adr/0027-lifecycle-failure-drills-release-gate.md) |
 
 ## Notes
 
