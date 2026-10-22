@@ -38,6 +38,8 @@ from typing import Any
 from .errors import (
     BackendUnavailableError,
     ConcurrencyLimitError,
+    GpuPlacementFailedError,
+    GpuUnavailableError,
     InsufficientQuotaError,
     ModelLoadError,
     QueueFullError,
@@ -84,6 +86,13 @@ def classify_error(exc: BaseException) -> ErrorClass:
     # (never retried, never benched) so it propagates straight to the client.
     if isinstance(exc, (QueueFullError, QueueTimeoutError)):
         return ErrorClass.OTHER
+    # Required-GPU admission failures (ADR 0025) must fail over to a pool member
+    # that qualifies, but never sleep-retry the same member (the check is
+    # deterministic for a given member, and the model was already unloaded on a
+    # post-load failure). BACKPRESSURE is exactly "always fails over, not
+    # sleep-retryable, not benched by default", so it is reused here.
+    if isinstance(exc, (GpuUnavailableError, GpuPlacementFailedError)):
+        return ErrorClass.BACKPRESSURE
     # Typed upstream HTTP error: classify by the UPSTREAM status, never the
     # broker-facing http_status (which it remaps for the client envelope). This is
     # what makes a client's own bad request (4xx) stop at one member instead of

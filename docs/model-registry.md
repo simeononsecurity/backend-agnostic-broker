@@ -129,8 +129,9 @@ in integer micro-USD so counters stay exact.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `required` | bool | `false` | Fail if a GPU is unavailable. |
-| `device_ids` | list[int] | `[]` | GPU ordinals to use (empty = backend default / CPU). |
+| `required` | bool | `false` | Require a GPU. **Enforced at load (ADR 0025):** an empty device inventory, or a `device_ids` entry not in it, fails the load with **503** `gpu_unavailable` before any spawn/eviction (no CPU fallback); placement is verified after load where the backend allows it (managed runtimes via telemetry, Ollama via `/api/ps` `size_vram`). A model **without** `required` is unchanged. See [gpu-placement.md](gpu-placement.md). |
+| `device_ids` | list[int] | `[]` | GPU ordinals to use (empty = backend default / CPU). When `required`, each id must be in the device inventory (measured telemetry devices, else `BROKER_GPU_DEVICES` / `BROKER_CUDA_VISIBLE_DEVICES`). |
+| `verify` | str? | _(none)_ | Only value: `declared`. Required to set `required: true` on an **external** OpenAI-compatible endpoint (no `startup_command`, non-Ollama) the broker cannot verify — otherwise that is a startup config error. Asserts GPU placement out-of-band; shown as `declared` in `/status`. |
 | `gpu_memory_fraction` | float? | _(none)_ | Per-GPU VRAM fraction `(0,1]` (e.g. vLLM). |
 | `tensor_split` | list[float] | `[]` | Fractional tensor split across GPUs (llama.cpp / strata). |
 | `layer_split` | str? | _(none)_ | Layers to offload to GPU (llama.cpp `n-gpu-layers`), e.g. `"all"` or a number. |

@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`gpu.required` / `gpu.device_ids` are now enforced in every production adapter
+  (ADR 0025).** Previously only the fake test backend read `gpu.required`; the
+  Ollama, vLLM, llama.cpp and Strata adapters ignored it and nothing validated
+  `gpu.device_ids`, so a model marked required could start on CPU (silently/slowly)
+  or on an unintended device — the docs promised a guarantee the broker did not
+  give. Enforcement now lives in the shared admission path:
+  - **Pre-load gate (all backends), before any spawn or eviction:** a load fails
+    fast with **503** `gpu_unavailable` when `gpu.required` is set and the device
+    inventory is empty, or when a `gpu.device_ids` entry is not in it. Nothing is
+    spawned or evicted and there is no CPU fallback; within a pool the request
+    fails over to a qualifying member without sleep-retrying the failing one.
+  - **Device inventory** resolves from measured telemetry devices when
+    `BROKER_GPU_TELEMETRY` is on, else the new `BROKER_GPU_DEVICES` (ordinals),
+    falling back to `BROKER_CUDA_VISIBLE_DEVICES`; the source is labelled
+    `measured` / `declared` in `/status`.
+  - **Post-load verification:** broker-managed runtimes (with telemetry) must hold
+    memory on a required device within `BROKER_GPU_VERIFY_SECONDS` (default 30);
+    Ollama must report `/api/ps` `size_vram > 0`. On failure the model is unloaded
+    and the request fails **503** `gpu_placement_failed` — never served on CPU.
+  - `GET /status` gains a per-model `gpu` block (`required`, inventory source,
+    evidence mode, last verification result).
+
+### Changed
+
+- **Behaviour change for misconfigured entries (ADR 0025).** This enforcement is
+  **on by default** for entries that already set `gpu.required`:
+  - a `gpu.required` entry with no resolvable GPU (telemetry off and no declared
+    inventory) now fails at load with 503 `gpu_unavailable` instead of silently
+    running on CPU;
+  - a `gpu.device_ids` referencing a device not in the inventory now fails at load;
+  - setting `gpu.required: true` on an **external** OpenAI-compatible endpoint (no
+    `startup_command`, non-Ollama) the broker cannot verify is now a **startup
+    configuration error** unless the entry also sets the new `gpu.verify: declared`
+    (shown as `declared` in `/status`).
+
+  Models **without** `gpu.required` are unchanged. New settings
+  `BROKER_GPU_DEVICES` and `BROKER_GPU_VERIFY_SECONDS`, the registry value
+  `gpu.verify: declared`, and the error types `gpu_unavailable` /
+  `gpu_placement_failed`. See the [upgrading guide](docs/guides/upgrading.md).
+
 ## [0.7.0] - 2026-10-21
 
 ### Added

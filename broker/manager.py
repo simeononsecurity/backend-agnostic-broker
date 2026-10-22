@@ -82,6 +82,8 @@ from .errors import (
     CapacityUnavailableError,
     ConcurrencyLimitError,
     ConfigError,
+    GpuPlacementFailedError,
+    GpuUnavailableError,
     ModelBusyError,
     ModelLoadError,
     ModelNotFoundError,
@@ -91,6 +93,12 @@ from .errors import (
     ReleaseStuckError,
     TimeoutError_,
     ValidationError,
+)
+from .gpu_admission import (
+    GpuInventory,
+    preload_problem,
+    required_device_keys,
+    resolve_inventory,
 )
 from .ledger import LedgerOwnerLock, LockOwner, RuntimeLedger, RuntimeRecord, argv_hash
 from .lifecycle import LifecycleMachine, State
@@ -251,14 +259,23 @@ class ManagedModel:
         # backpressure (ADR 0017 429 + Retry-After). The ADR 0023 admission queue
         # reads it as a backend-backpressure overload trigger. 0 = not throttled.
         self.backpressure_until: float = 0.0
+        # Last required-GPU verification result for /status (ADR 0025). None until
+        # a required model is admitted; otherwise a dict with the inventory source
+        # and the last pre/post-load verification outcome.
+        self.gpu_verification: dict[str, Any] | None = None
 
-    async def ensure_ready(self) -> None:
-        """Start + ready the model if needed, exactly once, under the load lock."""
+    async def ensure_ready(self) -> bool:
+        """Start + ready the model if needed, exactly once, under the load lock.
+
+        Returns ``True`` iff this call performed the load (the model went from
+        not-active to READY), so a caller can run one-shot post-load work (ADR
+        0025 placement verification) only on the cold path, never on every request.
+        """
         if self.machine.state in (State.READY, State.BUSY):
-            return
+            return False
         async with self.load_lock:
             if self.machine.state in (State.READY, State.BUSY):
-                return
+                return False
             if self.machine.state == State.FAILED:
                 self.machine.to(State.UNLOADED)  # allow a fresh attempt
             self.machine.to(State.LOADING)
@@ -274,6 +291,7 @@ class ManagedModel:
                 self.adopted = False
                 self._record_runtime(pid)
                 log.info("model %s ready (pid=%s)", self.entry.alias, pid)
+                return True
             except Exception as exc:  # noqa: BLE001
                 self.machine.to(State.FAILED, error=str(exc))
                 self.healthy = False
@@ -885,6 +903,217 @@ class ModelManager:
         self._admissions.append(
             {"alias": alias, "decision": decision, "detail": detail, "at": time.time()}
         )
+
+    # --- required-GPU admission + verification (ADR 0025) ----------------
+    #
+    # These are the admission-hook functions ADR 0026 (device leases) extends:
+    # ``_gpu_preload_check`` is the pre-spawn gate (acquire a device lease there,
+    # alongside the gpu_unavailable check, before anything is spawned or evicted),
+    # and ``_gpu_inventory`` is the single place that resolves which devices exist.
+    async def _gpu_inventory(self) -> GpuInventory:
+        """Resolve the device inventory (measured telemetry, else declared).
+
+        Labelled ``measured`` / ``declared`` / ``none`` so ``/status`` can show how
+        placement was established without ever mixing or inventing a figure.
+        """
+        sample = await self.telemetry_sample() if self.telemetry_enabled() else None
+        return resolve_inventory(
+            telemetry_on=self.telemetry_enabled(),
+            sample=sample,
+            declared=self.settings.declared_gpu_devices(),
+        )
+
+    async def _gpu_preload_check(self, m: ManagedModel) -> None:
+        """Pre-load gate for a ``gpu.required`` model (before any spawn/eviction).
+
+        No-op for a model without ``gpu.required`` (exact pre-ADR-0025 behaviour,
+        no telemetry probe). Otherwise resolves the inventory and raises
+        :class:`GpuUnavailableError` (503) when the inventory is empty or a pinned
+        ``device_ids`` entry is absent — nothing is spawned or evicted, and there
+        is no CPU fallback. Records the inventory source on the model for /status.
+        """
+        g = m.entry.gpu
+        if not g.required:
+            return
+        evidence = m.adapter.gpu_placement_evidence()
+        # verify: declared — the operator asserts GPU placement out-of-band
+        # (the only legal way for an un-verifiable external entry to set required).
+        # Trust it: no inventory enforcement, shown as `declared` in /status.
+        if g.verify == "declared":
+            m.gpu_verification = {
+                "required": True,
+                "evidence": evidence,
+                "inventory_source": "declared",
+                "result": "declared",
+                "detail": "operator-declared (gpu.verify: declared)",
+                "checked_at": time.time(),
+            }
+            return
+        inv = await self._gpu_inventory()
+        problem = preload_problem(g, inv)
+        verification = {
+            "required": True,
+            "evidence": evidence,
+            "inventory_source": inv.source,
+            "inventory": list(inv.devices),
+        }
+        if problem is not None:
+            verification["result"] = "gpu_unavailable"
+            verification["detail"] = problem.summary
+            verification["checked_at"] = time.time()
+            m.gpu_verification = verification
+            raise GpuUnavailableError(
+                f"cannot admit {m.entry.alias!r}: {problem.summary}",
+                backend=m.adapter.name,
+                model=m.entry.alias,
+                code=problem.reason,
+                remediation=(
+                    "point the model at an available device, declare the inventory "
+                    "with BROKER_GPU_DEVICES, enable telemetry, or remove gpu.required"
+                ),
+            )
+        # Pre-load passed; stash the source so /status reflects it even before the
+        # post-load verification result overwrites ``result``.
+        verification["result"] = "pending"
+        m.gpu_verification = verification
+
+    async def _gpu_postload_verify(self, m: ManagedModel) -> None:
+        """Verify GPU placement after a cold load, unloading + failing on a miss.
+
+        Only runs for a ``gpu.required`` model that this call just loaded. The
+        method of proof depends on the backend's evidence:
+
+        * ``reported`` (Ollama): ``/api/ps`` must report ``size_vram > 0``.
+        * ``measured`` (broker-managed runtime): with telemetry on, the runtime's
+          process group must hold memory on a required device within
+          ``BROKER_GPU_VERIFY_SECONDS``. Telemetry off → honest "no measurement"
+          (the pre-load declared-inventory check already ran); nothing is failed.
+        * ``external`` + ``gpu.verify: declared``: trusted, shown as ``declared``.
+
+        On a failure the model is unloaded (no request is ever served from a
+        required model on CPU) and :class:`GpuPlacementFailedError` (503) is raised.
+        """
+        g = m.entry.gpu
+        if not g.required:
+            return
+        evidence = m.adapter.gpu_placement_evidence()
+        base = m.gpu_verification or {"required": True, "evidence": evidence}
+        base = {**base, "evidence": evidence, "checked_at": time.time()}
+        # verify: declared short-circuits all verification (operator statement).
+        if g.verify == "declared":
+            base["result"] = "declared"
+            base["detail"] = "operator-declared (gpu.verify: declared)"
+            m.gpu_verification = base
+            return
+
+        async def _fail(detail: str) -> None:
+            base["result"] = "gpu_placement_failed"
+            base["detail"] = detail
+            m.gpu_verification = base
+            try:
+                await m.stop()
+            except Exception as exc:  # noqa: BLE001 - unload best-effort; still fail the load
+                log.warning(
+                    "gpu verify: unload of %s after failure errored: %s", m.entry.alias, exc
+                )
+            m.machine.to(State.UNLOADED)
+            m.healthy = False
+            raise GpuPlacementFailedError(
+                f"model {m.entry.alias!r} did not hold a required GPU after load: {detail}",
+                backend=m.adapter.name,
+                model=m.entry.alias,
+                remediation=(
+                    "check the runtime actually used the GPU (driver, device env, "
+                    "num_gpu/--n-gpu-layers); the model was unloaded, not served on CPU"
+                ),
+            )
+
+        if evidence == "external":
+            # A required external entry only reaches here with verify: declared
+            # (validate_config rejects it otherwise). Trust the operator statement.
+            base["result"] = "declared"
+            base["detail"] = "operator-declared (gpu.verify: declared)"
+            m.gpu_verification = base
+            return
+        if evidence == "reported":
+            ok, detail = await self._verify_reported(m)
+            if not ok:
+                await _fail(detail)
+                return
+            base["result"] = "ok"
+            base["evidence"] = "reported"
+            base["detail"] = detail
+            m.gpu_verification = base
+            return
+        # evidence == "measured"
+        if not self.telemetry_enabled():
+            base["result"] = "unverified"
+            base["detail"] = "telemetry off: GPU placement not measured"
+            m.gpu_verification = base
+            return
+        ok, detail = await self._verify_measured(m)
+        if not ok:
+            await _fail(detail)
+            return
+        base["result"] = "ok"
+        base["detail"] = detail
+        m.gpu_verification = base
+
+    async def _verify_reported(self, m: ManagedModel) -> tuple[bool, str]:
+        """Ollama post-load proof: ``/api/ps`` ``size_vram > 0`` for the model."""
+        try:
+            data = await m.adapter.ps()  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            return False, f"/api/ps probe failed: {exc}"
+        models = data.get("models") if isinstance(data, dict) else data
+        if not isinstance(models, list):
+            return False, "/api/ps returned no model list"
+        want = m.entry.runtime_model_id
+        for row in models:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("model") or row.get("name") or "")
+            if name == want or name.split(":")[0] == want.split(":")[0]:
+                try:
+                    vram = int(row.get("size_vram") or 0)
+                except (TypeError, ValueError):
+                    vram = 0
+                if vram > 0:
+                    return True, f"reported size_vram={vram}"
+                return False, f"reported size_vram={vram} (model resident on CPU only)"
+        return False, f"model {want!r} not resident in /api/ps after load"
+
+    async def _verify_measured(self, m: ManagedModel) -> tuple[bool, str]:
+        """Measured post-load proof: the runtime's process group holds device memory.
+
+        Polls telemetry (bounded by ``BROKER_GPU_VERIFY_SECONDS``) for a PID in the
+        runtime's process group holding memory on a *required* device. Returns
+        ``(True, detail)`` on first confirmation, else ``(False, detail)``.
+        """
+        inv = await self._gpu_inventory()
+        required = set(required_device_keys(m.entry.gpu, inv))
+        deadline = time.monotonic() + max(0.0, self.settings.gpu_verify_seconds)
+        poll = max(0.05, min(self.settings.gpu_telemetry_poll_seconds, 1.0))
+        last = "no measured device memory held by the runtime's process group"
+        while True:
+            pg = set(m.adapter.process_group_pids())
+            sample = await self.telemetry_sample(force=True)
+            if sample.ok:
+                for d in sample.devices:
+                    if required and str(d.index) not in required:
+                        continue
+                    held = sum(mib for pid, mib in d.processes.items() if pid in pg and mib > 0)
+                    if held > 0:
+                        return True, f"measured {held} MiB held on device {d.index}"
+                last = (
+                    f"process group {sorted(pg)} holds no memory on "
+                    f"required device(s) {sorted(required) or 'any'}"
+                )
+            else:
+                last = f"telemetry unavailable: {sample.reason}"
+            if time.monotonic() >= deadline:
+                return False, last
+            await asyncio.sleep(poll)
 
     # --- admission + eviction (ADR 0020 measured release + ADR 0022) -----
     async def _maybe_evict(self, keep_alias: str) -> None:
@@ -1807,8 +2036,10 @@ class ModelManager:
     async def acquire(self, alias: str) -> ManagedModel:
         """Select + load a single model for a request (no routing/failover)."""
         m = self.get(alias)
+        await self._gpu_preload_check(m)
         await self._maybe_evict(alias)
-        await m.ensure_ready()
+        if await m.ensure_ready():
+            await self._gpu_postload_verify(m)
         return m
 
     async def _route_and_serve(
@@ -2109,6 +2340,10 @@ class ModelManager:
         admit right now, so the caller can wait in the fair queue. On success BOTH
         slots are held and the caller MUST release them with :meth:`_release_slots`.
         """
+        # ADR 0025: required-GPU pre-load gate FIRST — before any overload wait,
+        # eviction or spawn. A deterministic gpu_unavailable fails fast (and fails
+        # over to a qualifying member) rather than queueing behind capacity.
+        await self._gpu_preload_check(m)
         if not blocking:
             trig = await self._overload_trigger(m)
             if trig is not None:
@@ -2121,7 +2356,10 @@ class ModelManager:
                 if qt is not None:
                     raise _WouldBlock(qt) from exc
             raise
-        await m.ensure_ready()
+        if await m.ensure_ready():
+            # ADR 0025: verify placement once, on the cold path only. On failure
+            # the model is already unloaded and this raises gpu_placement_failed.
+            await self._gpu_postload_verify(m)
         if blocking:
             await self.global_sem.acquire()
             try:
@@ -2911,8 +3149,10 @@ class ModelManager:
         or this explicit admin action.
         """
         m = self.get(alias)
+        await self._gpu_preload_check(m)
         await self._maybe_evict(alias)
-        await m.ensure_ready()
+        if await m.ensure_ready():
+            await self._gpu_postload_verify(m)
         return {"alias": alias, "state": m.machine.state.value, "loaded": m.machine.is_active()}
 
     async def admin_reload_registry(self) -> dict[str, Any]:
@@ -3265,6 +3505,14 @@ class ModelManager:
                 "pid": m.machine.pid,
                 "start_time": m.process_start_time,
                 "adopted": m.adopted,
+            }
+            # Required-GPU enforcement + verification visibility (ADR 0025).
+            snap["gpu"] = {
+                "required": m.entry.gpu.required,
+                "device_ids": list(m.entry.gpu.device_ids),
+                "evidence": m.adapter.gpu_placement_evidence(),
+                "verify": m.entry.gpu.verify,
+                "verification": m.gpu_verification,
             }
             if cooldowns_on:
                 cd_dict = (await self.state.get_cooldown(m.entry.alias)).to_dict()

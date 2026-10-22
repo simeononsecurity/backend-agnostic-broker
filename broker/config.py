@@ -374,6 +374,20 @@ class Settings(BaseSettings):
     gpu_visible: bool = False
     cuda_visible_devices: str | None = None  # e.g. "0,1"
 
+    # --- Required-GPU admission (ADR 0025; enforcement of an already-documented
+    # field, on by default for entries that set gpu.required) ---
+    # Declared device inventory (ordinals, e.g. "0,1") the broker may place a
+    # required model on when telemetry is OFF. Falls back to CUDA_VISIBLE_DEVICES.
+    # When telemetry is ON the measured devices are the inventory and this is
+    # ignored. A gpu.required model with an empty inventory (telemetry off and
+    # neither this nor BROKER_CUDA_VISIBLE_DEVICES set) fails fast with
+    # gpu_unavailable (503) instead of silently starting on CPU.
+    gpu_devices: str | None = None  # e.g. "0,1"
+    # How long (seconds) post-load verification waits for a broker-managed
+    # runtime's process group to hold memory on a required device (measured
+    # telemetry), before unloading and failing gpu_placement_failed.
+    gpu_verify_seconds: float = 30.0
+
     # --- Resource telemetry + measured release (ADR 0020; opt-in, default OFF) ---
     # Provider that measures per-device memory (and, where exposed, which PIDs hold
     # it): "off" (DEFAULT; behavior == v0.6.0), "nvidia" (nvidia-smi query mode),
@@ -607,6 +621,21 @@ class Settings(BaseSettings):
             return m[device_key]
         return m.get("*")
 
+    def declared_gpu_devices(self) -> list[str]:
+        """Declared device inventory for required-GPU admission (ADR 0025).
+
+        The ``BROKER_GPU_DEVICES`` ordinals, falling back to
+        ``BROKER_CUDA_VISIBLE_DEVICES``. Each entry is a device key (string).
+        Empty list when neither is set. Used only when telemetry is OFF; with
+        telemetry ON the measured devices are the inventory.
+        """
+        raw = self.gpu_devices
+        if raw is None or not str(raw).strip():
+            raw = self.cuda_visible_devices
+        if raw is None or not str(raw).strip():
+            return []
+        return [tok.strip() for tok in str(raw).split(",") if tok.strip()]
+
     def validate_runtime(self) -> None:
         """Cross-field, fail-fast checks run once at startup."""
         if self.auth_enabled and not self.api_keys and not self._has_keys_file():
@@ -776,6 +805,8 @@ class Settings(BaseSettings):
             )
         if self.gpu_memory_reservation_seconds < 0:
             raise ConfigError("BROKER_GPU_MEMORY_RESERVATION_SECONDS must be >= 0")
+        if self.gpu_verify_seconds < 0:
+            raise ConfigError("BROKER_GPU_VERIFY_SECONDS must be >= 0 (0 = don't wait)")
         for _tool_path in (
             self.gpu_telemetry_nvidia_smi_path,
             self.gpu_telemetry_amd_smi_path,

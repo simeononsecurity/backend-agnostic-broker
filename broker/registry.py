@@ -84,6 +84,13 @@ class GPURequirements(BaseModel):
     required: bool = False
     # Device ordinals, e.g. [0, 1]. Empty => backend default / CPU.
     device_ids: list[int] = Field(default_factory=list)
+    # Post-load verification mode for a ``required`` entry the broker cannot
+    # otherwise verify (ADR 0025). An external OpenAI-compatible endpoint has no
+    # lifecycle the broker controls, so ``required: true`` there is a startup
+    # config error UNLESS ``verify: declared`` — an explicit operator statement
+    # that the GPU placement is guaranteed out-of-band. Shown as ``declared`` in
+    # /status. Only ``"declared"`` (or unset) is accepted.
+    verify: str | None = None
     # Per-GPU VRAM fraction for runtimes that accept it (e.g. vLLM).
     gpu_memory_fraction: float | None = None
     # Tensor split across GPUs (llama.cpp / strata), e.g. [0.5, 0.5].
@@ -99,6 +106,13 @@ class GPURequirements(BaseModel):
     def _frac(cls, v: float | None) -> float | None:
         if v is not None and not (0.0 < v <= 1.0):
             raise ValueError("gpu_memory_fraction must be in (0, 1]")
+        return v
+
+    @field_validator("verify")
+    @classmethod
+    def _verify(cls, v: str | None) -> str | None:
+        if v is not None and v != "declared":
+            raise ValueError("gpu.verify must be 'declared' (or unset)")
         return v
 
 

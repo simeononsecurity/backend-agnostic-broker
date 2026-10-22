@@ -5,7 +5,7 @@ cache, web UI, governance v2, reliability v2, cache-aware v2, router v2) is
 **opt-in and default-off**, and the v0.5.0 configuration reproduces v0.5.0 behavior
 byte-for-byte. Upgrading is: update the package/image, keep your config, done.
 
-This guide lists the only three behavior changes you should be aware of, and how to
+This guide lists the only behavior changes you should be aware of, and how to
 adopt the new features when you want them.
 
 ## Upgrade steps
@@ -64,6 +64,31 @@ to capable (pricier) models. To keep v0.5.0 scoring:
 router:
   weights: { cost_normalized: false }
 ```
+
+### 4. `gpu.required` is now enforced in every adapter (ADR 0025)
+
+Previously only the fake test backend read `gpu.required`; the production adapters
+ignored it, so a required model could silently run on CPU or on the wrong device.
+It is now enforced in the admission path for any entry that sets `gpu.required`
+(models **without** it are unchanged). This is **on by default** — it closes a
+documented promise, not an opt-in feature.
+
+- A `gpu.required` entry with **no resolvable GPU** (telemetry off and no declared
+  inventory) now fails the load with **503** `gpu_unavailable` instead of running
+  on CPU. Declare the inventory with `BROKER_GPU_DEVICES=0,1` (or
+  `BROKER_CUDA_VISIBLE_DEVICES`), or turn on `BROKER_GPU_TELEMETRY`.
+- A `gpu.device_ids` pointing at a device **not in the inventory** now fails the
+  load with 503 `gpu_unavailable`.
+- Setting `gpu.required: true` on an **external** OpenAI-compatible endpoint (no
+  `startup_command`, non-Ollama) the broker cannot verify is now a **startup
+  config error**. Add `gpu.verify: declared` to assert placement out-of-band (it
+  shows as `declared` in `/status`), or remove `gpu.required`.
+- After a successful load, broker-managed runtimes (with telemetry) and Ollama are
+  verified to actually hold GPU memory; a miss unloads the model and returns
+  **503** `gpu_placement_failed` within `BROKER_GPU_VERIFY_SECONDS` (default 30).
+
+New knobs: `BROKER_GPU_DEVICES`, `BROKER_GPU_VERIFY_SECONDS`, and the registry
+value `gpu.verify: declared`. See [gpu-placement.md](../gpu-placement.md).
 
 ### If you run the frozen v0.5.0 test suite against this branch
 

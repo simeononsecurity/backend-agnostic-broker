@@ -258,6 +258,19 @@ class HTTPBackendAdapter(BackendAdapter):
                 self._allowed_bases(),
                 allow_loopback=self.settings.allow_loopback_backends,
             )
+        # ADR 0025: a required-GPU entry the broker cannot verify (external, no
+        # startup_command) is a startup config error unless gpu.verify: declared.
+        self._check_required_gpu_verifiable()
+
+    def gpu_placement_evidence(self) -> str:
+        """Managed runtimes (``startup_command``) are ``measured``; else ``external``.
+
+        An HTTP backend with a ``startup_command`` is a broker-spawned runtime
+        whose process group's device memory telemetry can confirm placement. One
+        pointing at a base_url with no startup_command is an external endpoint the
+        broker does not own and cannot verify.
+        """
+        return "measured" if self.entry.startup_command else "external"
 
     # --- lifecycle -------------------------------------------------------
     async def start(self) -> int | None:

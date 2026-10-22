@@ -254,6 +254,38 @@ class ReleaseStuckError(BrokerError):
     error_type = "release_stuck"
 
 
+class GpuUnavailableError(BrokerError):
+    """A ``gpu.required`` model could not be admitted to a GPU (ADR 0025).
+
+    Raised by the shared admission path *before any spawn or eviction* when the
+    resolved device inventory (measured telemetry devices, else the declared
+    ``BROKER_GPU_DEVICES`` / ``BROKER_CUDA_VISIBLE_DEVICES`` list) cannot satisfy
+    the entry: the model is ``gpu.required`` but the inventory is empty, or one of
+    its ``gpu.device_ids`` is not in the inventory. Nothing is loaded and there is
+    no CPU fallback. Maps to **503**; it fails over to a qualifying pool member but
+    is never retried on the same member (the check is deterministic for a member).
+    """
+
+    http_status = 503
+    error_type = "gpu_unavailable"
+
+
+class GpuPlacementFailedError(BrokerError):
+    """A ``gpu.required`` model loaded but was not confirmed on a GPU (ADR 0025).
+
+    Raised by post-load verification: a broker-managed runtime whose process group
+    held no memory on a required device within ``BROKER_GPU_VERIFY_SECONDS``
+    (evidence ``measured``), or an Ollama model whose ``/api/ps`` reported
+    ``size_vram == 0`` (evidence ``reported``). The model is unloaded before this
+    is raised, so no request is ever served from a required model running on CPU.
+    Maps to **503**; like :class:`GpuUnavailableError` it fails over to a
+    qualifying member without being retried on the failing one.
+    """
+
+    http_status = 503
+    error_type = "gpu_placement_failed"
+
+
 class RequestTooLargeError(BrokerError):
     """Request body exceeded the configured size limit."""
 

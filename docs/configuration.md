@@ -298,6 +298,19 @@ carry **all** required labels; if none qualify the broker returns
 | `BROKER_GPU_VISIBLE` | bool | `false` | Whether GPUs are exposed to the broker/runtimes. |
 | `BROKER_CUDA_VISIBLE_DEVICES` | str? | _(none)_ | e.g. `0,1`; sets device visibility for broker-managed runtimes (the var name follows the active provider — see below). |
 
+## Required-GPU admission (ADR 0025)
+
+Enforces the already-documented `gpu.required` / `gpu.device_ids` registry fields
+in every production adapter (previously only the fake backend honored them). It is
+**not opt-in** — it applies to entries that already set `gpu.required`, closing a
+documented promise. See [`gpu-placement.md`](gpu-placement.md) for the per-backend
+behavior and [ADR 0025](adr/0025-enforce-required-gpu-admission.md).
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_GPU_DEVICES` | str? | _(none)_ | Declared device inventory (ordinals, e.g. `0,1`) a `gpu.required` model may be placed on when telemetry is OFF. Falls back to `BROKER_CUDA_VISIBLE_DEVICES`; ignored when telemetry is ON (the measured devices are the inventory). A `gpu.required` model with an empty inventory fails fast with **503** `gpu_unavailable` — no CPU fallback. |
+| `BROKER_GPU_VERIFY_SECONDS` | float | `30.0` | How long post-load verification waits for a broker-managed runtime's process group to hold memory on a required device (measured telemetry) before unloading and failing `gpu_placement_failed`. `0` = don't wait. |
+
 ## Resource telemetry + measured release (ADR 0020)
 
 Opt-in, vendor-neutral, **default OFF** (behavior equals v0.6.0). See the

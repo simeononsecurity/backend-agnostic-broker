@@ -69,6 +69,14 @@ Errors are structured (`broker/errors.py`) and carry a `remediation` hint and a
 | `resources.sample.status: unavailable` | The driver tool isn't at an absolute/allow-listed path, timed out, or returned nothing. Run `python -m broker.resources_probe <provider>` and read the `reason`. |
 | A model shows `survived_kill: true` | `stop()` could not confirm the process exited after SIGKILL. Check for a wedged runtime holding the device. |
 
+## Required-GPU admission (ADR 0025)
+
+| Symptom | Cause / fix |
+|---------|-------------|
+| `503 gpu_unavailable` on a load | A `gpu.required` model could not be placed on a GPU, and **nothing was spawned or evicted** (no CPU fallback). `code=empty_inventory`: telemetry is off and no inventory is declared — set `BROKER_GPU_DEVICES=0,1` (or `BROKER_CUDA_VISIBLE_DEVICES`), or turn on `BROKER_GPU_TELEMETRY`. `code=unknown_device_id`: a `gpu.device_ids` entry is not in the inventory — fix the ordinal or the inventory. In a pool the request fails over to a qualifying member first. Check `/status` → the model's `gpu` block for the inventory source. |
+| `503 gpu_placement_failed` on a load | A `gpu.required` model loaded but did not actually hold a GPU, so it was **unloaded** (never served on CPU). Managed runtime (evidence `measured`): its process group held no memory on a required device within `BROKER_GPU_VERIFY_SECONDS` — check the runtime really used the GPU (driver, device env, `--n-gpu-layers`/`num_gpu`), or raise the timeout. Ollama (evidence `reported`): `/api/ps` reported `size_vram == 0` — the daemon loaded it on CPU (check `OLLAMA_*` GPU env on the daemon). |
+| Startup `config_error`: "sets gpu.required … with no runtime the broker can verify" | `gpu.required: true` on an **external** OpenAI-compatible endpoint (no `startup_command`, non-Ollama) the broker cannot verify. Add `gpu.verify: declared` to assert placement out-of-band (shows as `declared` in `/status`), give the entry a broker-managed `startup_command`, or drop `gpu.required`. |
+
 ## Request-queue issues (ADR 0023)
 
 | Symptom | Cause / fix |
