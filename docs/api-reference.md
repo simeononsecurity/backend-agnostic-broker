@@ -121,6 +121,8 @@ and `holder`), `release_stuck` (503, a runtime did not release its device after
 eviction — ADR 0020), `queue_full` (429, the admission queue is full — ADR 0023;
 carries `trigger` + `Retry-After`), `queue_timeout` (503, a queued request waited
 past `BROKER_QUEUE_MAX_WAIT_SECONDS` — ADR 0023; carries `trigger` + `Retry-After`),
+`shutting_down` (503, the broker is stopping and cancelled a load this request was
+waiting on — ADR 0024; carries `Retry-After`),
 `request_too_large` (413), `upstream_client_error` (the upstream 4xx; see below).
 
 ### Admission queue headers + errors (ADR 0023)

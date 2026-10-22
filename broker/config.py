@@ -73,6 +73,13 @@ class Settings(BaseSettings):
     request_timeout_seconds: float = 300.0
     startup_timeout_seconds: float = 120.0
     shutdown_timeout_seconds: float = 30.0
+    # ADR 0024: the total wall-clock budget for the whole stop path (uvicorn's
+    # graceful phase, cancelling loads, terminating every runtime and its
+    # descendants, releasing the ledger/leases/owner lock). Each runtime's
+    # SIGTERM grace is min(shutdown_timeout_seconds, its share of the remaining
+    # budget); when the budget runs out the broker SIGKILLs everything left and
+    # exits. Set the service manager's stop timeout to >= budget + 15 s.
+    shutdown_budget_seconds: float = 45.0
     idle_sweep_interval_seconds: float = 5.0
     # concurrency policy when a model is loading: "queue" waits, "reject" 429s.
     load_concurrency_policy: str = "queue"
@@ -635,6 +642,8 @@ class Settings(BaseSettings):
             raise ConfigError("BROKER_MAX_LOADED_MODELS must be >= 1")
         if self.max_concurrent_requests < 1:
             raise ConfigError("BROKER_MAX_CONCURRENT_REQUESTS must be >= 1")
+        if not math.isfinite(self.shutdown_budget_seconds) or self.shutdown_budget_seconds <= 0:
+            raise ConfigError("BROKER_SHUTDOWN_BUDGET_SECONDS must be a finite number > 0")
         if self.retry_max_attempts < 0:
             raise ConfigError("BROKER_RETRY_MAX_ATTEMPTS must be >= 0 (0 = legacy one-pass)")
         if self.retry_backoff_base_ms < 0 or self.retry_backoff_max_ms < 0:

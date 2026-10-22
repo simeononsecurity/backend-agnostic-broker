@@ -89,6 +89,7 @@ from .errors import (
     QueueFullError,
     QueueTimeoutError,
     ReleaseStuckError,
+    ShuttingDownError,
     TimeoutError_,
     ValidationError,
 )
@@ -107,6 +108,7 @@ from .reliability import ErrorClass, RetryPolicy, classify_error, retry_after_se
 from .resources import TelemetrySample, make_telemetry
 from .router import AutoRouter, should_escalate
 from .state import make_state_store
+from .teardown import TeardownResult, reap_broker_zombies
 from .tracing import make_tracer
 
 log = logging.getLogger("broker.manager")
@@ -251,17 +253,39 @@ class ManagedModel:
         # backpressure (ADR 0017 429 + Retry-After). The ADR 0023 admission queue
         # reads it as a backend-backpressure overload trigger. 0 = not throttled.
         self.backpressure_until: float = 0.0
+        # ADR 0024: the asyncio task currently running a load, so shutdown can
+        # preempt an in-progress load instead of waiting unbounded on load_lock.
+        self._load_task: asyncio.Task | None = None
+        # ADR 0024: flipped True once the broker starts stopping (first stop
+        # signal) so a request waiting on a cold load fails fast with a typed 503
+        # (shutting_down) and no NEW load is admitted, instead of hanging until
+        # the shutdown budget expires. Set by ModelManager.begin_preemption /
+        # shutdown; also set when a load is cancel_load()'d during teardown.
+        self._shutting_down = False
 
     async def ensure_ready(self) -> None:
         """Start + ready the model if needed, exactly once, under the load lock."""
         if self.machine.state in (State.READY, State.BUSY):
             return
+        if self._shutting_down:
+            raise ShuttingDownError(
+                f"broker is shutting down; not loading model {self.entry.alias}",
+                backend=self.adapter.name,
+                model=self.entry.alias,
+            )
         async with self.load_lock:
             if self.machine.state in (State.READY, State.BUSY):
                 return
+            if self._shutting_down:
+                raise ShuttingDownError(
+                    f"broker is shutting down; not loading model {self.entry.alias}",
+                    backend=self.adapter.name,
+                    model=self.entry.alias,
+                )
             if self.machine.state == State.FAILED:
                 self.machine.to(State.UNLOADED)  # allow a fresh attempt
             self.machine.to(State.LOADING)
+            self._load_task = asyncio.current_task()
             try:
                 pid = await self.adapter.start()
                 self.machine.pid = pid
@@ -274,6 +298,25 @@ class ManagedModel:
                 self.adopted = False
                 self._record_runtime(pid)
                 log.info("model %s ready (pid=%s)", self.entry.alias, pid)
+            except asyncio.CancelledError:
+                # ADR 0024: the load was preempted. If the broker is stopping, the
+                # partially-spawned runtime is torn down by the shutdown/stop path
+                # (which signals every model), so here we only flip state out of
+                # LOADING and convert the cancellation into a typed 503 so the
+                # waiting client fails fast. A cancellation for any OTHER reason
+                # (e.g. a client disconnect) is propagated unchanged.
+                try:
+                    self.machine.to(State.FAILED, error="load preempted by shutdown")
+                except Exception:  # noqa: BLE001 - never mask the original cancel
+                    pass
+                self.healthy = False
+                if self._shutting_down:
+                    raise ShuttingDownError(
+                        f"broker is shutting down; load of model {self.entry.alias} was preempted",
+                        backend=self.adapter.name,
+                        model=self.entry.alias,
+                    ) from None
+                raise
             except Exception as exc:  # noqa: BLE001
                 self.machine.to(State.FAILED, error=str(exc))
                 self.healthy = False
@@ -291,6 +334,8 @@ class ManagedModel:
                     state=self.machine.state.value,
                     remediation="check runtime logs and registry startup_command",
                 ) from exc
+            finally:
+                self._load_task = None
 
     def _record_runtime(self, pid: int | None) -> None:
         """Persist a ledger record for a freshly-spawned broker-managed runtime.
@@ -403,21 +448,81 @@ class ManagedModel:
             except Exception as exc:  # noqa: BLE001
                 self.machine.to(State.FAILED, error=str(exc))
 
-    async def stop(self) -> None:
-        async with self.load_lock:
-            if self.machine.state != State.UNLOADED:
-                try:
-                    self.machine.to(State.STOPPING)
-                except Exception:  # noqa: BLE001
-                    pass
+    def cancel_load(self) -> asyncio.Task | None:
+        """Preempt an in-progress load (ADR 0024 shutdown).
+
+        Marks the model as shutting down (so the preempted load — and any request
+        queued behind the load lock — fails fast with a typed 503 instead of a
+        bare ``CancelledError``) and returns the cancelled load task (if any) so
+        the caller can await its unwind before tearing down the spawning runtime.
+        """
+        self._shutting_down = True
+        task = self._load_task
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+            return task
+        return None
+
+    async def stop(
+        self,
+        *,
+        grace: float | None = None,
+        hard_deadline: float | None = None,
+        sigkill_only: bool = False,
+        force_check: Callable[[], bool] | None = None,
+    ) -> TeardownResult | None:
+        """Stop the runtime within a deadline, preempting any in-progress load.
+
+        ADR 0024: never waits unbounded on ``load_lock`` — an in-progress load is
+        cancelled first (its spawning runtime is then torn down like any other),
+        so a slow load can no longer hold shutdown open. The teardown result is
+        recorded on the lifecycle machine (``survived_kill`` / ``release_info``)
+        so a surviving runtime stays visible via ``/status`` ``release_stuck``.
+        """
+        task = self.cancel_load()
+        if task is not None:
             try:
-                await self.adapter.stop()
-            finally:
-                self._forget_runtime()
-                try:
-                    self.machine.to(State.UNLOADED)
-                except Exception:  # noqa: BLE001
-                    self.machine.state = State.UNLOADED
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        if self.machine.state != State.UNLOADED:
+            try:
+                self.machine.to(State.STOPPING)
+            except Exception:  # noqa: BLE001
+                pass
+        result: TeardownResult | None = None
+        try:
+            result = await self.adapter.stop(
+                grace=grace,
+                hard_deadline=hard_deadline,
+                sigkill_only=sigkill_only,
+                force_check=force_check,
+            )
+        finally:
+            self._forget_runtime()
+            try:
+                self.machine.to(State.UNLOADED)
+            except Exception:  # noqa: BLE001
+                self.machine.state = State.UNLOADED
+        if result is not None:
+            self.machine.survived_kill = not result.ok()
+            self.machine.release_info = result.to_dict()
+            if result.survivors:
+                log.error(
+                    "teardown of %s left survivors: %s (outcome=%s, %.2fs)",
+                    self.entry.alias,
+                    result.survivors,
+                    result.outcome,
+                    result.duration,
+                )
+            else:
+                log.info(
+                    "teardown of %s: %s (%.2fs)",
+                    self.entry.alias,
+                    result.outcome,
+                    result.duration,
+                )
+        return result
 
 
 class ModelManager:
@@ -496,6 +601,18 @@ class ModelManager:
         self._sweeper: asyncio.Task | None = None
         self._health_task: asyncio.Task | None = None
         self._stopping = False
+        # ADR 0024: flipped True by a second SIGTERM/SIGINT during shutdown, so the
+        # in-flight teardown escalates straight to SIGKILL of every runtime tree.
+        self._force_shutdown = False
+        # ADR 0024: the monotonic deadline for the WHOLE stop path, stamped once at
+        # the first stop signal (begin_preemption) so the time uvicorn spends in
+        # its graceful phase counts against the same budget the runtime teardown
+        # draws from — the total from first signal to exit stays <= the budget.
+        self._shutdown_deadline: float | None = None
+        self._preempting = False
+        # The running event loop, captured at startup so begin_preemption (called
+        # from uvicorn's signal handler) can schedule preemption thread-safely.
+        self._loop: asyncio.AbstractEventLoop | None = None
         # Resource telemetry (ADR 0020): a provider selected by BROKER_GPU_TELEMETRY
         # ("off" by default => disabled). Samples are cached for
         # gpu_telemetry_poll_seconds so a status read or admission check does not
@@ -3001,6 +3118,23 @@ class ModelManager:
             if timeout > 0 and m.machine.idle_seconds() >= timeout:
                 log.info("idle unload: %s (idle %.1fs)", m.entry.alias, m.machine.idle_seconds())
                 await m.unload()
+        # ADR 0024: reap any re-parented descendant that became a zombie child of
+        # the broker between teardowns (Linux subreaper), so a long-running broker
+        # that churns such runtimes does not accumulate zombies. Never touches a
+        # live runtime the broker spawned (those PIDs are skipped and reaped by
+        # asyncio's child watcher). A no-op off Linux.
+        await self._reap_reparented_zombies()
+
+    async def _reap_reparented_zombies(self) -> None:
+        """Periodically reap the broker's re-parented zombie children (ADR 0024)."""
+        skip = {pid for m in self.models.values() if (pid := m.adapter.process_pid()) is not None}
+        try:
+            reaped = await asyncio.to_thread(reap_broker_zombies, os.getpid(), skip=skip)
+        except Exception as exc:  # noqa: BLE001 - reaping must never break the sweep
+            log.debug("descendant reap error: %s", exc)
+            return
+        if reaped:
+            log.info("reaped %d re-parented runtime descendant(s): %s", len(reaped), reaped)
 
     async def start_sweeper(self) -> None:
         async def loop() -> None:
@@ -3150,8 +3284,73 @@ class ModelManager:
             daemons.append(entry)
         return {"daemons": daemons}
 
+    def note_event_loop(self) -> None:
+        """Capture the running event loop at startup (ADR 0024).
+
+        :meth:`begin_preemption` is invoked from uvicorn's signal handler, which
+        runs in the main thread; it uses this loop reference to schedule the
+        actual preemption thread-safely.
+        """
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - not inside a loop
+            self._loop = None
+
+    def begin_preemption(self) -> None:
+        """Begin stop preemption on the FIRST stop signal (ADR 0024).
+
+        Called from uvicorn's signal handler, so it does no blocking work: it
+        schedules the real preemption onto the event loop (thread-safely). This
+        cancels in-progress loads and stops admitting new ones *concurrently with*
+        uvicorn's (now bounded) graceful HTTP phase, so a client waiting on a cold
+        load fails fast with a typed 503 instead of pinning shutdown open for the
+        whole budget.
+        """
+        loop = self._loop
+        if loop is None:
+            self._do_begin_preemption()
+            return
+        try:
+            loop.call_soon_threadsafe(self._do_begin_preemption)
+        except RuntimeError:  # pragma: no cover - loop already closed
+            self._do_begin_preemption()
+
+    def _do_begin_preemption(self) -> None:
+        """Flip into stopping, stamp the budget deadline, and cancel loads."""
+        if self._preempting:
+            return
+        self._preempting = True
+        self._stopping = True
+        if self._shutdown_deadline is None:
+            budget = self.settings.shutdown_budget_seconds
+            self._shutdown_deadline = time.monotonic() + max(0.0, budget)
+        for m in list(self.models.values()):
+            try:
+                m.cancel_load()
+            except Exception:  # noqa: BLE001 - preemption is best effort
+                pass
+
+    def request_force_shutdown(self) -> None:
+        """Escalate an in-progress shutdown to immediate SIGKILL (ADR 0024).
+
+        Called when a second SIGTERM/SIGINT arrives while the broker is already
+        stopping: every remaining runtime tree is SIGKILLed without waiting out
+        the grace, and the overall budget is effectively zero from here on.
+        """
+        self._force_shutdown = True
+
     async def shutdown(self) -> None:
         self._stopping = True
+        budget = self.settings.shutdown_budget_seconds
+        # Draw the deadline from the first stop signal if preemption already ran,
+        # so uvicorn's graceful phase and the runtime teardown share ONE budget
+        # (total from first signal to exit stays <= budget). Fall back to a fresh
+        # budget when shutdown() runs without a prior signal (e.g. a direct
+        # lifespan exit in a test).
+        deadline = self._shutdown_deadline
+        if deadline is None:
+            deadline = time.monotonic() + max(0.0, budget)
+            self._shutdown_deadline = deadline
         for task in (self._sweeper, self._health_task, self._queue_pump_task):
             if task:
                 task.cancel()
@@ -3159,7 +3358,37 @@ class ModelManager:
                     await task
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
-        await asyncio.gather(*(m.stop() for m in self.models.values()), return_exceptions=True)
+        models = list(self.models.values())
+        # Preempt every in-progress load up front so no stop waits on a load.
+        for m in models:
+            m.cancel_load()
+
+        force_check = lambda: self._force_shutdown  # noqa: E731
+
+        async def _stop_one(m: ManagedModel) -> Any:
+            # Each runtime's SIGTERM grace is the smaller of shutdown_timeout and
+            # the budget still remaining; the shared hard_deadline bounds the whole
+            # set, and force_check cuts it short on a second signal.
+            remaining = deadline - time.monotonic()
+            if self._force_shutdown:
+                return await m.stop(hard_deadline=deadline, sigkill_only=True)
+            grace = min(self.settings.shutdown_timeout_seconds, max(0.0, remaining))
+            return await m.stop(grace=grace, hard_deadline=deadline, force_check=force_check)
+
+        results = await asyncio.gather(*(_stop_one(m) for m in models), return_exceptions=True)
+        # Budget-expiry / survivor sweep: anything still alive after the budget (or
+        # a forced shutdown) gets an unconditional SIGKILL of its whole tree.
+        survivors = [
+            m
+            for m, r in zip(models, results, strict=False)
+            if isinstance(r, TeardownResult) and r.survivors
+        ]
+        if survivors or self._force_shutdown or time.monotonic() >= deadline:
+            for m in survivors:
+                try:
+                    await m.stop(sigkill_only=True)
+                except Exception:  # noqa: BLE001
+                    pass
         # Release the broker-lifetime ledger ownership lock (ADR 0021) so a
         # restart on the same cache dir takes it over cleanly.
         self._owner_lock.release()

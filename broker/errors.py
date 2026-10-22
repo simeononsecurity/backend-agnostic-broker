@@ -254,6 +254,25 @@ class ReleaseStuckError(BrokerError):
     error_type = "release_stuck"
 
 
+class ShuttingDownError(BrokerError):
+    """The broker is stopping and preempted this request's model load (ADR 0024).
+
+    On the first stop signal the broker cancels in-progress loads and stops
+    admitting new ones so a client waiting on a cold load fails fast instead of
+    hanging until the shutdown budget expires. Maps to **503** ``shutting_down``
+    with a short ``Retry-After`` so a client behind a load balancer retries onto
+    a healthy instance.
+    """
+
+    http_status = 503
+    error_type = "shutting_down"
+
+    def __init__(self, message: str, *, retry_after: int = 1, **kwargs: Any) -> None:
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers.setdefault("Retry-After", str(retry_after))
+        super().__init__(message, headers=headers, **kwargs)
+
+
 class RequestTooLargeError(BrokerError):
     """Request body exceeded the configured size limit."""
 

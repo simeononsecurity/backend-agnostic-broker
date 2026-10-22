@@ -19,7 +19,8 @@ tensor/layer split, and caching are all configurable.
 | `broker/adapters/` | Backend adapter contract (`base.py`), shared HTTP adapter (`httpbase.py`), and one adapter per backend (`fake`, `ollama`, `vllm`, `llamacpp`, `strata`). |
 | `broker/registry.py` | Declarative, pydantic-validated model registry (YAML/JSON). |
 | `broker/security.py` | Trust boundaries: executable allow-list, model-path validation, request-flag rejection, no-shell argv construction, SSRF guard. |
-| `broker/proc.py` | `ProcessSupervisor`: no-shell child-process lifecycle for broker-managed runtimes; `stop()` reports whether the process group actually exited (ADR 0020). |
+| `broker/proc.py` | `ProcessSupervisor`: no-shell child-process lifecycle for broker-managed runtimes; records descendants while a runtime runs and `stop()` returns a `TeardownResult` for the whole tree (ADR 0020 / 0024). |
+| `broker/teardown.py` | Deadline-driven, descendant-aware runtime teardown (ADR 0024): identity-gated `terminate_tree`, `/proc`+`ps` descendant enumeration, Linux child-subreaper (`prctl`), and the `TeardownResult` + teardown metrics. |
 | `broker/resources.py` | Vendor-neutral `ResourceTelemetry` providers (ADR 0020): `off`/`nvidia`/`amd`/`host`/`auto`, argv-only + allow-listed + defensive parsing; `resources_probe.py` CLI. Feeds measured release and memory-aware admission (ADR 0022). |
 | `broker/admission.py` | `AdmissionQueue` (ADR 0023): bounded/timed/fair admission-queue scheduler — ordering (FIFO-per-key + round-robin + priority/aging), depth bounds, wake selection, and `/status` stats. The manager owns the overload probes + semaphore acquisition. |
 | `broker/config.py` | Typed, fail-fast `Settings` (env prefix `BROKER_`). |
@@ -199,9 +200,34 @@ On startup (`broker/reconcile.py`, from the lifespan, before the sweeper/health
 loops, never loading a model) the broker reconciles the ledger per
 `BROKER_RUNTIME_RECONCILE`: `off`, `report` (default — list orphans in `/status`),
 `adopt` (reuse a still-healthy orphan: mark READY without spawning), or `stop`
-(`SIGTERM`→grace→`SIGKILL` the recorded group). A clean shutdown stops every
-runtime and clears the ledger. The scope is per host (local processes), so the
-ledger is never shared via Redis. See `docs/guides/restart-and-recovery.md`.
+(`SIGTERM`→grace→`SIGKILL` the recorded group). A clean shutdown is bounded by
+`BROKER_SHUTDOWN_BUDGET_SECONDS` and tears down every runtime **and its
+descendants** (ADR 0024, below), then clears the ledger. The scope is per host
+(local processes), so the ledger is never shared via Redis. See
+`docs/guides/restart-and-recovery.md`.
+
+**Bounded, descendant-aware shutdown (ADR 0024).** `ModelManager.shutdown()` runs
+against one total budget (`BROKER_SHUTDOWN_BUDGET_SECONDS`, default 45 s) whose
+deadline is stamped at the **first** stop signal, so uvicorn's graceful phase and the
+runtime teardown draw from the same budget. On that first signal the broker immediately
+cancels in-progress loads and stops admitting new ones (`begin_preemption`): a client
+waiting on a cold load fails fast with a typed **503 `shutting_down`** (with `Retry-After`)
+instead of pinning shutdown open. uvicorn's graceful HTTP phase is capped at
+`timeout_graceful_shutdown = min(10 s, budget/3)`, leaving the rest for runtime SIGTERM
+grace (`min(BROKER_SHUTDOWN_TIMEOUT_SECONDS, remaining budget)`). The kill set is the
+runtime's process group **plus every recorded descendant** — on Linux the broker is a
+child subreaper (`prctl(PR_SET_CHILD_SUBREAPER)`) and walks `/proc`; elsewhere a periodic
+argv-only `ps` snapshot records descendants while the runtime lives — so an escaped
+`setsid` GPU worker is still torn down. After the tree is down, descendants that
+re-parented to the broker and became zombie children are **reaped** (`waitpid(WNOHANG)`,
+only the specific kill-set PIDs whose parent is the broker — never `waitpid(-1)`), inline
+in `terminate_tree` and periodically in the idle sweeper, so a long-running broker that
+churns runtimes does not accumulate zombies. Every stop is identity-gated (PID + start
+time, never a process the broker didn't start), produces a `TeardownResult` (signalled /
+exited / survivors / reaped / duration) that is logged, counted in
+`broker_runtime_teardown_total{outcome}` + a duration histogram, and surfaced via
+`survived_kill` / `release_stuck` in `/status`. A second `SIGTERM`/`SIGINT` during
+shutdown escalates straight to `SIGKILL` of every runtime tree.
 
 **Ownership lock.** Because the ledger is host-local, two brokers that accidentally
 share a `BROKER_CACHE_DIR` could otherwise stop or adopt each other's live
