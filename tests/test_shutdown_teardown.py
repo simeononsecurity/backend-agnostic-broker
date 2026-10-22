@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -85,6 +86,27 @@ def _post(port: int, payload: dict, timeout: float):
         return type(exc).__name__
 
 
+def _post_status(port: int, payload: dict, timeout: float):
+    """POST a chat completion, returning the HTTP status code even on an error.
+
+    Unlike :func:`_post`, an HTTP error response (e.g. a 503 ``shutting_down``)
+    yields its integer status rather than the exception name, so a test can tell
+    a fast 503 apart from a dropped connection / hang.
+    """
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions",
+        json.dumps(payload).encode(),
+        {"content-type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except Exception as exc:  # noqa: BLE001
+        return type(exc).__name__
+
+
 def _wait_health(port: int, timeout: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -97,32 +119,47 @@ def _wait_health(port: int, timeout: float = 30.0) -> bool:
 
 
 class _Broker:
-    """A spawned ``python -m broker`` wired to the drill runtime."""
+    """A spawned ``python -m broker`` wired to one or more drill runtimes."""
 
-    def __init__(self, tmp_path: Path, *, mode: str, budget: float, startup_timeout: float):
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        mode: str,
+        budget: float,
+        startup_timeout: float,
+        aliases: tuple[str, ...] = ("m",),
+        extra_env: dict | None = None,
+    ):
         self.port = _free_port()
-        self.runtime_port = _free_port()
         self.escape_pidfile = tmp_path / "escape.pid"
+        self.aliases = aliases
+        self.runtime_ports = {a: _free_port() for a in aliases}
+        # Back-compat for single-model tests.
+        self.runtime_port = self.runtime_ports[aliases[0]]
         models = tmp_path / "models"
         models.mkdir(exist_ok=True)
         model_file = models / "m.gguf"
         model_file.write_text("x")
         reg = tmp_path / "registry.yaml"
-        reg.write_text(
-            "models:\n"
-            "  - alias: m\n"
-            "    backend: llamacpp\n"
-            "    runtime_model_id: m\n"
-            "    model_path: " + str(model_file) + "\n"
-            "    base_url: http://127.0.0.1:" + str(self.runtime_port) + "\n"
-            "    context_limit: 512\n"
-            "    output_limit: 16\n"
-            "    supports_streaming: true\n"
-            '    startup_command: ["' + str(_FIXTURE) + '", "--model", "{model_path}", '
-            '"--port", "' + str(self.runtime_port) + '"]\n'
-            "    readiness: {kind: http, path: /health, expect_status: 200, "
-            "timeout_seconds: " + str(int(startup_timeout)) + "}\n"
-        )
+        lines = ["models:\n"]
+        for alias in aliases:
+            rp = self.runtime_ports[alias]
+            lines.append(
+                "  - alias: " + alias + "\n"
+                "    backend: llamacpp\n"
+                "    runtime_model_id: " + alias + "\n"
+                "    model_path: " + str(model_file) + "\n"
+                "    base_url: http://127.0.0.1:" + str(rp) + "\n"
+                "    context_limit: 512\n"
+                "    output_limit: 16\n"
+                "    supports_streaming: true\n"
+                '    startup_command: ["' + str(_FIXTURE) + '", "--model", "{model_path}", '
+                '"--port", "' + str(rp) + '"]\n'
+                "    readiness: {kind: http, path: /health, expect_status: 200, "
+                "timeout_seconds: " + str(int(startup_timeout)) + "}\n"
+            )
+        reg.write_text("".join(lines))
         self.env = dict(
             os.environ,
             PYTHONPATH=str(_REPO_ROOT),
@@ -140,6 +177,8 @@ class _Broker:
             DRILL_MODE=mode,
             DRILL_ESCAPE_PIDFILE=str(self.escape_pidfile),
         )
+        if extra_env:
+            self.env.update({k: str(v) for k, v in extra_env.items()})
         self.logf = open(tmp_path / "broker.log", "w")  # noqa: SIM115
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "broker"],
@@ -148,6 +187,12 @@ class _Broker:
             stdout=self.logf,
             stderr=subprocess.STDOUT,
         )
+
+    def read_escape_pid(self) -> int | None:
+        try:
+            return int(self.escape_pidfile.read_text())
+        except (OSError, ValueError):
+            return None
 
     def terminate_and_time(self, extra_signals: int = 0, gap: float = 0.3) -> float | None:
         t = time.monotonic()
@@ -233,7 +278,45 @@ def test_sigterm_during_slow_load_cancels_and_exits_within_budget(tmp_path):
         assert len(_runtime_pids()) >= 1
         elapsed = b.terminate_and_time()
         assert elapsed is not None, "broker hung past 100 s (load not cancelled)"
-        assert elapsed <= budget + 3.0, f"exit took {elapsed}s, over budget {budget}s"
+        # The first signal preempts the in-progress load immediately (ADR 0024),
+        # so the broker exits well under budget — not just within budget + slack.
+        assert elapsed < 5.0, f"exit took {elapsed}s; load was not preempted at the first signal"
+        time.sleep(0.5)
+        assert _runtime_pids() == []
+    finally:
+        b.cleanup()
+
+
+def test_sigterm_while_client_waits_on_cold_load_returns_503_fast(tmp_path):
+    # GAP 1 (ADR 0024): a client request blocked on a cold load must fail fast
+    # with a typed 503 the moment the broker starts stopping, and the broker must
+    # exit well under the budget — NOT hang until the full budget expires (the
+    # pre-fix behaviour, which spent the whole budget in uvicorn's graceful phase
+    # before cancelling the load).
+    import threading
+
+    budget = 45.0
+    b = _Broker(tmp_path, mode="slow_start", budget=budget, startup_timeout=150)
+    result: dict = {}
+    try:
+        assert _wait_health(b.port)
+
+        def _call():
+            result["status"] = _post_status(
+                b.port, {"model": "m", "messages": [{"role": "user", "content": "hi"}]}, 120
+            )
+
+        t = threading.Thread(target=_call, daemon=True)
+        t.start()
+        time.sleep(3)  # the client is now blocked on the cold load
+        assert len(_runtime_pids()) >= 1
+        elapsed = b.terminate_and_time()
+        assert elapsed is not None, "broker hung past 100 s"
+        assert elapsed < 5.0, f"exit took {elapsed}s with a {budget}s budget (load not preempted)"
+        t.join(10)
+        assert result.get("status") == 503, (
+            f"waiting client got {result.get('status')!r}, expected a fast 503 shutting_down"
+        )
         time.sleep(0.5)
         assert _runtime_pids() == []
     finally:
@@ -315,5 +398,71 @@ def test_second_sigterm_forces_immediate_kill(tmp_path):
         assert elapsed < 4.0, f"second SIGTERM did not force a fast exit: {elapsed}s"
         time.sleep(0.5)
         assert _runtime_pids() == []
+    finally:
+        b.cleanup()
+
+
+def _zombie_children(ppid: int) -> list[int]:
+    """PIDs of zombie processes whose current parent is ``ppid`` (Linux /proc)."""
+    out: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", encoding="utf-8", errors="replace") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        rest = data[data.rfind(")") + 1 :].split()
+        if len(rest) >= 2 and rest[0] == "Z":
+            try:
+                if int(rest[1]) == ppid:
+                    out.append(int(entry))
+            except ValueError:
+                continue
+    return out
+
+
+@pytest.mark.skipif(not _IS_LINUX, reason="subreaper re-parenting + /proc zombies are Linux-only")
+def test_evictions_reap_reparented_descendants_no_zombies(tmp_path):
+    # GAP 2 (ADR 0024): with the broker a child subreaper, an evicted runtime's
+    # escaped setsid grandchild re-parents to the broker and, once killed, would
+    # linger as a zombie child unless the broker reaps it. Alternating evictions
+    # must leave zero zombie children of the broker while still serving each
+    # request (normal runtime lifecycle is observed correctly).
+    b = _Broker(
+        tmp_path,
+        mode="escape",
+        budget=10,
+        startup_timeout=30,
+        aliases=("a", "z"),
+        extra_env={"BROKER_MAX_LOADED_MODELS": 1, "BROKER_SHUTDOWN_TIMEOUT_SECONDS": 3},
+    )
+    try:
+        assert _wait_health(b.port)
+        grandchildren: list[int] = []
+        codes: list = []
+        for i in range(6):
+            alias = "a" if i % 2 == 0 else "z"
+            codes.append(
+                _post_status(
+                    b.port, {"model": alias, "messages": [{"role": "user", "content": "hi"}]}, 60
+                )
+            )
+            time.sleep(0.8)  # let the runtime ready + the descendant recorder snapshot
+            gp = b.read_escape_pid()
+            if gp is not None:
+                grandchildren.append(gp)
+        # Every request was served (the runtime lifecycle still works under churn).
+        assert codes == [200] * 6, f"eviction chat codes: {codes}"
+        # Give the sweeper a tick as a backstop in case a reap raced a teardown.
+        time.sleep(2.0)
+        zombies = _zombie_children(b.proc.pid)
+        assert zombies == [], f"re-parented descendants left as zombies: {zombies}"
+        # Each evicted model's grandchild (all but possibly the last, still loaded)
+        # must be dead — not merely unreaped.
+        evicted = grandchildren[:-1] if grandchildren else []
+        still_alive = [p for p in evicted if _pid_alive(p)]
+        assert still_alive == [], f"evicted grandchildren still alive: {still_alive}"
     finally:
         b.cleanup()

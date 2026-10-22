@@ -51,18 +51,33 @@ tree.
    broker sends `SIGKILL` to every remaining runtime and exits. The docs state the rule:
    service-manager stop timeout ≥ budget + 15 s. The example unit uses `TimeoutStopSec`
    and `KillMode=mixed`.
-2. **Shutdown preempts loads.** Stopping cancels an in-progress load instead of waiting for
-   it: the spawning runtime is killed, and the model goes to `UNLOADED`.
-   `ManagedModel.stop()` no longer waits on `load_lock` without a bound.
-3. **Bounded graceful HTTP phase.** uvicorn runs with `timeout_graceful_shutdown` taken from
-   the budget, so an open request or stream cannot hold up shutdown.
-4. **Descendant-aware termination.** The kill set is the runtime's process group **plus every
-   recorded descendant**, each identity-gated by PID + start time (ADR 0021):
+2. **Shutdown preempts loads on the first signal.** The first stop signal
+   (`SIGTERM`/`SIGINT`) immediately cancels every in-progress load and stops
+   admitting new ones, *concurrently with* uvicorn's graceful HTTP phase — not
+   after it. A client request waiting on a cold load fails fast with a typed
+   **503 `shutting_down`** (carrying a short `Retry-After`) instead of hanging
+   until the budget expires. The spawning runtime is then torn down like any
+   other and the model goes to `FAILED`/`UNLOADED`. `ManagedModel.stop()` never
+   waits on `load_lock` without a bound.
+3. **Bounded graceful HTTP phase.** uvicorn's `timeout_graceful_shutdown` is a
+   small share of the budget — `min(10 s, budget / 3)` — so an open request or
+   stream cannot hold up shutdown; the rest of the budget is left for runtime
+   `SIGTERM` grace. The whole stop (graceful phase + runtime teardown) is drawn
+   from one deadline stamped at the first signal, so the total from first signal
+   to exit stays within the budget.
+4. **Descendant-aware termination and reaping.** The kill set is the runtime's process group
+   **plus every recorded descendant**, each identity-gated by PID + start time (ADR 0021):
    - On Linux, the broker makes itself a child subreaper (`prctl(PR_SET_CHILD_SUBREAPER)`), so
      descendants that leave the group are re-parented to it and can be found and reaped.
    - Elsewhere, a periodic parent-PID tree snapshot (argv-only `ps`) records descendants while
      the runtime is alive.
    - A process the broker cannot prove it started is never signalled.
+   - After the tree is down, the re-parented descendants that became zombie children of the
+     broker are reaped (`waitpid(pid, WNOHANG)`) — both inline in `terminate_tree` after an
+     eviction/unload/shutdown and periodically in the idle sweeper — so a long-running broker
+     that churns such runtimes does not accumulate zombies. Only the specific recorded/kill-set
+     PIDs whose current parent is the broker are waited on; `waitpid(-1)` is never used (it
+     would steal exit statuses from asyncio's child watcher for the runtimes the broker spawned).
 5. **No blocking calls on the event loop.** Adopted-runtime termination becomes async.
 6. **Escalation.** A second `SIGTERM`/`SIGINT` during shutdown triggers immediate `SIGKILL`
    of all runtime groups and descendants, then exit.
@@ -94,9 +109,10 @@ stops what it started"), not a new feature.
   - Leftover processes are found and killed, or reported.
   - Cleanup code always runs before the service manager would have to force-kill.
 - **Negative:**
-  - A load in progress at shutdown is lost and repeats on the next start.
+  - A load in progress at shutdown is lost and repeats on the next start; the waiting client
+    receives a 503 `shutting_down` (with `Retry-After`) rather than a completed response.
   - The subreaper changes how orphaned descendants are re-parented on Linux: the broker must
-    reap them, which the supervisor loop now does.
+    reap them, which `terminate_tree` (inline) and the idle sweeper (periodic) now do.
   - Very slow-to-exit runtimes get `SIGKILL` sooner when the budget is short.
 - **Neutral:** two settings (`BROKER_SHUTDOWN_BUDGET_SECONDS`, plus the existing
   `BROKER_SHUTDOWN_TIMEOUT_SECONDS`, which is now capped by the budget) and new teardown
@@ -105,11 +121,17 @@ stops what it started"), not a new feature.
 ## Confirmation
 
 Implemented in `broker/teardown.py` (identity-gated `terminate_tree`, descendant
-enumeration, Linux child-subreaper), `broker/proc.py` (`ProcessSupervisor` records
-descendants and returns a `TeardownResult`), `broker/manager.py` (budgeted
-`ModelManager.shutdown()`, load preemption, force-escalation), the adapter `stop()`
-contract (`broker/adapters/`), and `broker/__main__.py` (subreaper install, uvicorn
-`timeout_graceful_shutdown`, second-signal escalation).
+enumeration, Linux child-subreaper, and `reap_reparented`/`reap_broker_zombies` which
+`waitpid(WNOHANG)` only the broker's re-parented zombie descendants, never `waitpid(-1)`),
+`broker/proc.py` (`ProcessSupervisor` records descendants, passes its own asyncio child
+PID so it is not reaped twice, and returns a `TeardownResult`), `broker/manager.py`
+(budgeted `ModelManager.shutdown()` drawing one deadline from the first signal,
+`begin_preemption()`/`_do_begin_preemption()` first-signal load cancellation, the
+per-model `shutting_down` flag that turns a preempted/queued load into a typed 503
+`ShuttingDownError`, force-escalation, and the idle-sweeper periodic reap), the adapter
+`stop()` contract (`broker/adapters/`), and `broker/__main__.py` (subreaper install,
+first-signal `begin_preemption`, uvicorn `timeout_graceful_shutdown = min(10 s, budget/3)`,
+second-signal escalation).
 
 Real-process drills (`tests/test_shutdown_teardown.py`, with the stand-in runtime
 `tests/fixtures/drill_runtime.py`) spawn a real `python -m broker` and assert:
@@ -118,17 +140,26 @@ Real-process drills (`tests/test_shutdown_teardown.py`, with the stand-in runtim
 - `test_runtime_ignoring_sigterm_is_killed_within_budget` — ignores `SIGTERM`, small
   budget → SIGKILL within budget, 0 left.
 - `test_sigterm_during_slow_load_cancels_and_exits_within_budget` — `SIGTERM` during a
-  slow load → load cancelled, exit within budget, 0 left.
+  slow load → load preempted at the first signal, exit **< 5 s**, 0 left.
+- `test_sigterm_while_client_waits_on_cold_load_returns_503_fast` — a client blocked on a
+  cold load with a 45 s budget → the client gets a fast **503**, the broker exits **< 5 s**
+  (not a hang until the budget), 0 left.
 - `test_escaped_setsid_descendant_is_torn_down` — escaped `setsid` child holding the
   inherited stdout pipe → killed (0 left; on macOS killed because recorded while its
   parent lived, else reported as a survivor).
 - `test_open_stream_at_sigterm_exits_within_budget` — open stream → exit within budget.
 - `test_second_sigterm_forces_immediate_kill` — second `SIGTERM` → fast forced exit.
+- `test_evictions_reap_reparented_descendants_no_zombies` (Linux container gate) —
+  alternating evictions (max 1 loaded model) with an escaped grandchild per runtime →
+  every request served, **0 zombie children of the broker** afterwards, evicted
+  grandchildren dead.
 
 Unit/async tests (`tests/test_teardown.py`): identity gate, descendant enumeration,
-real process-tree `terminate_tree`, the best-effort subreaper, and that an
-adopted-runtime stop keeps the event loop responsive while the grace elapses.
-`tests/test_proc_release.py` covers the new `TeardownResult` supervisor contract.
+real process-tree `terminate_tree`, the best-effort subreaper, an adopted-runtime stop
+keeping the event loop responsive, and the reaping primitives — `reap_reparented`
+reaps exactly a zombie child of this process (skips a skipped PID and a foreign PID),
+and `reap_broker_zombies` sweeps all re-parented zombie children while honoring `skip`.
+`tests/test_proc_release.py` covers the `TeardownResult` supervisor contract.
 
-The Linux-specific descendant paths (`/proc`, subreaper) also run in the project's
-Python 3.11 container gate. ADR 0027 drills D1–D6 build on these fixtures.
+The Linux-specific descendant/reaping paths (`/proc`, subreaper, `waitpid`) also run in
+the project's Python 3.11 container gate. ADR 0027 drills D1–D6 build on these fixtures.

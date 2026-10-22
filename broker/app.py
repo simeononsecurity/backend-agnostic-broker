@@ -330,6 +330,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # the ledger. Reconcile never loads a model.
         manager.acquire_ledger_ownership()
         await manager.reconcile()
+        # ADR 0024: capture the running loop so the signal handler can preempt
+        # in-progress loads thread-safely on the first stop signal.
+        manager.note_event_loop()
         await manager.start_sweeper()
         await manager.start_health_probe()
         await manager.start_queue_pump()

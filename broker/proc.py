@@ -223,6 +223,10 @@ class ProcessSupervisor:
             force_check=force_check,
             alias=self.alias or "",
             backend=self.backend or "",
+            # The main PID is our own asyncio.subprocess child; asyncio's child
+            # watcher reaps it (via self._proc.wait() below), so terminate_tree
+            # must not waitpid it — only its re-parented descendants (ADR 0024).
+            asyncio_child_pid=main_pid,
         )
         # Let asyncio reap our own child so its transport is finalized (no zombie).
         if self._proc is not None and self._proc.returncode is None:

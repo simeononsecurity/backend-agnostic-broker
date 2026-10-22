@@ -7,15 +7,22 @@
 - Docker: `docker compose up -d --build`; `docker compose down -v`.
 - Graceful shutdown drains the idle sweeper and tears down every broker-managed
   runtime (and its descendants) within a **total budget**,
-  `BROKER_SHUTDOWN_BUDGET_SECONDS` (default 45 s). Each runtime's SIGTERM grace is
-  `min(BROKER_SHUTDOWN_TIMEOUT_SECONDS, remaining budget)`; when the budget runs
-  out, anything still alive is SIGKILLed and the broker exits. See ADR 0024.
+  `BROKER_SHUTDOWN_BUDGET_SECONDS` (default 45 s), measured from the first stop
+  signal. That first signal immediately preempts any in-progress load — a client
+  waiting on a cold load gets a fast **503 `shutting_down`** instead of a hang —
+  and caps uvicorn's graceful HTTP phase at `min(10 s, budget/3)`. Each runtime's
+  SIGTERM grace is `min(BROKER_SHUTDOWN_TIMEOUT_SECONDS, remaining budget)`; when
+  the budget runs out, anything still alive is SIGKILLed and the broker exits. See
+  ADR 0024.
 
 ### Bounded teardown & the service manager (ADR 0024)
 
 Shutdown is deadline-driven and covers the runtime's whole descendant tree (an
 escaped `setsid` worker included), so a stop always completes in a known time and
-leaves no GPU memory held. For the service manager to let that cleanup run **before**
+leaves no GPU memory held. On Linux the broker is a child subreaper and **reaps**
+any descendant that re-parented to it, so a long-running broker that evicts/unloads
+runtimes does not accumulate zombie processes (watch `ps` under the broker PID if
+you suspect otherwise). For the service manager to let that cleanup run **before**
 it force-kills the tree, set its stop timeout to **≥ budget + 15 s** and prefer
 `KillMode=mixed` (SIGTERM to the main process, SIGKILL to the group only on
 timeout) so the broker owns teardown and systemd is defense-in-depth:

@@ -207,18 +207,26 @@ descendants** (ADR 0024, below), then clears the ledger. The scope is per host
 `docs/guides/restart-and-recovery.md`.
 
 **Bounded, descendant-aware shutdown (ADR 0024).** `ModelManager.shutdown()` runs
-against one total budget (`BROKER_SHUTDOWN_BUDGET_SECONDS`, default 45 s): uvicorn's
-graceful phase is bounded by it (`timeout_graceful_shutdown`), an in-progress load
-is **cancelled** rather than waited on (the spawning runtime is killed, model →
-`UNLOADED`), and each runtime's SIGTERM grace is `min(BROKER_SHUTDOWN_TIMEOUT_SECONDS,
-remaining budget)`. The kill set is the runtime's process group **plus every recorded
-descendant** — on Linux the broker is a child subreaper (`prctl(PR_SET_CHILD_SUBREAPER)`)
-and walks `/proc`; elsewhere a periodic argv-only `ps` snapshot records descendants
-while the runtime lives — so an escaped `setsid` GPU worker is still torn down. Every
-stop is identity-gated (PID + start time, never a process the broker didn't start),
-produces a `TeardownResult` (signalled / exited / survivors / duration) that is logged,
-counted in `broker_runtime_teardown_total{outcome}` + a duration histogram, and surfaced
-via `survived_kill` / `release_stuck` in `/status`. A second `SIGTERM`/`SIGINT` during
+against one total budget (`BROKER_SHUTDOWN_BUDGET_SECONDS`, default 45 s) whose
+deadline is stamped at the **first** stop signal, so uvicorn's graceful phase and the
+runtime teardown draw from the same budget. On that first signal the broker immediately
+cancels in-progress loads and stops admitting new ones (`begin_preemption`): a client
+waiting on a cold load fails fast with a typed **503 `shutting_down`** (with `Retry-After`)
+instead of pinning shutdown open. uvicorn's graceful HTTP phase is capped at
+`timeout_graceful_shutdown = min(10 s, budget/3)`, leaving the rest for runtime SIGTERM
+grace (`min(BROKER_SHUTDOWN_TIMEOUT_SECONDS, remaining budget)`). The kill set is the
+runtime's process group **plus every recorded descendant** — on Linux the broker is a
+child subreaper (`prctl(PR_SET_CHILD_SUBREAPER)`) and walks `/proc`; elsewhere a periodic
+argv-only `ps` snapshot records descendants while the runtime lives — so an escaped
+`setsid` GPU worker is still torn down. After the tree is down, descendants that
+re-parented to the broker and became zombie children are **reaped** (`waitpid(WNOHANG)`,
+only the specific kill-set PIDs whose parent is the broker — never `waitpid(-1)`), inline
+in `terminate_tree` and periodically in the idle sweeper, so a long-running broker that
+churns runtimes does not accumulate zombies. Every stop is identity-gated (PID + start
+time, never a process the broker didn't start), produces a `TeardownResult` (signalled /
+exited / survivors / reaped / duration) that is logged, counted in
+`broker_runtime_teardown_total{outcome}` + a duration histogram, and surfaced via
+`survived_kill` / `release_stuck` in `/status`. A second `SIGTERM`/`SIGINT` during
 shutdown escalates straight to `SIGKILL` of every runtime tree.
 
 **Ownership lock.** Because the ledger is host-local, two brokers that accidentally

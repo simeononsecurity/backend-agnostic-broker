@@ -35,7 +35,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from . import runtime_identity as rid
@@ -73,23 +73,34 @@ def set_child_subreaper() -> bool:
     return True
 
 
-def _linux_ppid(pid: int) -> int | None:
+def _linux_proc_state_ppid(pid: int) -> tuple[str | None, int | None]:
+    """Read ``(state, ppid)`` for a PID from ``/proc/<pid>/stat`` (Linux).
+
+    ``state`` is the single-letter status (``Z`` for a zombie); ``ppid`` is the
+    current parent PID (the broker's PID once a descendant has re-parented to it
+    under ``PR_SET_CHILD_SUBREAPER``). Returns ``(None, None)`` if unreadable.
+    A zombie's stat is still readable, so this works for reaping decisions.
+    """
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
             data = fh.read()
     except OSError:
-        return None
+        return (None, None)
     rparen = data.rfind(")")
     if rparen == -1:
-        return None
+        return (None, None)
     rest = data[rparen + 1 :].split()
     # After the "(comm)" token: state(0) ppid(1) pgrp(2) ...
     if len(rest) < 2:
-        return None
+        return (None, None)
     try:
-        return int(rest[1])
+        return (rest[0], int(rest[1]))
     except ValueError:
-        return None
+        return (rest[0] if rest else None, None)
+
+
+def _linux_ppid(pid: int) -> int | None:
+    return _linux_proc_state_ppid(pid)[1]
 
 
 def ppid_map() -> dict[int, int]:
@@ -185,6 +196,9 @@ class TeardownResult:
     signalled: list[int] = field(default_factory=list)
     exited: list[int] = field(default_factory=list)
     survivors: list[int] = field(default_factory=list)
+    #: Re-parented descendant PIDs this teardown reaped (``waitpid``) so they do
+    #: not linger as zombie children of the broker (ADR 0024, Linux subreaper).
+    reaped: list[int] = field(default_factory=list)
     duration: float = 0.0
 
     def ok(self) -> bool:
@@ -198,6 +212,7 @@ class TeardownResult:
             "signalled": sorted(self.signalled),
             "exited": sorted(self.exited),
             "survivors": sorted(self.survivors),
+            "reaped": sorted(self.reaped),
             "duration": round(self.duration, 3),
         }
 
@@ -233,6 +248,83 @@ def _killpg(pgid: int, sig: int) -> None:
         log.warning("killpg %s of pgid %s failed: %s", sig, pgid, exc)
 
 
+def reap_reparented(
+    pids: Iterable[int],
+    *,
+    broker_pid: int,
+    skip: Iterable[int] | None = None,
+) -> list[int]:
+    """Reap zombie descendants re-parented to the broker (ADR 0024, Linux).
+
+    When the broker is a child subreaper (``PR_SET_CHILD_SUBREAPER``), a runtime
+    descendant that outlives its parent re-parents to the broker; once killed it
+    becomes a zombie child of the broker that nobody waits on, so a long-running
+    broker that churns such runtimes accumulates zombies without bound.
+
+    This ``waitpid(pid, WNOHANG)``\\ s **only** the given PIDs whose *current*
+    parent is the broker and that are not in ``skip`` — never ``waitpid(-1)``,
+    which would steal exit statuses from asyncio's child watcher for the runtime
+    main processes the broker spawned (``skip`` carries those). A no-op off Linux
+    (no subreaper re-parenting there). Returns the PIDs actually reaped.
+    """
+    if not _IS_LINUX:
+        return []
+    skip_set = {int(p) for p in (skip or ())}
+    reaped: list[int] = []
+    for pid in pids:
+        pid = int(pid)
+        if pid <= 0 or pid in skip_set:
+            continue
+        # Only a process whose parent is now THIS broker is a re-parented
+        # descendant we must reap; anything else is not ours to wait on.
+        if _linux_ppid(pid) != broker_pid:
+            continue
+        try:
+            wpid, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            continue  # not our child (already reaped, or never ours)
+        except OSError:  # pragma: no cover - rare
+            continue
+        if wpid == pid:
+            reaped.append(pid)
+    return reaped
+
+
+def broker_zombie_pids(broker_pid: int, *, skip: Iterable[int] | None = None) -> list[int]:
+    """PIDs of zombie processes whose current parent is the broker (ADR 0024).
+
+    Scans ``/proc`` for ``state == 'Z'`` entries whose ppid is ``broker_pid``,
+    excluding ``skip``. Used by the periodic sweeper to catch any re-parented
+    descendant that became a zombie between teardowns. Empty off Linux.
+    """
+    if not _IS_LINUX or not os.path.isdir("/proc"):
+        return []
+    skip_set = {int(p) for p in (skip or ())}
+    out: list[int] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:  # pragma: no cover - defensive
+        return out
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid in skip_set:
+            continue
+        state, ppid = _linux_proc_state_ppid(pid)
+        if state == "Z" and ppid == broker_pid:
+            out.append(pid)
+    return out
+
+
+def reap_broker_zombies(broker_pid: int, *, skip: Iterable[int] | None = None) -> list[int]:
+    """Find and reap the broker's re-parented zombie children (ADR 0024 sweeper)."""
+    zombies = broker_zombie_pids(broker_pid, skip=skip)
+    if not zombies:
+        return []
+    return reap_reparented(zombies, broker_pid=broker_pid, skip=skip)
+
+
 def terminate_tree(
     *,
     main_pid: int | None,
@@ -245,6 +337,7 @@ def terminate_tree(
     force_check: Callable[[], bool] | None = None,
     alias: str = "",
     backend: str = "",
+    asyncio_child_pid: int | None = None,
 ) -> TeardownResult:
     """Synchronously tear down a runtime's whole tree, identity-gated.
 
@@ -254,10 +347,17 @@ def terminate_tree(
     passes, or ``force_check`` returns True (a second shutdown signal).
     ``sigkill_only`` skips straight to ``SIGKILL``. Always run via
     ``asyncio.to_thread`` — it sleeps, so it must not run on the event loop.
+
+    After the tree is down, descendants that re-parented to the broker (Linux
+    subreaper) are reaped so they do not linger as zombie children (ADR 0024).
+    ``asyncio_child_pid`` (the supervisor's own ``asyncio.subprocess`` PID) is
+    never reaped here — asyncio's child watcher owns it.
     """
     start = time.monotonic()
     descendants = dict(descendants or {})
     result = TeardownResult(alias=alias)
+    broker_pid = os.getpid()
+    reap_skip: set[int] = {asyncio_child_pid} if asyncio_child_pid is not None else set()
 
     # Identity gate the recorded main process: a mismatch means its PID was
     # recycled, so neither it nor its (possibly reused) process group is ours.
@@ -293,8 +393,19 @@ def terminate_tree(
             targets.add(pid)
 
     targets = {p for p in targets if p > 0}
+
+    def _reap() -> None:
+        # Reap re-parented descendants (never the asyncio-owned main). Only runs
+        # on Linux; a no-op elsewhere. The caller has already polled the tree to
+        # death, so the main is a zombie and any surviving children have already
+        # re-parented to the broker, which is when their ppid becomes reapable.
+        reaped = reap_reparented(targets, broker_pid=broker_pid, skip=reap_skip)
+        if reaped:
+            result.reaped.extend(p for p in reaped if p not in result.reaped)
+
     alive_targets = {p for p in targets if not _dead(p)}
     if not alive_targets:
+        _reap()
         result.duration = time.monotonic() - start
         result.exited = sorted(targets)
         if result.outcome != "identity_mismatch":
@@ -328,6 +439,7 @@ def terminate_tree(
             grace_deadline = min(grace_deadline, hard_deadline)
         remaining = _poll_until_gone(grace_deadline)
         if not remaining:
+            _reap()
             result.outcome = "signalled"
             result.exited = sorted(alive_targets)
             result.duration = time.monotonic() - start
@@ -344,6 +456,7 @@ def terminate_tree(
     if hard_deadline is not None:
         kill_deadline = min(kill_deadline, max(hard_deadline, time.monotonic() + 0.2))
     survivors = _poll_until_gone(kill_deadline)
+    _reap()
     result.survivors = sorted(survivors)
     result.exited = sorted(alive_targets - survivors)
     result.duration = time.monotonic() - start

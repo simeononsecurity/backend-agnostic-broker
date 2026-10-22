@@ -49,11 +49,14 @@ def _load_local_env(path: str = ".env") -> None:
 
 
 class _BoundedServer(uvicorn.Server):
-    """uvicorn server that escalates a second stop signal to force-kill runtimes.
+    """uvicorn server that bounds and escalates the stop path (ADR 0024).
 
-    The first SIGTERM/SIGINT begins a graceful, budget-bounded shutdown (ADR
-    0024). A second one while already stopping tells the manager to SIGKILL every
-    remaining runtime tree immediately instead of waiting out the grace.
+    The first SIGTERM/SIGINT begins a graceful, budget-bounded shutdown: the
+    manager immediately preempts in-progress loads (so a client waiting on a cold
+    load fails fast with a 503 instead of pinning the server open for the whole
+    budget) *concurrently with* uvicorn's own graceful HTTP phase, which is
+    itself capped at a small share of the budget. A second signal while already
+    stopping tells the manager to SIGKILL every remaining runtime tree at once.
     """
 
     def __init__(self, config: uvicorn.Config, app) -> None:
@@ -61,12 +64,28 @@ class _BoundedServer(uvicorn.Server):
         self._broker_app = app
 
     def handle_exit(self, sig, frame) -> None:  # type: ignore[override]
+        manager = getattr(self._broker_app.state, "manager", None)
         if self.should_exit:
             # Already stopping -> this is the second signal: force-kill runtimes.
-            manager = getattr(self._broker_app.state, "manager", None)
             if manager is not None:
                 manager.request_force_shutdown()
+        elif manager is not None:
+            # First signal: start preemption now, before uvicorn waits on any
+            # in-flight request, so a client blocked on a cold load is released.
+            manager.begin_preemption()
         super().handle_exit(sig, frame)
+
+
+def _graceful_share(budget: float) -> int:
+    """uvicorn's graceful HTTP-phase cap: a bounded share of the stop budget.
+
+    The whole stop must fit in ``BROKER_SHUTDOWN_BUDGET_SECONDS``. uvicorn gets at
+    most ``min(10 s, budget / 3)`` to drain open requests/streams, leaving the
+    rest of the budget for runtime SIGTERM grace; load-waiting requests are
+    already released by the manager's first-signal preemption (ADR 0024).
+    """
+    share = min(10.0, budget / 3.0)
+    return max(1, int(math.ceil(share)))
 
 
 def main() -> None:
@@ -77,9 +96,10 @@ def main() -> None:
     # can be found and reaped at teardown.
     set_child_subreaper()
     app = create_app(settings)
-    # Bound uvicorn's graceful phase by the shutdown budget so an open request or
-    # stream cannot hold up shutdown past the budget (ADR 0024).
-    graceful = max(1, int(math.ceil(settings.shutdown_budget_seconds)))
+    # Bound uvicorn's graceful phase to a small share of the shutdown budget so an
+    # open request or stream cannot hold up shutdown; the manager preempts
+    # load-waiting requests on the first signal (ADR 0024).
+    graceful = _graceful_share(settings.shutdown_budget_seconds)
     config = uvicorn.Config(
         app,
         host=settings.host,

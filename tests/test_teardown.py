@@ -22,7 +22,10 @@ from broker.config import Settings
 from broker.registry import BackendType, ModelEntry
 from broker.teardown import (
     TeardownResult,
+    broker_zombie_pids,
     enumerate_descendants,
+    reap_broker_zombies,
+    reap_reparented,
     set_child_subreaper,
     terminate_tree,
 )
@@ -164,3 +167,65 @@ async def test_adopted_stop_does_not_block_the_event_loop():
         except (ProcessLookupError, PermissionError):
             pass
         proc.wait()
+
+
+_LINUX = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="subreaper re-parenting + /proc zombie reaping are Linux-only",
+)
+
+
+def test_teardown_result_reaped_in_dict():
+    r = TeardownResult(alias="m", outcome="killed", reaped=[7, 3])
+    assert r.to_dict()["reaped"] == [3, 7]  # sorted
+
+
+def test_reap_reparented_is_noop_for_foreign_pid():
+    # A no-op on a PID whose parent is not this process (e.g. init): never raises,
+    # never reaps something that is not ours.
+    assert reap_reparented([1], broker_pid=os.getpid()) == []
+    assert reap_reparented([], broker_pid=os.getpid()) == []
+
+
+@_LINUX
+def test_reap_reparented_reaps_a_broker_zombie_child():
+    # A direct child that exits without being waited on becomes a zombie child of
+    # this process; reap_reparented must waitpid exactly it (ppid == us).
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - child
+        os._exit(0)
+    for _ in range(100):
+        if rid.process_is_zombie(pid):
+            break
+        time.sleep(0.01)
+    assert pid in broker_zombie_pids(os.getpid())
+    # A PID in the skip set is never reaped (it models the asyncio-owned main).
+    assert reap_reparented([pid], broker_pid=os.getpid(), skip={pid}) == []
+    # Reaping it returns the pid, and a second reap is a harmless no-op (ECHILD).
+    assert reap_reparented([pid], broker_pid=os.getpid()) == [pid]
+    assert reap_reparented([pid], broker_pid=os.getpid()) == []
+    assert pid not in broker_zombie_pids(os.getpid())
+
+
+@_LINUX
+def test_reap_broker_zombies_sweeps_all_reparented_children():
+    pids = []
+    for _ in range(3):
+        p = os.fork()
+        if p == 0:  # pragma: no cover - child
+            os._exit(0)
+        pids.append(p)
+    for p in pids:
+        for _ in range(100):
+            if rid.process_is_zombie(p):
+                break
+            time.sleep(0.01)
+    # Skip one (models a live runtime the broker spawned): the sweeper leaves it.
+    reaped = reap_broker_zombies(os.getpid(), skip={pids[0]})
+    # Every non-skipped forked child was reaped (the sweep may also clean up other
+    # leaked zombie children of this process, so assert a subset, not equality).
+    assert set(pids[1:]) <= set(reaped)
+    assert pids[0] not in reaped
+    assert pids[0] in broker_zombie_pids(os.getpid())
+    # Clean up the skipped one so the test process leaves no zombie behind.
+    os.waitpid(pids[0], 0)

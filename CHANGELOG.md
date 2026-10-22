@@ -13,18 +13,29 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   descendant tree, fixing three stop-path defects seen on a production canary and
   reproduced locally (same on v0.6.0 and the v0.7.0 RC):
   - `SIGTERM` **during an in-progress load** no longer waits for the load to finish
-    (was up to ~97 s): shutdown now **cancels** the load, kills the spawning
-    runtime, and the model goes to `UNLOADED`. `ManagedModel.stop()` no longer waits
-    unbounded on `load_lock`.
+    (was up to ~97 s): the **first** stop signal **cancels** the load *before*
+    uvicorn's graceful phase, kills the spawning runtime, and the model goes to
+    `UNLOADED`. `ManagedModel.stop()` no longer waits unbounded on `load_lock`. A
+    client request waiting on that cold load fails fast with a typed **503
+    `shutting_down`** (with `Retry-After`) instead of hanging until the budget
+    expires. uvicorn's graceful HTTP phase is now capped at `min(10 s, budget/3)` and
+    the whole stop is drawn from one deadline stamped at the first signal, so the
+    total stays within the budget.
   - An **escaped `setsid` runtime descendant** (e.g. a GPU worker in a new session)
     is no longer left holding device memory after the broker exits: descendants are
     recorded while the runtime lives (Linux `/proc` + child-subreaper; a periodic
     argv-only `ps` snapshot elsewhere) and the kill set is the process group **plus
     every recorded descendant**, each identity-gated (PID + start time).
+  - **Re-parented descendants no longer accumulate as zombies.** On Linux the broker
+    is a child subreaper, so a descendant that outlives its runtime re-parents to the
+    broker; after teardown those are now **reaped** (`waitpid(WNOHANG)` on only the
+    specific kill-set PIDs whose parent is the broker — never `waitpid(-1)`), both
+    inline in `terminate_tree` (after an eviction/unload/shutdown) and periodically in
+    the idle sweeper. Previously repeated evictions left zombie children behind.
   - A runtime that ignores `SIGTERM` is now bounded by a total budget instead of
     only a per-runtime grace: adopted-runtime termination moved off the event loop
     (no longer blocks the loop during the grace), and uvicorn runs with
-    `timeout_graceful_shutdown` taken from the budget.
+    `timeout_graceful_shutdown` bounded by the budget.
 
 ### Added
 
@@ -35,8 +46,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shutdown escalates immediately to SIGKILL of every runtime tree.
 - Per-stop teardown telemetry: `broker_runtime_teardown_total{outcome}` counter and
   `broker_runtime_teardown_duration_seconds` histogram; the teardown result
-  (signalled / exited / survivors / duration) is logged and surfaced through
+  (signalled / exited / survivors / reaped / duration) is logged and surfaced through
   `survived_kill` / `release_stuck` in `/status` while survivors exist.
+- New typed error `shutting_down` (HTTP **503**, with `Retry-After`): returned to a
+  client whose request was waiting on a model load the broker cancelled while stopping.
 
 ### Changed
 
