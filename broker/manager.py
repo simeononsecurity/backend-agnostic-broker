@@ -117,6 +117,7 @@ from .leases import (
     cleanup_leases,
     incompatible_holders,
     run_lease_hook,
+    validate_hook_command,
 )
 from .ledger import LedgerOwnerLock, LockOwner, RuntimeLedger, RuntimeRecord, argv_hash
 from .lifecycle import LifecycleMachine, State
@@ -982,6 +983,27 @@ class ModelManager:
         return self.last_reconciliation
 
     # --- device leases (ADR 0026) ----------------------------------------
+    def validate_lease_hooks(self) -> None:
+        """Startup: warn (naming the setting) if a lease hook can't be parsed.
+
+        Called once at startup when leases are enabled. A malformed hook string
+        still fails the load closed with ``device_busy`` at runtime (correct); this
+        just surfaces *which* setting is wrong up front instead of leaving the
+        operator to infer it from a runtime ``device_busy``.
+        """
+        if self.leases is None or not self.leases.enabled:
+            return
+        validate_hook_command(
+            self.settings.lease_acquire_command,
+            setting="BROKER_LEASE_ACQUIRE_COMMAND",
+            allowed_exec_dirs=self.settings.allowed_exec_dirs,
+        )
+        validate_hook_command(
+            self.settings.lease_release_command,
+            setting="BROKER_LEASE_RELEASE_COMMAND",
+            allowed_exec_dirs=self.settings.allowed_exec_dirs,
+        )
+
     async def cleanup_stale_leases(self) -> dict[str, Any]:
         """Remove stale device leases (dead broker + dead runtime) and update metrics.
 

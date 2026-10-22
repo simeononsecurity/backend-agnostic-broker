@@ -335,6 +335,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         manager.note_event_loop()
         # Remove stale device leases before serving (ADR 0026). No-op when leases
         # are off; otherwise a forced-kill's stale lease is cleared at startup too.
+        manager.validate_lease_hooks()
         await manager.cleanup_stale_leases()
         await manager.start_sweeper()
         await manager.start_health_probe()

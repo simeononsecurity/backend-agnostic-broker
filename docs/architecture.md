@@ -272,13 +272,15 @@ shutdown → teardown → release → lease-drop**:
 - **Acquire** happens inside the atomic admission step, **before** spawn, so a
   device is never double-booked (see the request flow above); the runtime
   identity is stamped onto the lease once the load succeeds.
-- **Release** is driven by one decision — "is the runtime gone?" — computed by
-  `ManagedModel.lease_released()` (today the measured-release signal
-  `adapter.last_release_ok()`; ADR 0024's richer bounded-teardown result is wired
-  in here by the integration card). On teardown the broker **first** confirms the
-  process group is gone and memory released, **then** drops the lease and fires
-  the release hook. If the runtime survives, the lease is marked `stuck` and the
-  sweeper clears it once the survivors exit.
+- **Release** is driven by one decision — "is the runtime gone?" — made on the
+  stop path (`ManagedModel.stop()`): the lease is released **only when ADR 0024's
+  bounded teardown reports no survivors AND measured release passed**
+  (`result.ok()` and `adapter.last_release_ok()`). On teardown the broker **first**
+  tears down the whole descendant tree and confirms memory released, **then** drops
+  the lease and fires the release hook. If the runtime (or an escaped descendant)
+  survives, the lease is marked `stuck` and the sweeper / `python -m broker cleanup`
+  clears it once the survivors exit — the device is never handed to a co-tenant
+  while something still holds it.
 
 Stale leases (broker dead **and** runtime gone) are removed at startup (before
 serving), by the periodic sweeper, and by the one-shot `python -m broker cleanup`

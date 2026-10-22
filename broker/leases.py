@@ -50,6 +50,7 @@ from typing import Any
 
 from . import runtime_identity as rid
 from .security import validate_executable
+from .teardown import terminate_tree
 
 log = logging.getLogger("broker.leases")
 
@@ -421,6 +422,45 @@ def run_lease_hook(
 # --- stale/orphan cleanup (shared by startup, the sweeper, and the CLI) ---------
 
 
+def validate_hook_command(
+    command: str | None,
+    *,
+    setting: str,
+    allowed_exec_dirs: list[str],
+) -> bool:
+    """Startup check: warn (naming ``setting``) if ``command`` can't be parsed.
+
+    A lease hook is a **single argv-template string** (e.g.
+    ``/abs/hook acquire {device} {mode} {holder}``), whitespace-split with
+    ``shlex`` — *not* a JSON list. If it can't be parsed into an allow-listed
+    argv, a load that needs the hook fails closed with ``device_busy`` (correct);
+    this logs a clear warning **naming the exact setting** so the operator can see
+    which one is malformed instead of only seeing a runtime ``device_busy``.
+    Returns ``True`` when the command is empty or valid. Never raises.
+    """
+    if not command or not str(command).strip():
+        return True
+    import shlex
+
+    try:
+        tokens = shlex.split(str(command))
+        if not tokens:
+            log.warning("%s is set but empty after parsing; no hook will run", setting)
+            return False
+        validate_executable(tokens[0], allowed_exec_dirs)
+    except Exception as exc:  # noqa: BLE001 - a bad hook config must not crash startup
+        log.warning(
+            "%s is not a parseable argv command string (%s): %r — a load that needs "
+            "this hook will fail closed with device_busy. It must be a single string "
+            "like '/abs/hook acquire {device} {mode} {holder}', not a JSON list.",
+            setting,
+            exc,
+            command,
+        )
+        return False
+    return True
+
+
 def cleanup_leases(
     store: DeviceLeaseStore,
     *,
@@ -436,7 +476,11 @@ def cleanup_leases(
     * **stale** holder (broker dead AND runtime gone) → dropped.
     * **orphan** holder (broker dead, runtime alive) → kept and marked
       ``orphaned`` unless ``kill_orphans`` (the ``stop``-mode / ExecStopPost
-      path), which terminates the runtime **identity-gated** then drops it.
+      path), which tears the runtime down **identity-gated and descendant-aware**
+      (ADR 0024 ``terminate_tree`` — the process group *plus* escaped ``setsid``
+      descendants found by a ppid scan) then drops it; a holder whose teardown
+      leaves **survivors** is kept and marked ``stuck`` so the device is not
+      handed to a co-tenant while something still holds it.
     * a holder whose **broker is alive** (a live broker owns the lease) is left
       untouched.
     * an **external** holder is never signalled and never dropped.
@@ -449,6 +493,7 @@ def cleanup_leases(
         "removed": [],
         "killed": [],
         "orphaned": [],
+        "stuck": [],
         "kept": [],
         "external": [],
         "skipped": [],
@@ -468,6 +513,7 @@ def cleanup_leases(
                 allowed_exec_dirs=dirs,
                 hook_timeout=hook_timeout,
                 kill_grace=kill_grace,
+                deadline=deadline,
                 summary=summary,
             )
         except Exception as exc:  # noqa: BLE001 - one bad lease never aborts cleanup
@@ -485,6 +531,7 @@ def _cleanup_one(
     allowed_exec_dirs: list[str],
     hook_timeout: float,
     kill_grace: float,
+    deadline: float | None = None,
     summary: dict[str, Any],
 ) -> None:
     with store.locked(lease.device):
@@ -505,17 +552,40 @@ def _cleanup_one(
             # Broker dead from here on.
             if holder_runtime_alive(h):
                 if kill_orphans:
-                    status = rid.terminate_process_group(
-                        h.runtime_pid,  # type: ignore[arg-type]
-                        h.runtime_pgid,
-                        h.runtime_start_time,
+                    # ADR 0024: descendant-aware, identity-gated teardown — the
+                    # process group PLUS an escaped ``setsid`` child found by the
+                    # ppid scan, not just the recorded pgid. A lease is freed only
+                    # when teardown leaves no survivors (ADR 0026); survivors keep
+                    # the holder and mark it ``stuck``.
+                    result = terminate_tree(
+                        main_pid=h.runtime_pid,
+                        main_start_time=h.runtime_start_time,
+                        pgid=h.runtime_pgid,
                         grace=kill_grace,
+                        hard_deadline=deadline,
+                        alias=f"lease:{fresh.device}",
                     )
-                    summary["killed"].append(
-                        {"device": fresh.device, "pid": h.runtime_pid, "status": status}
-                    )
-                    freed = True
-                    # runtime terminated → drop the holder.
+                    if result.survivors:
+                        h.state = STATE_STUCK
+                        surviving.append(h)
+                        summary["stuck"].append(
+                            {
+                                "device": fresh.device,
+                                "pid": h.runtime_pid,
+                                "survivors": result.survivors,
+                            }
+                        )
+                    else:
+                        summary["killed"].append(
+                            {
+                                "device": fresh.device,
+                                "pid": h.runtime_pid,
+                                "status": result.outcome,
+                                "reaped": result.reaped,
+                            }
+                        )
+                        freed = True
+                        # runtime terminated → drop the holder.
                 else:
                     h.state = STATE_ORPHANED
                     surviving.append(h)

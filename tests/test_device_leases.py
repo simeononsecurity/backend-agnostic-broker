@@ -29,6 +29,7 @@ from broker.leases import (
     holder_is_orphan,
     holder_is_stale,
     incompatible_holders,
+    validate_hook_command,
 )
 from broker.lifecycle import State
 from broker.manager import ModelManager
@@ -326,3 +327,40 @@ async def test_stale_lease_reaped_by_sweeper(tmp_path):
         assert mgr.leases.read("0") is None
     finally:
         await mgr.shutdown()
+
+
+# Hook-command validation (ADR 0026, comment 94): a hook is a single argv-template
+# string, not a JSON list; a malformed one is warned at startup naming the setting.
+def test_validate_hook_command_accepts_valid_single_string(tmp_path):
+    hook = tmp_path / "acquire.sh"
+    hook.write_text("#!/bin/sh\nexit 0\n")
+    hook.chmod(0o755)
+    cmd = f"{hook} {{device}} {{mode}} {{holder}}"
+    assert (
+        validate_hook_command(
+            cmd, setting="BROKER_LEASE_ACQUIRE_COMMAND", allowed_exec_dirs=[str(tmp_path)]
+        )
+        is True
+    )
+
+
+def test_validate_hook_command_empty_is_ok(tmp_path):
+    assert (
+        validate_hook_command(
+            None, setting="BROKER_LEASE_ACQUIRE_COMMAND", allowed_exec_dirs=[str(tmp_path)]
+        )
+        is True
+    )
+
+
+def test_validate_hook_command_json_list_is_warned_naming_setting(tmp_path, caplog):
+    # A value written as a JSON list (the mistake that cost a probe rerun): the
+    # first token '["/bin/true",' is not an allow-listed executable, so it is
+    # rejected and the warning names the setting.
+    bad = '["/bin/true", "{device}"]'
+    with caplog.at_level("WARNING"):
+        ok = validate_hook_command(
+            bad, setting="BROKER_LEASE_ACQUIRE_COMMAND", allowed_exec_dirs=[str(tmp_path)]
+        )
+    assert ok is False
+    assert "BROKER_LEASE_ACQUIRE_COMMAND" in caplog.text

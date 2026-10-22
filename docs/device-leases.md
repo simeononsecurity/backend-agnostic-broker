@@ -133,14 +133,25 @@ at broker startup (before serving) and in the periodic sweeper.
 
 ## Hooks
 
-`BROKER_LEASE_ACQUIRE_COMMAND` and `BROKER_LEASE_RELEASE_COMMAND` are argv
-templates with `{device}` `{mode}` `{holder}` placeholders, run (no shell) when a
-lease is acquired/released — e.g. to pause and resume a co-tenant without the
-broker depending on any external tool. The executable must resolve inside
-`BROKER_ALLOWED_EXEC_DIRS`; calls are bounded by
-`BROKER_LEASE_HOOK_TIMEOUT_SECONDS`. A failed **acquire** hook fails the load
-with `device_busy`; a failed **release** hook is logged and retried by the
-sweeper. A worked example lives in
+`BROKER_LEASE_ACQUIRE_COMMAND` and `BROKER_LEASE_RELEASE_COMMAND` are each a
+**single argv-template string** — whitespace/`shlex`-split, **not** a JSON list —
+with `{device}` `{mode}` `{holder}` placeholders, e.g.:
+
+```ini
+BROKER_LEASE_ACQUIRE_COMMAND=/opt/leasehooks/acquire.sh {device} {mode} {holder}
+BROKER_LEASE_RELEASE_COMMAND=/opt/leasehooks/release.sh {device} {mode} {holder}
+```
+
+The first token is the executable (it must resolve inside
+`BROKER_ALLOWED_EXEC_DIRS`); the hooks run (no shell) when a lease is
+acquired/released — e.g. to pause and resume a co-tenant without the broker
+depending on any external tool. Calls are bounded by
+`BROKER_LEASE_HOOK_TIMEOUT_SECONDS`. A failed — or **unparseable** — **acquire**
+hook fails the load closed with `device_busy`; at startup the broker logs a
+warning **naming the exact setting** it could not parse (so a malformed value
+written as a JSON list, say, is obvious rather than surfacing only as a runtime
+`device_busy`). A failed **release** hook is logged and retried by the sweeper. A
+worked example lives in
 [`examples/device-leases/`](../examples/device-leases/).
 
 ## Visibility

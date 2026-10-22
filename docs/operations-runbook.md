@@ -35,9 +35,16 @@ TimeoutStopSec=60
 # SIGTERM the broker; let IT tear down runtimes. systemd SIGKILLs the whole
 # control group only if the broker overruns TimeoutStopSec.
 KillMode=mixed
-# A stale-lease cleanup ExecStopPost hook is added by ADR 0026.
+# Always runs, even after a forced kill: free any device lease for a co-tenant
+# within seconds (descendant-aware, identity-gated; no-op when leases are off).
+ExecStopPost=/usr/bin/python -m broker cleanup
+# Device leases are opt-in; set these only if you use them (see device-leases.md).
+Environment=BROKER_DEVICE_LEASES=on
+Environment=BROKER_RUNTIME_RECONCILE=stop
 Restart=on-failure
 ```
+
+This is the single recommended unit; the device-leases section refers back to it.
 
 A second `systemctl stop` (or `SIGTERM`/`SIGINT`) while the broker is already
 stopping escalates immediately to SIGKILL of every runtime group and descendant.
@@ -213,27 +220,19 @@ rules.
   ```
   It is bounded (≤ 20 s), runs no server, prints a JSON summary, and exits 0/1.
 
-### systemd unit (recommended)
+### systemd unit
 
-Give the broker a stop timeout comfortably above the teardown budget, kill the
-whole control group, and run the lease cleanup as a post-stop step so a hard kill
-still frees the device for a co-tenant:
+Use the single recommended unit from
+[Bounded teardown & the service manager](#bounded-teardown--the-service-manager-adr-0024)
+above — it already sets `TimeoutStopSec` ≥ budget + 15 s, `KillMode=mixed`, and an
+`ExecStopPost=/usr/bin/python -m broker cleanup` that frees any held device lease
+for a co-tenant even after a forced kill, plus the opt-in `BROKER_DEVICE_LEASES=on`
+/ `BROKER_RUNTIME_RECONCILE=stop` environment.
 
-```ini
-[Service]
-ExecStart=/usr/bin/python -m broker
-# Allow bounded teardown (ADR 0024) to finish before systemd escalates.
-TimeoutStopSec=60
-# Reap the whole process group, including escaped runtime descendants.
-KillMode=mixed
-# Always runs, even after a forced kill: free the device for co-tenants.
-ExecStopPost=/usr/bin/python -m broker cleanup
-Environment=BROKER_DEVICE_LEASES=on
-Environment=BROKER_RUNTIME_RECONCILE=stop
-```
-
-- `stop` mode terminates a live orphan runtime **identity-gated** then releases
-  its lease; `report`/`adopt`/`off` keep it and mark it `orphaned`.
+- `stop` mode terminates a live orphan runtime **identity-gated and
+  descendant-aware** (the process group plus an escaped `setsid` child) then
+  releases its lease; `report`/`adopt`/`off` keep it and mark it `orphaned`. A
+  teardown that leaves survivors keeps the lease and marks it `stuck`.
 - An **external** holder is never signalled or removed — only its own owner
   manages its lease.
 
