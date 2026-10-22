@@ -6,6 +6,38 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Host-local device leases (ADR 0026; opt-in, `BROKER_DEVICE_LEASES=off` by
+  default).** When on, the broker records one lease file per device it uses under
+  `BROKER_DEVICE_LEASE_DIR` (default `<cache_dir>/leases`; atomic + `flock`,
+  world-readable) so co-tenant workloads get a reliable, readable "device N is in
+  use" signal, `gpu.exclusive` models are admitted safely, and a forced stop can
+  be cleaned up promptly.
+  - **Exclusive admission.** New registry field `gpu.exclusive`. An exclusive
+    model evicts an idle broker holder on its device under the normal policy but
+    fails fast with **503** `device_busy` + `Retry-After` against a busy broker
+    holder or any **external** holder — which is never signalled or evicted.
+    Leases are acquired inside the atomic admission step **before** spawn and
+    released only once teardown + measured release confirm the runtime is gone
+    (otherwise marked `stuck` for the sweeper).
+  - **Stale/forced-stop cleanup.** Stale leases (broker dead **and** runtime gone)
+    are removed at startup, by the sweeper, and by a new one-shot
+    `python -m broker cleanup` (bounded, no server, JSON summary, exit 0/1) meant
+    for systemd `ExecStopPost=`. In `stop` mode it reaps a live orphan runtime
+    **identity-gated** then releases; `report` keeps it `orphaned` and signals
+    nothing. The lease file format is a documented, versioned interface; external
+    holders may publish their own `external` lease.
+  - **Hooks** `BROKER_LEASE_ACQUIRE_COMMAND` / `BROKER_LEASE_RELEASE_COMMAND`
+    (argv templates with `{device}` `{mode}` `{holder}`, allow-listed, no shell,
+    bounded by `BROKER_LEASE_HOOK_TIMEOUT_SECONDS`) run on acquire/release and on a
+    stale release by `cleanup`.
+  - `GET /status` gains a `leases` block; Prometheus gains
+    `broker_device_leases{state}`, `broker_device_lease_stale_cleanups_total`, and
+    `broker_device_lease_hook_failures_total{phase}`. See
+    [docs/device-leases.md](docs/device-leases.md). Default off is byte-for-byte
+    the previous release (no lease directory is created).
+
 ### Fixed
 
 - **`gpu.required` / `gpu.device_ids` are now enforced in every production adapter
@@ -41,7 +73,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - setting `gpu.required: true` on an **external** OpenAI-compatible endpoint (no
     `startup_command`, non-Ollama) the broker cannot verify is now a **startup
     configuration error** unless the entry also sets the new `gpu.verify: declared`
-    (shown as `declared` in `/status`).
+    (shown as `declared` in `/status`). `gpu.verify: declared` is scoped to those
+    external entries: it is **rejected** (startup config error) on any backend the
+    broker can verify (managed/Ollama) so it can never silently disable
+    enforcement.
 
   Models **without** `gpu.required` are unchanged. New settings
   `BROKER_GPU_DEVICES` and `BROKER_GPU_VERIFY_SECONDS`, the registry value

@@ -523,6 +523,18 @@ broker reconciles that ledger against the live process table. See
 | `BROKER_RUNTIME_RECONCILE` | str | `report` | Startup action for recorded runtimes: `off` (ignore the ledger), `report` (list still-alive, identity-matched runtimes as `orphaned` in `/status`; never signal/adopt — **default**, silent on a fresh/empty ledger), `adopt` (if alive with matching identity + argv + readiness, mark the model READY without spawning), or `stop` (`SIGTERM`→grace→`SIGKILL` the recorded process group, then clear). In **every** mode a PID whose recorded start time no longer matches is dropped as stale and never signalled; a process the broker did not record is never touched. |
 | `BROKER_RUNTIME_PORT_PRECHECK` | bool | `true` | Before spawning a broker-managed runtime, fail fast with a clear error if the target port (from the registry `base_url`) is already bound, instead of a confusing readiness timeout. Non-loading TCP connect probe only. |
 
+### Host-local device leases (ADR 0026)
+
+Opt-in (`BROKER_DEVICE_LEASES=off` by default). When on, the broker records one lease file per device it uses so co-tenant workloads get a reliable, readable "device N is in use" signal, admits `gpu.exclusive` models safely, and can clean up a forced stop from `ExecStopPost=`. See [device-leases.md](device-leases.md) for the file format, the exclusive-admission rules, and `python -m broker cleanup`.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `BROKER_DEVICE_LEASES` | str | `off` | `off` (default; byte-for-byte the previous release — no lease dir, nothing read/written) or `on`. |
+| `BROKER_DEVICE_LEASE_DIR` | str | `<cache_dir>/leases` | Directory holding the per-device lease files (`device-<key>.lease.json`). World-readable, owner-writable so a co-tenant/external holder can read them and write `external` leases. |
+| `BROKER_LEASE_ACQUIRE_COMMAND` | str | _(unset)_ | Optional hook run on lease acquire. Argv template with `{device}` `{mode}` `{holder}`; the executable must resolve inside `BROKER_ALLOWED_EXEC_DIRS`; no shell. A failed acquire hook fails the load with `device_busy`. |
+| `BROKER_LEASE_RELEASE_COMMAND` | str | _(unset)_ | Optional hook run on lease release (including a stale release by `cleanup`). Same template/allow-list rules. A failed release hook is logged and retried by the sweeper. |
+| `BROKER_LEASE_HOOK_TIMEOUT_SECONDS` | float | `10.0` | Per-hook subprocess timeout. |
+
 **One broker per `BROKER_CACHE_DIR`.** The ledger assumes a single owning broker.
 At startup each broker takes an exclusive, lifetime lock on
 `<cache_dir>/runtime-ledger.owner.lock`. If a *live* sibling broker already owns it

@@ -210,6 +210,12 @@ models:
       required: true
       device_ids: [0]
       layer_split: "99"
+      # Take an EXCLUSIVE device lease when loaded (ADR 0026; needs
+      # BROKER_DEVICE_LEASES=on). The model refuses to co-reside on device 0: an
+      # idle broker model there is evicted, but a busy broker model or an external
+      # holder makes the load fail with 503 device_busy + Retry-After. Other
+      # models take a shared lease. See docs/device-leases.md.
+      exclusive: true
 
   # ---- llama.cpp (broker-managed process; model loads at startup) -----------
   - alias: qwen-llamacpp

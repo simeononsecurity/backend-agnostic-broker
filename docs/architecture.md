@@ -120,7 +120,13 @@ auto/cascade — `/v1/embeddings` and `/v1/rerank`):
      OOMing. The broker never resets a GPU or kills a foreign process.
    - **Count limit** (v0.6.0): the LRU idle model is unloaded if
      `max_loaded_models` is reached (raises `ConcurrencyLimitError` if nothing can
-     be evicted).
+     be evicted). An already-resident member holds its own slot and skips this step.
+   - **Device-lease admission** (ADR 0026, opt-in `BROKER_DEVICE_LEASES=on`): the
+     model's devices are leased **before spawn**, inside the same atomic admission
+     step. A `gpu.exclusive` model takes an `exclusive` lease; others take a
+     `shared` lease. An incompatible idle broker holder is evicted under the policy
+     above; a busy broker holder or any **external** holder fails the load with
+     `device_busy` (503 + `Retry-After`), and an external holder is never signalled.
    - **Port pre-check + ledger record, then spawn** (ADR 0021): before starting a
      broker-managed runtime, `_port_precheck` fails fast (naming the port) if the
      target port is already bound (`BROKER_RUNTIME_PORT_PRECHECK`, default on); after
@@ -225,6 +231,37 @@ PID in the `resources` block like any other holder. Its provenance is visible in
 `reconciliation.last` summary (`adopted` list, alongside `stopped`, `orphaned`,
 `stale`, and `owned_by_live_broker`). A model reported (not adopted) by a sibling
 broker in `report` mode is **not** counted by that broker at all.
+
+## Device leases (ADR 0026)
+
+Opt-in (`BROKER_DEVICE_LEASES=on`). The broker keeps one lease file per device it
+uses under `BROKER_DEVICE_LEASE_DIR` (atomic + flock, world-readable), reusing the
+runtime-identity and owner-lock machinery of ADR 0021. Leases give co-tenants a
+readable device-occupancy signal, enforce `gpu.exclusive` admission, and let a
+forced stop be cleaned up from `ExecStopPost=`.
+
+The lease lifecycle follows a single ordering, **acquire → spawn → … →
+shutdown → teardown → release → lease-drop**:
+
+- **Acquire** happens inside the atomic admission step, **before** spawn, so a
+  device is never double-booked (see the request flow above); the runtime
+  identity is stamped onto the lease once the load succeeds.
+- **Release** is driven by one decision — "is the runtime gone?" — computed by
+  `ManagedModel.lease_released()` (today the measured-release signal
+  `adapter.last_release_ok()`; ADR 0024's richer bounded-teardown result is wired
+  in here by the integration card). On teardown the broker **first** confirms the
+  process group is gone and memory released, **then** drops the lease and fires
+  the release hook. If the runtime survives, the lease is marked `stuck` and the
+  sweeper clears it once the survivors exit.
+
+Stale leases (broker dead **and** runtime gone) are removed at startup (before
+serving), by the periodic sweeper, and by the one-shot `python -m broker cleanup`
+(`ExecStopPost=`). An orphan (broker dead, runtime alive) follows
+`BROKER_RUNTIME_RECONCILE`; an **external** holder is never signalled, evicted, or
+removed. `/status.leases` shows the current holders; Prometheus exposes
+`broker_device_leases{state}`, `broker_device_lease_stale_cleanups_total`, and
+`broker_device_lease_hook_failures_total{phase}`. See
+[device-leases.md](device-leases.md).
 
 ## Security boundaries
 

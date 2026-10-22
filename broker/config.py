@@ -544,6 +544,28 @@ class Settings(BaseSettings):
     # confusing readiness timeout. Non-loading TCP connect probe only.
     runtime_port_precheck: bool = True
 
+    # --- Host-local device leases (ADR 0026; opt-in, default OFF) ---
+    # When "on", the broker records one lease file per device it uses under
+    # device_lease_dir so co-tenant workloads get a reliable, readable "device N
+    # is in use" signal, and so a forced stop can be cleaned up from the service
+    # manager's post-stop step (python -m broker cleanup). Default "off" is
+    # byte-for-byte the previous release: no lease dir is created and nothing is
+    # read or written.
+    device_leases: str = "off"  # "off" | "on"
+    # Directory holding the per-device lease files. Unset => <cache_dir>/leases.
+    # Files are world-readable, owner-writable so an external holder/co-tenant can
+    # read (and, following the documented protocol, write "external" leases).
+    device_lease_dir: str | None = None
+    # Optional operator hooks run on lease acquire/release (and on a stale release
+    # by `cleanup`). Argv templates with {device} {mode} {holder}; the executable
+    # must resolve inside BROKER_ALLOWED_EXEC_DIRS; no shell is used. A failed
+    # acquire hook fails the load (device_busy); a failed release hook is logged
+    # and retried by the sweeper. Unset => no hook.
+    lease_acquire_command: str | None = None
+    lease_release_command: str | None = None
+    # Per-hook subprocess timeout (seconds).
+    lease_hook_timeout_seconds: float = 10.0
+
     # --- Docker / networking hints (documented, used by compose) ---
     docker_network_mode: str = "bridge"
 
@@ -583,6 +605,23 @@ class Settings(BaseSettings):
         if v not in ("off", "report", "adopt", "stop"):
             raise ValueError("runtime_reconcile must be 'off', 'report', 'adopt', or 'stop'")
         return v
+
+    @field_validator("device_leases")
+    @classmethod
+    def _device_leases(cls, v: str) -> str:
+        if v not in ("off", "on"):
+            raise ValueError("device_leases must be 'off' or 'on'")
+        return v
+
+    def leases_enabled(self) -> bool:
+        """True when host-local device leases are turned on (ADR 0026)."""
+        return self.device_leases == "on"
+
+    def device_lease_dir_resolved(self) -> str:
+        """Lease directory: BROKER_DEVICE_LEASE_DIR, else <cache_dir>/leases."""
+        if self.device_lease_dir and str(self.device_lease_dir).strip():
+            return str(self.device_lease_dir).rstrip("/")
+        return f"{self.cache_dir.rstrip('/')}/leases"
 
     @field_validator("gpu_telemetry")
     @classmethod

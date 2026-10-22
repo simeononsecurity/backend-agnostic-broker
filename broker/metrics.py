@@ -62,3 +62,20 @@ QUEUE_WAIT_SECONDS = Histogram(
     "broker_queue_wait_seconds",
     "Time a request spent waiting in the admission queue before admission",
 )
+
+# --- Device leases (ADR 0026) ---
+# New series only; the /metrics endpoint exposure itself is unchanged.
+LEASES_BY_STATE = Gauge(
+    "broker_device_leases",
+    "Current device-lease holders by state (held/releasing/stuck/orphaned/external)",
+    ["state"],
+)
+LEASE_STALE_CLEANUPS = Counter(
+    "broker_device_lease_stale_cleanups_total",
+    "Device leases removed by stale/orphan cleanup (startup, sweeper, or CLI)",
+)
+LEASE_HOOK_FAILURES = Counter(
+    "broker_device_lease_hook_failures_total",
+    "Lease acquire/release hook invocations that failed, by phase",
+    ["phase"],
+)

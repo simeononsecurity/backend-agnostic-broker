@@ -160,6 +160,49 @@ reconciles it on the next startup.
 - Reconciliation is **per host**: give each replica its own `BROKER_CACHE_DIR`.
 - Full procedure: [`guides/restart-and-recovery.md`](guides/restart-and-recovery.md).
 
+## Device leases + forced-stop cleanup (ADR 0026) — opt-in
+
+With `BROKER_DEVICE_LEASES=on` the broker records one lease file per device it
+uses under `BROKER_DEVICE_LEASE_DIR` (default `<cache_dir>/leases`) so co-tenant
+workloads see device occupancy, `gpu.exclusive` models are admitted safely, and a
+forced stop can be cleaned up promptly. See
+[device-leases.md](device-leases.md) for the file format and exclusive-admission
+rules.
+
+- Inspect current leases: `curl -s localhost:8080/status | jq '.leases'`.
+- A forced stop can leave a lease whose owning broker is dead. Run the one-shot
+  cleanup to free the device within seconds (it also runs at startup and in the
+  sweeper):
+  ```bash
+  python -m broker cleanup            # stop-mode reap per BROKER_RUNTIME_RECONCILE
+  python -m broker cleanup --report   # never kill an orphan; only report
+  ```
+  It is bounded (≤ 20 s), runs no server, prints a JSON summary, and exits 0/1.
+
+### systemd unit (recommended)
+
+Give the broker a stop timeout comfortably above the teardown budget, kill the
+whole control group, and run the lease cleanup as a post-stop step so a hard kill
+still frees the device for a co-tenant:
+
+```ini
+[Service]
+ExecStart=/usr/bin/python -m broker
+# Allow bounded teardown (ADR 0024) to finish before systemd escalates.
+TimeoutStopSec=60
+# Reap the whole process group, including escaped runtime descendants.
+KillMode=mixed
+# Always runs, even after a forced kill: free the device for co-tenants.
+ExecStopPost=/usr/bin/python -m broker cleanup
+Environment=BROKER_DEVICE_LEASES=on
+Environment=BROKER_RUNTIME_RECONCILE=stop
+```
+
+- `stop` mode terminates a live orphan runtime **identity-gated** then releases
+  its lease; `report`/`adopt`/`off` keep it and mark it `orphaned`.
+- An **external** holder is never signalled or removed — only its own owner
+  manages its lease.
+
 ## Multi-replica / shared state (ADR 0009)
 
 By default each broker keeps routing state (sticky map, cooldowns, counters)

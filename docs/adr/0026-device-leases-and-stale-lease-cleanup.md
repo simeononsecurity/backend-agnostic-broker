@@ -1,6 +1,6 @@
 # ADR 0026: Host-local device leases with exclusive admission and stale-lease cleanup
 
-Status: Proposed
+Status: Accepted
 Date: 2026-10-21
 Supersedes: —
 Related: ADR 0020 (measured release), ADR 0021 (runtime identity + reconciliation),
@@ -30,15 +30,21 @@ start.
 We will add opt-in, host-local **device leases** (`BROKER_DEVICE_LEASES=off|on`, default
 `off`).
 
-1. **Lease records.** There is one lease file per device under `BROKER_DEVICE_LEASE_DIR`
-   (default `<cache_dir>/leases`). Writes are atomic and flock-protected, and files are
-   world-readable but writable only by the owner. Each record holds:
-   - device, `mode` (`exclusive` | `shared`) and holder (model alias or an external name);
+1. **Lease records.** There is one lease file per device (`device-<key>.lease.json`) under
+   `BROKER_DEVICE_LEASE_DIR` (default `<cache_dir>/leases`). Writes are atomic and
+   flock-protected, and files are world-readable but writable only by the owner (`0644`).
+   Each file carries a schema `version`, the `device`, the lease `mode`
+   (`exclusive` | `shared`) and a list of `holders`. A `shared` lease may have several
+   holders (co-residency); an `exclusive` lease has exactly one. Each holder records:
+   - holder (model alias or an external name) and `state`
+     (`held` | `releasing` | `stuck` | `orphaned` | `external`);
    - holder identity: broker PID + start time, and the runtime's PID/pgid/start time;
-   - `state` (`held` | `releasing` | `stuck`), `acquired_at` and `heartbeat_at`.
+   - `acquired_at` and `heartbeat_at`.
 
-   The format is documented as a stable, versioned interface. Co-tenants and operators can
-   read it, and external holders may write `external` leases with the same protocol.
+   The documented flat top-level fields (`holder`, `broker_pid`, `runtime_pid`, …) mirror
+   the first holder for the common single-holder case. The format is a stable, versioned
+   interface: co-tenants and operators can read it, and external holders may write
+   `external` leases with the same protocol (see `docs/device-leases.md`).
 2. **Acquire before load, release after measured release.**
    - The broker acquires leases for the model's devices (`gpu.device_ids`, or the devices
      admission placed it on) inside the atomic admission step (ADR 0022) and before spawning.
@@ -106,11 +112,25 @@ We will add opt-in, host-local **device leases** (`BROKER_DEVICE_LEASES=off|on`,
 
 ## Confirmation
 
-ADR 0027 drills D9–D11:
+Implemented in `broker/leases.py` (lease store, pure classification/compatibility,
+hooks, and the shared cleanup) wired into `broker/manager.py` (acquire inside the
+atomic admission step before spawn; release on the single "released" decision;
+startup + sweeper stale cleanup; `/status.leases`; metrics) and the
+`python -m broker cleanup` CLI in `broker/__main__.py`. Covered by:
 
-- a lease is acquired and released around a load and unload;
-- `SIGKILL` of the broker followed by `python -m broker cleanup` reaps the runtime and lease
-  within 10 s and fires the release hook;
-- an exclusive model is refused on a device held externally, with nothing signalled.
+- `tests/test_device_leases.py` — a load writes a `held` lease with the runtime
+  identity and fires the acquire hook once; an unload removes it and fires the
+  release hook once; an exclusive model evicts an idle shared holder and is
+  refused (`device_busy` 503 + `Retry-After`) on a busy holder and on an
+  **external** holder whose real process is asserted still alive (never
+  signalled); a stale lease is reaped; leases off create no directory; plus the
+  pure compatibility/classification matrix and the shipped example hook script.
+- `tests/test_device_leases_realproc.py` — real `python -m broker cleanup` against
+  a lease whose broker is dead and whose runtime is a real alive process: `stop`
+  mode terminates it identity-gated, removes the lease and fires the release hook
+  within 10 s; `--report` keeps it `orphaned` and signals nothing; a decoy whose
+  recorded start time does not match is never killed (identity gate).
 
-The v0.6.0 and v0.7.0 suites pass unchanged with leases off.
+ADR 0027's lifecycle drills (D9–D11) add the forced-kill / exclusive-refusal
+drills as a release gate. The v0.6.0 and v0.7.0 suites pass unchanged with leases
+off, and no lease directory is created.

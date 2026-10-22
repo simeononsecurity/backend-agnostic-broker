@@ -38,6 +38,7 @@ from typing import Any
 from .errors import (
     BackendUnavailableError,
     ConcurrencyLimitError,
+    DeviceBusyError,
     GpuPlacementFailedError,
     GpuUnavailableError,
     InsufficientQuotaError,
@@ -91,7 +92,7 @@ def classify_error(exc: BaseException) -> ErrorClass:
     # deterministic for a given member, and the model was already unloaded on a
     # post-load failure). BACKPRESSURE is exactly "always fails over, not
     # sleep-retryable, not benched by default", so it is reused here.
-    if isinstance(exc, (GpuUnavailableError, GpuPlacementFailedError)):
+    if isinstance(exc, (GpuUnavailableError, GpuPlacementFailedError, DeviceBusyError)):
         return ErrorClass.BACKPRESSURE
     # Typed upstream HTTP error: classify by the UPSTREAM status, never the
     # broker-facing http_status (which it remaps for the client envelope). This is

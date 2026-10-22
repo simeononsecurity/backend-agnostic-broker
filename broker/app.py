@@ -330,6 +330,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # the ledger. Reconcile never loads a model.
         manager.acquire_ledger_ownership()
         await manager.reconcile()
+        # Remove stale device leases before serving (ADR 0026). No-op when leases
+        # are off; otherwise a forced-kill's stale lease is cleared at startup too.
+        await manager.cleanup_stale_leases()
         await manager.start_sweeper()
         await manager.start_health_probe()
         await manager.start_queue_pump()

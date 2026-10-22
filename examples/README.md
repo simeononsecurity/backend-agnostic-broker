@@ -29,6 +29,7 @@ no external daemon**, then swap in real backends for production.
 | [restart-recovery](restart-recovery/) | Runtime ledger + restart reconciliation (adopt/stop/report) | [restart-and-recovery](../docs/guides/restart-and-recovery.md) |
 | [gpu-memory](gpu-memory/) | Telemetry, measured release, sized models (ADR 0020/0022) | [gpu-memory](../docs/guides/gpu-memory.md) |
 | [request-queueing](request-queueing/) | Bounded, fair admission queue under overload (ADR 0023) | [request-queueing](../docs/guides/request-queueing.md) |
+| [device-leases](device-leases/) | Host-local device leases + acquire/release hooks (ADR 0026) | [device-leases](../docs/device-leases.md) |
 
 ## How these are tested
 

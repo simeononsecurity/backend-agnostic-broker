@@ -84,6 +84,13 @@ class GPURequirements(BaseModel):
     required: bool = False
     # Device ordinals, e.g. [0, 1]. Empty => backend default / CPU.
     device_ids: list[int] = Field(default_factory=list)
+    # Take an EXCLUSIVE device lease when loaded (ADR 0026; requires
+    # BROKER_DEVICE_LEASES=on to have any effect). An exclusive model refuses to
+    # co-reside on a device held by any other holder: an idle broker model on that
+    # device may be evicted under the normal policy, but a busy broker model or an
+    # external holder makes the load fail fast with device_busy (503 +
+    # Retry-After). Other models take a shared lease. Default False = shared.
+    exclusive: bool = False
     # Post-load verification mode for a ``required`` entry the broker cannot
     # otherwise verify (ADR 0025). An external OpenAI-compatible endpoint has no
     # lifecycle the broker controls, so ``required: true`` there is a startup

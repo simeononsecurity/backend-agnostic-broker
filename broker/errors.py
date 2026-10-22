@@ -286,6 +286,22 @@ class GpuPlacementFailedError(BrokerError):
     error_type = "gpu_placement_failed"
 
 
+class DeviceBusyError(BrokerError):
+    """A device needed by a model is held incompatibly by another holder (ADR 0026).
+
+    Raised by the device-lease admission step (``BROKER_DEVICE_LEASES=on``) when a
+    model needs a device that is already leased incompatibly and the holder cannot
+    be evicted: an ``exclusive`` model against any other holder, or any model
+    against an ``exclusive``/``external`` holder that is not an idle broker model.
+    The broker never evicts or signals an external holder. Maps to **503** with a
+    ``Retry-After`` so a client (and the ADR 0023 queue) can back off and retry.
+    Nothing is spawned.
+    """
+
+    http_status = 503
+    error_type = "device_busy"
+
+
 class RequestTooLargeError(BrokerError):
     """Request body exceeded the configured size limit."""
 
