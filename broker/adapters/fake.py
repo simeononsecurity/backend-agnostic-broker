@@ -49,7 +49,12 @@ class FakeAdapter(BackendAdapter):
 
     def validate_config(self) -> None:
         # Fake backend needs nothing beyond an alias + runtime_model_id.
+        self._check_required_gpu_verifiable()
         return None
+
+    def gpu_placement_evidence(self) -> str:
+        """The fake backend stands in for a broker-managed runtime → ``measured``."""
+        return "measured"
 
     async def start(self) -> int | None:
         if self.fail_on_start:

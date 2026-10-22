@@ -45,9 +45,9 @@ links the ADR that records the decision. Every item below is resolved: ✅ done 
 | 13 | Crash recovery: runtime identity + restart reconciliation | ✅ done — PID+start-time identity, host-local ledger, reconcile (adopt/stop/report), port pre-check | [0021](adr/0021-runtime-identity-and-restart-reconciliation.md) |
 | 14 | GPU-safe model swapping: vendor-neutral memory telemetry + measured release + memory-aware admission | ✅ done — opt-in, default OFF; `off`/`nvidia`/`amd`/`host`/`auto` providers, `release_stuck`, sized models with declared/measured budgets | [0020](adr/0020-resource-telemetry-and-measured-release.md) · [0022](adr/0022-memory-aware-admission.md) |
 | 15 | Bounded, fair request queueing under overload | ✅ done — opt-in, default OFF; bounded+timed queue (429 `queue_full` / 503 `queue_timeout` + Retry-After), FIFO-per-key + round-robin fairness + priority/aging, configurable concurrency/capacity/device/host/backend triggers | [0023](adr/0023-request-queueing.md) |
-| 16 | Bounded shutdown + descendant-aware runtime teardown (production canary blocker) | 🟢 accepted | [0024](adr/0024-bounded-shutdown-and-descendant-teardown.md) |
-| 17 | Enforce `gpu.required` / `gpu.device_ids` at load in every adapter | 🟡 proposed | [0025](adr/0025-enforce-required-gpu-admission.md) |
-| 18 | Host-local device leases: exclusive admission + stale-lease cleanup (`python -m broker cleanup`) | 🟡 proposed | [0026](adr/0026-device-leases-and-stale-lease-cleanup.md) |
+| 16 | Bounded shutdown + descendant-aware runtime teardown (production canary blocker) | ✅ done | [0024](adr/0024-bounded-shutdown-and-descendant-teardown.md) |
+| 17 | Enforce `gpu.required` / `gpu.device_ids` at load in every adapter | ✅ done | [0025](adr/0025-enforce-required-gpu-admission.md) |
+| 18 | Host-local device leases: exclusive admission + stale-lease cleanup (`python -m broker cleanup`) | ✅ done | [0026](adr/0026-device-leases-and-stale-lease-cleanup.md) |
 | 19 | Lifecycle failure drills as a release gate | 🟡 proposed | [0027](adr/0027-lifecycle-failure-drills-release-gate.md) |
 
 ## Notes

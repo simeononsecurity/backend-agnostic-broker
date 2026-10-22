@@ -210,6 +210,12 @@ models:
       required: true
       device_ids: [0]
       layer_split: "99"
+      # Take an EXCLUSIVE device lease when loaded (ADR 0026; needs
+      # BROKER_DEVICE_LEASES=on). The model refuses to co-reside on device 0: an
+      # idle broker model there is evicted, but a busy broker model or an external
+      # holder makes the load fail with 503 device_busy + Retry-After. Other
+      # models take a shared lease. See docs/device-leases.md.
+      exclusive: true
 
   # ---- llama.cpp (broker-managed process; model loads at startup) -----------
   - alias: qwen-llamacpp
@@ -286,12 +292,32 @@ models:
       expect_status: 200
       timeout_seconds: 300
     gpu:
+      # required: true is ENFORCED (ADR 0025). This is a broker-managed runtime
+      # (startup_command present), so placement is verified after load: with
+      # BROKER_GPU_TELEMETRY on, the process group must hold memory on device 0
+      # within BROKER_GPU_VERIFY_SECONDS, else the model is unloaded and the
+      # request fails 503 gpu_placement_failed. With telemetry off, device 0 must
+      # be in the declared inventory (BROKER_GPU_DEVICES / BROKER_CUDA_VISIBLE_DEVICES)
+      # or the load fails 503 gpu_unavailable before spawning. No CPU fallback.
       required: true
       device_ids: [0]
       tensor_parallel_size: 1
       gpu_memory_fraction: 0.9
     supports_streaming: true
     supports_tools: true
+
+  # ---- External OpenAI-compatible endpoint (no startup_command) -------------
+  # The broker owns no lifecycle here, so it cannot verify GPU placement. Setting
+  # gpu.required: true on such an entry is a STARTUP CONFIG ERROR unless you also
+  # set gpu.verify: declared — an explicit operator statement that the endpoint is
+  # GPU-backed out-of-band. It then shows as `declared` in /status (ADR 0025).
+  # - alias: remote-vllm
+  #   backend: vllm
+  #   runtime_model_id: meta-llama/Llama-3.1-8B-Instruct
+  #   base_url: http://gpu-host.internal:8000   # external; no startup_command
+  #   gpu:
+  #     required: true
+  #     verify: declared
 
   # ---- Strata (broker-managed; flags are deployment-specific/UNVERIFIED) ----
   # Fill startup_command/readiness from your confirmed Strata version. See

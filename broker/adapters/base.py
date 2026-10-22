@@ -161,6 +161,68 @@ class BackendAdapter(abc.ABC):
         ids = self.entry.gpu.device_ids
         return [str(d) for d in ids] if ids else ["default"]
 
+    # --- required-GPU enforcement (ADR 0025) -----------------------------
+    def gpu_placement_evidence(self) -> str:
+        """How a required GPU placement can be CONFIRMED for this backend.
+
+        * ``measured`` — a broker-managed runtime; placement is verified against
+          the telemetry provider's per-device PIDs after load (when telemetry is
+          on).
+        * ``reported`` — the backend reports residency itself (Ollama ``/api/ps``
+          ``size_vram``); the broker trusts that report, labelled ``reported``.
+        * ``external`` — an endpoint with no lifecycle the broker controls; the
+          broker cannot verify placement at all.
+
+        The default is ``external`` (the safe assumption); backends that spawn a
+        runtime or report residency override it.
+        """
+        return "external"
+
+    def _check_required_gpu_verifiable(self) -> None:
+        """Startup guard: a ``gpu.required`` entry the broker cannot verify (ADR 0025).
+
+        An ``external`` entry (no lifecycle, no residency report) cannot have its
+        placement confirmed, so ``gpu.required: true`` there is a configuration
+        error unless the operator explicitly sets ``gpu.verify: declared``. Called
+        from each adapter's :meth:`validate_config` (fail-fast at startup).
+
+        Conversely, ``gpu.verify: declared`` is ONLY meaningful for an external
+        endpoint: on a backend the broker *can* verify (a broker-managed runtime
+        whose process-group telemetry is ``measured``, or Ollama which ``reports``
+        residency) it would silently disable the required-GPU enforcement that
+        backend is capable of. So ``verify: declared`` on a verifiable backend is
+        itself a configuration error — it must not become a blanket off-switch.
+        """
+        from ..errors import ConfigError
+
+        g = self.entry.gpu
+        if g.verify == "declared" and self.gpu_placement_evidence() != "external":
+            raise ConfigError(
+                f"model {self.entry.alias!r} sets gpu.verify: declared on backend "
+                f"{self.name!r}, which the broker can verify itself",
+                backend=self.name,
+                model=self.entry.alias,
+                remediation=(
+                    "gpu.verify: declared is only for external endpoints the broker "
+                    "cannot verify; remove it so GPU placement is enforced "
+                    "(measured telemetry for a managed runtime, or Ollama size_vram)"
+                ),
+            )
+        if not g.required:
+            return
+        if self.gpu_placement_evidence() == "external" and g.verify != "declared":
+            raise ConfigError(
+                f"model {self.entry.alias!r} sets gpu.required on backend "
+                f"{self.name!r} with no runtime the broker can verify",
+                backend=self.name,
+                model=self.entry.alias,
+                remediation=(
+                    "the broker cannot confirm GPU placement for an external "
+                    "endpoint; set gpu.verify: declared to assert it out-of-band, "
+                    "or give the entry a broker-managed startup_command"
+                ),
+            )
+
     # --- inference -------------------------------------------------------
     @abc.abstractmethod
     async def chat(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:

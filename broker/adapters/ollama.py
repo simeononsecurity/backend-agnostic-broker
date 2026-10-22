@@ -182,6 +182,10 @@ class OllamaAdapter(HTTPBackendAdapter):
             remediation="use a vLLM or llama.cpp reranker model for /v1/rerank",
         )
 
+    def gpu_placement_evidence(self) -> str:
+        """Ollama reports residency via ``/api/ps`` ``size_vram`` → ``reported``."""
+        return "reported"
+
     async def ps(self) -> dict[str, Any]:
         """Return Ollama's ``/api/ps`` — models currently resident in memory.
 

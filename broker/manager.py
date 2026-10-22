@@ -47,6 +47,7 @@ FAILED so the next request reloads/reroutes instead of erroring mid-flight.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import json
 import logging
@@ -82,6 +83,9 @@ from .errors import (
     CapacityUnavailableError,
     ConcurrencyLimitError,
     ConfigError,
+    DeviceBusyError,
+    GpuPlacementFailedError,
+    GpuUnavailableError,
     ModelBusyError,
     ModelLoadError,
     ModelNotFoundError,
@@ -93,9 +97,33 @@ from .errors import (
     TimeoutError_,
     ValidationError,
 )
+from .gpu_admission import (
+    GpuInventory,
+    preload_problem,
+    required_device_keys,
+    resolve_inventory,
+)
+from .leases import (
+    MODE_EXCLUSIVE,
+    MODE_SHARED,
+    STATE_EXTERNAL,
+    STATE_HELD,
+    STATE_ORPHANED,
+    STATE_RELEASING,
+    STATE_STUCK,
+    DeviceLease,
+    DeviceLeaseStore,
+    LeaseHolder,
+    cleanup_leases,
+    incompatible_holders,
+    run_lease_hook,
+)
 from .ledger import LedgerOwnerLock, LockOwner, RuntimeLedger, RuntimeRecord, argv_hash
 from .lifecycle import LifecycleMachine, State
 from .metrics import (
+    LEASE_HOOK_FAILURES,
+    LEASE_STALE_CLEANUPS,
+    LEASES_BY_STATE,
     QUEUE_ADMITTED,
     QUEUE_DEPTH,
     QUEUE_ENQUEUED,
@@ -220,6 +248,7 @@ class ManagedModel:
         broker_instance_id: str = "",
         broker_pid: int | None = None,
         broker_start_time: str | None = None,
+        leases: DeviceLeaseStore | None = None,
     ) -> None:
         self.entry = entry
         self.settings = settings
@@ -262,11 +291,27 @@ class ManagedModel:
         # the shutdown budget expires. Set by ModelManager.begin_preemption /
         # shutdown; also set when a load is cancel_load()'d during teardown.
         self._shutting_down = False
+        # Last required-GPU verification result for /status (ADR 0025). None until
+        # a required model is admitted; otherwise a dict with the inventory source
+        # and the last pre/post-load verification outcome.
+        self.gpu_verification: dict[str, Any] | None = None
+        # Host-local device leases (ADR 0026). ``leases`` is a disabled store
+        # (directory None) unless BROKER_DEVICE_LEASES=on, so the default path
+        # touches no files. ``held_lease_devices`` records the devices this model
+        # currently holds a lease on so unload/stop can release them.
+        self.leases = leases
+        self.held_lease_devices: list[str] = []
+        self.lease_mode: str = MODE_SHARED
 
-    async def ensure_ready(self) -> None:
-        """Start + ready the model if needed, exactly once, under the load lock."""
+    async def ensure_ready(self) -> bool:
+        """Start + ready the model if needed, exactly once, under the load lock.
+
+        Returns ``True`` iff this call performed the load (the model went from
+        not-active to READY), so a caller can run one-shot post-load work (ADR
+        0025 placement verification) only on the cold path, never on every request.
+        """
         if self.machine.state in (State.READY, State.BUSY):
-            return
+            return False
         if self._shutting_down:
             raise ShuttingDownError(
                 f"broker is shutting down; not loading model {self.entry.alias}",
@@ -275,7 +320,7 @@ class ManagedModel:
             )
         async with self.load_lock:
             if self.machine.state in (State.READY, State.BUSY):
-                return
+                return False
             if self._shutting_down:
                 raise ShuttingDownError(
                     f"broker is shutting down; not loading model {self.entry.alias}",
@@ -298,6 +343,7 @@ class ManagedModel:
                 self.adopted = False
                 self._record_runtime(pid)
                 log.info("model %s ready (pid=%s)", self.entry.alias, pid)
+                return True
             except asyncio.CancelledError:
                 # ADR 0024: the load was preempted. If the broker is stopping, the
                 # partially-spawned runtime is torn down by the shutdown/stop path
@@ -384,6 +430,181 @@ class ManagedModel:
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to remove runtime %s from ledger: %s", self.entry.alias, exc)
 
+    # --- device leases (ADR 0026) ---------------------------------------
+    def _lease_holder(self, *, state: str = STATE_HELD, with_runtime: bool = False) -> LeaseHolder:
+        """Build a :class:`LeaseHolder` for this model's current (broker) identity.
+
+        ``with_runtime`` stamps the live runtime's PID/pgid/start time — known only
+        after a successful load — so a stale-cleanup can confirm the runtime is
+        gone by identity.
+        """
+        pid = self.adapter.process_pid() if with_runtime else None
+        now = time.time()
+        return LeaseHolder(
+            holder=self.entry.alias,
+            state=state,
+            broker_pid=self.broker_pid,
+            broker_start_time=self.broker_start_time,
+            runtime_pid=pid,
+            runtime_pgid=(rid.pgid_of(pid) if pid else None),
+            runtime_start_time=(
+                self.process_start_time or (rid.process_start_time(pid) if pid else None)
+            ),
+            acquired_at=now,
+            heartbeat_at=now,
+        )
+
+    def _write_holder(self, device: str, mode: str, holder: LeaseHolder) -> None:
+        """Insert/replace this model's holder in ``device``'s lease (locked)."""
+        assert self.leases is not None
+        with self.leases.locked(device):
+            lease = self.leases.read(device)
+            if mode == MODE_EXCLUSIVE or lease is None:
+                lease = DeviceLease(device=device, mode=mode, holders=[])
+            lease.holders = [h for h in lease.holders if h.holder != self.entry.alias]
+            if mode == MODE_EXCLUSIVE:
+                lease.mode = MODE_EXCLUSIVE
+                lease.holders = [holder]
+            else:
+                lease.mode = MODE_SHARED
+                lease.holders.append(holder)
+            self.leases.write(lease)
+
+    def acquire_lease(self, devices: list[str], mode: str) -> None:
+        """Run the acquire hook + write a ``held`` lease for each device (no runtime yet).
+
+        Called under the admission lock, BEFORE spawn (ADR 0026). A failed acquire
+        hook rolls back any device already acquired and raises
+        :class:`DeviceBusyError`. Blocking (file IO + subprocess); the manager
+        invokes it via a thread so the event loop is never blocked.
+        """
+        if self.leases is None or not self.leases.enabled:
+            return
+        done: list[str] = []
+        for device in devices:
+            ok = run_lease_hook(
+                self.settings.lease_acquire_command,
+                device=device,
+                mode=mode,
+                holder=self.entry.alias,
+                allowed_exec_dirs=self.settings.allowed_exec_dirs,
+                timeout=self.settings.lease_hook_timeout_seconds,
+            )
+            if not ok:
+                LEASE_HOOK_FAILURES.labels(phase="acquire").inc()
+                self._rollback_leases(done, mode)
+                raise DeviceBusyError(
+                    f"lease acquire hook failed for device {device!r} (model {self.entry.alias!r})",
+                    backend=self.adapter.name,
+                    model=self.entry.alias,
+                    code="device_busy",
+                    headers={"Retry-After": "5"},
+                )
+            self._write_holder(device, mode, self._lease_holder())
+            done.append(device)
+        self.held_lease_devices = list(devices)
+        self.lease_mode = mode
+
+    def _rollback_leases(self, devices: list[str], mode: str) -> None:
+        """Remove partially-acquired holders + fire release hook (acquire failure)."""
+        if self.leases is None:
+            return
+        for device in devices:
+            with contextlib.suppress(Exception):
+                with self.leases.locked(device):
+                    lease = self.leases.read(device)
+                    if lease is None:
+                        continue
+                    lease.holders = [h for h in lease.holders if h.holder != self.entry.alias]
+                    if lease.holders:
+                        self.leases.write(lease)
+                    else:
+                        self.leases.remove(device)
+            with contextlib.suppress(Exception):
+                run_lease_hook(
+                    self.settings.lease_release_command,
+                    device=device,
+                    mode=mode,
+                    holder=self.entry.alias,
+                    allowed_exec_dirs=self.settings.allowed_exec_dirs,
+                    timeout=self.settings.lease_hook_timeout_seconds,
+                )
+
+    def stamp_lease_runtime(self) -> None:
+        """After a successful load, record the runtime identity on held leases."""
+        if self.leases is None or not self.held_lease_devices:
+            return
+        for device in self.held_lease_devices:
+            with contextlib.suppress(Exception):
+                with self.leases.locked(device):
+                    lease = self.leases.read(device)
+                    if lease is None:
+                        continue
+                    stamped = self._lease_holder(with_runtime=True)
+                    for i, h in enumerate(lease.holders):
+                        if h.holder == self.entry.alias:
+                            lease.holders[i] = stamped
+                            break
+                    else:
+                        continue
+                    self.leases.write(lease)
+
+    def release_leases(self, released: bool) -> None:
+        """Release this model's leases after unload/stop (ADR 0026).
+
+        ``released`` is the single "the runtime is gone" decision (see
+        :meth:`lease_released`). When released, the holder is removed (the file is
+        deleted once no holders remain) and the release hook fires once per freed
+        device. Otherwise the holder is marked ``stuck`` and kept, so the sweeper
+        retries once the survivors exit.
+        """
+        if self.leases is None or not self.held_lease_devices:
+            return
+        devices = list(self.held_lease_devices)
+        freed: list[tuple[str, str]] = []
+        for device in devices:
+            with contextlib.suppress(Exception):
+                with self.leases.locked(device):
+                    lease = self.leases.read(device)
+                    if lease is None:
+                        continue
+                    others = [h for h in lease.holders if h.holder != self.entry.alias]
+                    if released:
+                        if others:
+                            lease.holders = others
+                            self.leases.write(lease)
+                        else:
+                            self.leases.remove(device)
+                        freed.append((device, lease.mode))
+                    else:
+                        for h in lease.holders:
+                            if h.holder == self.entry.alias:
+                                h.state = STATE_STUCK
+                        self.leases.write(lease)
+        for device, mode in freed:
+            with contextlib.suppress(Exception):
+                run_lease_hook(
+                    self.settings.lease_release_command,
+                    device=device,
+                    mode=mode,
+                    holder=self.entry.alias,
+                    allowed_exec_dirs=self.settings.allowed_exec_dirs,
+                    timeout=self.settings.lease_hook_timeout_seconds,
+                )
+        if released:
+            self.held_lease_devices = []
+            self.lease_mode = MODE_SHARED
+
+    def lease_released(self) -> bool:
+        """The single "has the runtime released the device?" decision (ADR 0026).
+
+        Today this is the measured-release signal the broker already computes:
+        ``adapter.last_release_ok()`` (False == the process survived SIGKILL /
+        lingering device memory). ADR 0024's richer bounded-teardown result is
+        wired in here by the integration card so leases and teardown agree.
+        """
+        return self.adapter.last_release_ok()
+
     async def adopt(self, record: RuntimeRecord) -> bool:
         """Adopt a recorded, still-alive orphaned runtime (ADR 0021, adopt mode).
 
@@ -444,6 +665,7 @@ class ManagedModel:
                 self.machine.survived_kill = not self.adapter.last_release_ok()
                 self.machine.to(State.UNLOADED)
                 self._forget_runtime()
+                await self._release_leases_async(self.lease_released())
                 log.info("model %s unloaded", self.entry.alias)
             except Exception as exc:  # noqa: BLE001
                 self.machine.to(State.FAILED, error=str(exc))
@@ -463,6 +685,12 @@ class ManagedModel:
             return task
         return None
 
+    async def _release_leases_async(self, released: bool) -> None:
+        """Release held device leases off the event loop (blocking IO + hook)."""
+        if self.leases is None or not self.held_lease_devices:
+            return
+        await asyncio.to_thread(self.release_leases, released)
+
     async def stop(
         self,
         *,
@@ -478,6 +706,11 @@ class ManagedModel:
         so a slow load can no longer hold shutdown open. The teardown result is
         recorded on the lifecycle machine (``survived_kill`` / ``release_info``)
         so a surviving runtime stays visible via ``/status`` ``release_stuck``.
+
+        ADR 0026: a held device lease is released only when teardown reports **no
+        survivors** *and* measured release passed; otherwise the lease is marked
+        ``stuck`` (``released=False``) so the device is never handed to a co-tenant
+        while a runtime (or its escaped descendant) might still hold it.
         """
         task = self.cancel_load()
         if task is not None:
@@ -500,6 +733,13 @@ class ManagedModel:
             )
         finally:
             self._forget_runtime()
+            # ADR 0024 + 0026: the single "released" decision. A lease is released
+            # only when teardown reported no survivors AND measured release passed;
+            # a survivor (or an unmeasured release) keeps the lease and marks it
+            # stuck so the device is not reassigned under a still-live holder.
+            teardown_clean = result is not None and result.ok() and not result.survivors
+            released = teardown_clean and self.adapter.last_release_ok()
+            await self._release_leases_async(released)
             try:
                 self.machine.to(State.UNLOADED)
             except Exception:  # noqa: BLE001
@@ -546,6 +786,12 @@ class ModelManager:
         self.reconcile_disabled_reason: str | None = None
         #: Summary of the last startup reconciliation, surfaced in /status.
         self.last_reconciliation: dict[str, Any] = {}
+        # Host-local device leases (ADR 0026). A disabled store (directory None)
+        # unless BROKER_DEVICE_LEASES=on, so the default path creates no lease
+        # dir and reads/writes nothing.
+        self.leases: DeviceLeaseStore = DeviceLeaseStore(
+            settings.device_lease_dir_resolved() if settings.leases_enabled() else None
+        )
         self.models: dict[str, ManagedModel] = {
             e.alias: ManagedModel(
                 e,
@@ -554,6 +800,7 @@ class ModelManager:
                 self.broker_instance_id,
                 self.broker_pid,
                 self.broker_start_time,
+                self.leases,
             )
             for e in registry.models
         }
@@ -733,6 +980,62 @@ class ModelManager:
 
         self.last_reconciliation = await reconcile_runtimes(self)
         return self.last_reconciliation
+
+    # --- device leases (ADR 0026) ----------------------------------------
+    async def cleanup_stale_leases(self) -> dict[str, Any]:
+        """Remove stale device leases (dead broker + dead runtime) and update metrics.
+
+        Called at startup (after reconcile, before serving) and from the periodic
+        sweeper. ``kill_orphans=False``: a live orphan runtime is handled by the
+        ADR 0021 ledger reconcile per ``BROKER_RUNTIME_RECONCILE``; the lease sweep
+        only reaps leases whose runtime is already gone, and marks orphans. The
+        ``stop``-mode reap of a live orphan runtime is the ``python -m broker
+        cleanup`` (ExecStopPost) job, not the running broker's sweeper.
+        """
+        if self.leases is None or not self.leases.enabled:
+            return {}
+        summary = await asyncio.to_thread(
+            cleanup_leases,
+            self.leases,
+            kill_orphans=False,
+            release_command=self.settings.lease_release_command,
+            allowed_exec_dirs=self.settings.allowed_exec_dirs,
+            hook_timeout=self.settings.lease_hook_timeout_seconds,
+        )
+        removed = len(summary.get("removed", []))
+        if removed:
+            LEASE_STALE_CLEANUPS.inc(removed)
+        self._update_lease_metrics()
+        return summary
+
+    def _update_lease_metrics(self) -> None:
+        """Refresh the per-state lease gauge (ADR 0026). No-op when leases off."""
+        if self.leases is None or not self.leases.enabled:
+            return
+        counts: dict[str, int] = {}
+        for lease in self.leases.load_all():
+            for h in lease.holders:
+                counts[h.state] = counts.get(h.state, 0) + 1
+        for state in (
+            STATE_HELD,
+            STATE_RELEASING,
+            STATE_STUCK,
+            STATE_ORPHANED,
+            STATE_EXTERNAL,
+        ):
+            LEASES_BY_STATE.labels(state=state).set(counts.get(state, 0))
+
+    def _leases_block(self) -> dict[str, Any]:
+        """The ``leases`` block for ``/status`` (ADR 0026)."""
+        if self.leases is None or not self.leases.enabled:
+            return {"enabled": False}
+        leases = self.leases.load_all()
+        return {
+            "enabled": True,
+            "dir": self.leases.directory,
+            "count": len(leases),
+            "devices": [lease.to_dict() for lease in leases],
+        }
 
     def get(self, alias: str) -> ManagedModel:
         m = self.models.get(alias)
@@ -1003,6 +1306,217 @@ class ModelManager:
             {"alias": alias, "decision": decision, "detail": detail, "at": time.time()}
         )
 
+    # --- required-GPU admission + verification (ADR 0025) ----------------
+    #
+    # These are the admission-hook functions ADR 0026 (device leases) extends:
+    # ``_gpu_preload_check`` is the pre-spawn gate (acquire a device lease there,
+    # alongside the gpu_unavailable check, before anything is spawned or evicted),
+    # and ``_gpu_inventory`` is the single place that resolves which devices exist.
+    async def _gpu_inventory(self) -> GpuInventory:
+        """Resolve the device inventory (measured telemetry, else declared).
+
+        Labelled ``measured`` / ``declared`` / ``none`` so ``/status`` can show how
+        placement was established without ever mixing or inventing a figure.
+        """
+        sample = await self.telemetry_sample() if self.telemetry_enabled() else None
+        return resolve_inventory(
+            telemetry_on=self.telemetry_enabled(),
+            sample=sample,
+            declared=self.settings.declared_gpu_devices(),
+        )
+
+    async def _gpu_preload_check(self, m: ManagedModel) -> None:
+        """Pre-load gate for a ``gpu.required`` model (before any spawn/eviction).
+
+        No-op for a model without ``gpu.required`` (exact pre-ADR-0025 behaviour,
+        no telemetry probe). Otherwise resolves the inventory and raises
+        :class:`GpuUnavailableError` (503) when the inventory is empty or a pinned
+        ``device_ids`` entry is absent — nothing is spawned or evicted, and there
+        is no CPU fallback. Records the inventory source on the model for /status.
+        """
+        g = m.entry.gpu
+        if not g.required:
+            return
+        evidence = m.adapter.gpu_placement_evidence()
+        # verify: declared — the operator asserts GPU placement out-of-band
+        # (the only legal way for an un-verifiable external entry to set required).
+        # Trust it: no inventory enforcement, shown as `declared` in /status.
+        if g.verify == "declared":
+            m.gpu_verification = {
+                "required": True,
+                "evidence": evidence,
+                "inventory_source": "declared",
+                "result": "declared",
+                "detail": "operator-declared (gpu.verify: declared)",
+                "checked_at": time.time(),
+            }
+            return
+        inv = await self._gpu_inventory()
+        problem = preload_problem(g, inv)
+        verification = {
+            "required": True,
+            "evidence": evidence,
+            "inventory_source": inv.source,
+            "inventory": list(inv.devices),
+        }
+        if problem is not None:
+            verification["result"] = "gpu_unavailable"
+            verification["detail"] = problem.summary
+            verification["checked_at"] = time.time()
+            m.gpu_verification = verification
+            raise GpuUnavailableError(
+                f"cannot admit {m.entry.alias!r}: {problem.summary}",
+                backend=m.adapter.name,
+                model=m.entry.alias,
+                code=problem.reason,
+                remediation=(
+                    "point the model at an available device, declare the inventory "
+                    "with BROKER_GPU_DEVICES, enable telemetry, or remove gpu.required"
+                ),
+            )
+        # Pre-load passed; stash the source so /status reflects it even before the
+        # post-load verification result overwrites ``result``.
+        verification["result"] = "pending"
+        m.gpu_verification = verification
+
+    async def _gpu_postload_verify(self, m: ManagedModel) -> None:
+        """Verify GPU placement after a cold load, unloading + failing on a miss.
+
+        Only runs for a ``gpu.required`` model that this call just loaded. The
+        method of proof depends on the backend's evidence:
+
+        * ``reported`` (Ollama): ``/api/ps`` must report ``size_vram > 0``.
+        * ``measured`` (broker-managed runtime): with telemetry on, the runtime's
+          process group must hold memory on a required device within
+          ``BROKER_GPU_VERIFY_SECONDS``. Telemetry off → honest "no measurement"
+          (the pre-load declared-inventory check already ran); nothing is failed.
+        * ``external`` + ``gpu.verify: declared``: trusted, shown as ``declared``.
+
+        On a failure the model is unloaded (no request is ever served from a
+        required model on CPU) and :class:`GpuPlacementFailedError` (503) is raised.
+        """
+        g = m.entry.gpu
+        if not g.required:
+            return
+        evidence = m.adapter.gpu_placement_evidence()
+        base = m.gpu_verification or {"required": True, "evidence": evidence}
+        base = {**base, "evidence": evidence, "checked_at": time.time()}
+        # verify: declared short-circuits all verification (operator statement).
+        if g.verify == "declared":
+            base["result"] = "declared"
+            base["detail"] = "operator-declared (gpu.verify: declared)"
+            m.gpu_verification = base
+            return
+
+        async def _fail(detail: str) -> None:
+            base["result"] = "gpu_placement_failed"
+            base["detail"] = detail
+            m.gpu_verification = base
+            try:
+                await m.stop()
+            except Exception as exc:  # noqa: BLE001 - unload best-effort; still fail the load
+                log.warning(
+                    "gpu verify: unload of %s after failure errored: %s", m.entry.alias, exc
+                )
+            m.machine.to(State.UNLOADED)
+            m.healthy = False
+            raise GpuPlacementFailedError(
+                f"model {m.entry.alias!r} did not hold a required GPU after load: {detail}",
+                backend=m.adapter.name,
+                model=m.entry.alias,
+                remediation=(
+                    "check the runtime actually used the GPU (driver, device env, "
+                    "num_gpu/--n-gpu-layers); the model was unloaded, not served on CPU"
+                ),
+            )
+
+        if evidence == "external":
+            # A required external entry only reaches here with verify: declared
+            # (validate_config rejects it otherwise). Trust the operator statement.
+            base["result"] = "declared"
+            base["detail"] = "operator-declared (gpu.verify: declared)"
+            m.gpu_verification = base
+            return
+        if evidence == "reported":
+            ok, detail = await self._verify_reported(m)
+            if not ok:
+                await _fail(detail)
+                return
+            base["result"] = "ok"
+            base["evidence"] = "reported"
+            base["detail"] = detail
+            m.gpu_verification = base
+            return
+        # evidence == "measured"
+        if not self.telemetry_enabled():
+            base["result"] = "unverified"
+            base["detail"] = "telemetry off: GPU placement not measured"
+            m.gpu_verification = base
+            return
+        ok, detail = await self._verify_measured(m)
+        if not ok:
+            await _fail(detail)
+            return
+        base["result"] = "ok"
+        base["detail"] = detail
+        m.gpu_verification = base
+
+    async def _verify_reported(self, m: ManagedModel) -> tuple[bool, str]:
+        """Ollama post-load proof: ``/api/ps`` ``size_vram > 0`` for the model."""
+        try:
+            data = await m.adapter.ps()  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            return False, f"/api/ps probe failed: {exc}"
+        models = data.get("models") if isinstance(data, dict) else data
+        if not isinstance(models, list):
+            return False, "/api/ps returned no model list"
+        want = m.entry.runtime_model_id
+        for row in models:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("model") or row.get("name") or "")
+            if name == want or name.split(":")[0] == want.split(":")[0]:
+                try:
+                    vram = int(row.get("size_vram") or 0)
+                except (TypeError, ValueError):
+                    vram = 0
+                if vram > 0:
+                    return True, f"reported size_vram={vram}"
+                return False, f"reported size_vram={vram} (model resident on CPU only)"
+        return False, f"model {want!r} not resident in /api/ps after load"
+
+    async def _verify_measured(self, m: ManagedModel) -> tuple[bool, str]:
+        """Measured post-load proof: the runtime's process group holds device memory.
+
+        Polls telemetry (bounded by ``BROKER_GPU_VERIFY_SECONDS``) for a PID in the
+        runtime's process group holding memory on a *required* device. Returns
+        ``(True, detail)`` on first confirmation, else ``(False, detail)``.
+        """
+        inv = await self._gpu_inventory()
+        required = set(required_device_keys(m.entry.gpu, inv))
+        deadline = time.monotonic() + max(0.0, self.settings.gpu_verify_seconds)
+        poll = max(0.05, min(self.settings.gpu_telemetry_poll_seconds, 1.0))
+        last = "no measured device memory held by the runtime's process group"
+        while True:
+            pg = set(m.adapter.process_group_pids())
+            sample = await self.telemetry_sample(force=True)
+            if sample.ok:
+                for d in sample.devices:
+                    if required and str(d.index) not in required:
+                        continue
+                    held = sum(mib for pid, mib in d.processes.items() if pid in pg and mib > 0)
+                    if held > 0:
+                        return True, f"measured {held} MiB held on device {d.index}"
+                last = (
+                    f"process group {sorted(pg)} holds no memory on "
+                    f"required device(s) {sorted(required) or 'any'}"
+                )
+            else:
+                last = f"telemetry unavailable: {sample.reason}"
+            if time.monotonic() >= deadline:
+                return False, last
+            await asyncio.sleep(poll)
+
     # --- admission + eviction (ADR 0020 measured release + ADR 0022) -----
     async def _maybe_evict(self, keep_alias: str) -> None:
         """Make room to load ``keep_alias``: memory-aware admission then count.
@@ -1022,7 +1536,91 @@ class ModelManager:
             await self._guard_release_stuck(m)
             await self._admit_memory(m)
             await self._evict_for_count(keep_alias)
+            # Device-lease admission (ADR 0026): exclusive-conflict check + evict
+            # incompatible idle broker models, then acquire the lease BEFORE spawn.
+            # A no-op when leases are off. Runs last, after the model is reserved,
+            # so a failed acquire unreserves cleanly (nothing spawned yet).
             self._reserve(m)
+            try:
+                await self._admit_leases(m)
+            except BaseException:
+                self._unreserve(m)
+                raise
+
+    def _unreserve(self, m: ManagedModel) -> None:
+        """Undo a reservation when post-reserve admission fails before any spawn."""
+        if m.machine.state == State.LOADING and m.machine.pid is None:
+            with contextlib.suppress(Exception):
+                # LOADING -> UNLOADED is not a legal direct edge; go via STOPPING.
+                m.machine.to(State.STOPPING)
+                m.machine.to(State.UNLOADED)
+
+    async def _admit_leases(self, m: ManagedModel) -> None:
+        """Exclusive-admission check + acquire this model's device leases (ADR 0026).
+
+        No-op when leases are off. For each device the model will use:
+
+        * find holders incompatible with the model's mode (``exclusive`` conflicts
+          with every other holder; ``shared`` only with an ``exclusive`` holder);
+        * an incompatible holder that is an *idle broker model we own* is evicted
+          under the normal policy; any other incompatible holder — a busy broker
+          model, or (always) an external holder — fails the load fast with
+          :class:`DeviceBusyError` (503 + Retry-After). An external holder is never
+          evicted or signalled.
+
+        After resolving conflicts the lease is acquired (acquire hook + a ``held``
+        lease file) before the model is spawned.
+        """
+        if self.leases is None or not self.leases.enabled:
+            return
+        devices = m.adapter.device_keys()
+        mode = MODE_EXCLUSIVE if m.entry.gpu.exclusive else MODE_SHARED
+        victims: list[ManagedModel] = []
+        for device in devices:
+            lease = self.leases.read(device)
+            for h in incompatible_holders(lease, mode):
+                if h.holder == m.entry.alias:
+                    continue
+                if h.external:
+                    raise self._device_busy(m, device, f"external holder {h.holder!r}")
+                victim = self.models.get(h.holder)
+                if (
+                    victim is not None
+                    and victim is not m
+                    and victim.machine.state == State.READY
+                    and victim.machine.inflight == 0
+                    and not victim.draining
+                ):
+                    victims.append(victim)
+                else:
+                    held_by = h.holder if victim is not None else f"unknown holder {h.holder!r}"
+                    raise self._device_busy(m, device, f"in-use by {held_by}")
+        # Evict the idle broker victims (dedup, preserve order). Releasing a victim
+        # drops its holder from the device lease via its unload path.
+        for victim in dict.fromkeys(victims):
+            log.info(
+                "device leases: evicting idle %s to grant %s device(s) %s",
+                victim.entry.alias,
+                m.entry.alias,
+                devices,
+            )
+            await self._evict_model(victim)
+        # Acquire (hook + write held lease) off the event loop.
+        await asyncio.to_thread(m.acquire_lease, devices, mode)
+
+    def _device_busy(self, m: ManagedModel, device: str, detail: str) -> DeviceBusyError:
+        ra = max(1, int(round(self.settings.idle_sweep_interval_seconds)))
+        return DeviceBusyError(
+            f"device {device!r} needed by {m.entry.alias!r} is {detail}",
+            backend=m.adapter.name,
+            model=m.entry.alias,
+            code="device_busy",
+            remediation=(
+                "wait for the holder to release the device, pin the model to "
+                "another device, or drop gpu.exclusive"
+            ),
+            headers={"Retry-After": str(ra)},
+        )
 
     def _reserve(self, m: ManagedModel) -> None:
         """Mark a just-admitted model LOADING so a concurrent admission sees it.
@@ -1041,6 +1639,17 @@ class ModelManager:
             m.machine.to(State.LOADING)
 
     async def _evict_for_count(self, keep_alias: str) -> None:
+        # A model that is ALREADY resident holds its slot: serving another request
+        # to it (including a failover landing on an already-loaded pool member)
+        # loads nothing new, so the count limit does not apply and there is no
+        # victim to seek. Without this guard, a request that fails over from a
+        # gpu_unavailable member onto an already-loaded member reaches here with
+        # loaded_count == max and no *other* idle model to evict, and wrongly 429s
+        # the member that is serving it (regression surfaced once ADR 0025 made
+        # the unqualified member fail over instead of silently loading on CPU).
+        keep = self.models.get(keep_alias)
+        if keep is not None and keep.machine.is_active():
+            return
         if self.loaded_count() < self.settings.max_loaded_models:
             return
         candidates = [
@@ -1924,9 +2533,17 @@ class ModelManager:
     async def acquire(self, alias: str) -> ManagedModel:
         """Select + load a single model for a request (no routing/failover)."""
         m = self.get(alias)
+        await self._gpu_preload_check(m)
         await self._maybe_evict(alias)
-        await m.ensure_ready()
+        if await m.ensure_ready():
+            await self._gpu_postload_verify(m)
+            await self._post_load_leases(m)
         return m
+
+    async def _post_load_leases(self, m: ManagedModel) -> None:
+        """Stamp the runtime identity onto held leases after a cold load (ADR 0026)."""
+        if m.held_lease_devices:
+            await asyncio.to_thread(m.stamp_lease_runtime)
 
     async def _route_and_serve(
         self,
@@ -2226,6 +2843,10 @@ class ModelManager:
         admit right now, so the caller can wait in the fair queue. On success BOTH
         slots are held and the caller MUST release them with :meth:`_release_slots`.
         """
+        # ADR 0025: required-GPU pre-load gate FIRST — before any overload wait,
+        # eviction or spawn. A deterministic gpu_unavailable fails fast (and fails
+        # over to a qualifying member) rather than queueing behind capacity.
+        await self._gpu_preload_check(m)
         if not blocking:
             trig = await self._overload_trigger(m)
             if trig is not None:
@@ -2238,7 +2859,11 @@ class ModelManager:
                 if qt is not None:
                     raise _WouldBlock(qt) from exc
             raise
-        await m.ensure_ready()
+        if await m.ensure_ready():
+            # ADR 0025: verify placement once, on the cold path only. On failure
+            # the model is already unloaded and this raises gpu_placement_failed.
+            await self._gpu_postload_verify(m)
+            await self._post_load_leases(m)
         if blocking:
             await self.global_sem.acquire()
             try:
@@ -3028,8 +3653,11 @@ class ModelManager:
         or this explicit admin action.
         """
         m = self.get(alias)
+        await self._gpu_preload_check(m)
         await self._maybe_evict(alias)
-        await m.ensure_ready()
+        if await m.ensure_ready():
+            await self._gpu_postload_verify(m)
+            await self._post_load_leases(m)
         return {"alias": alias, "state": m.machine.state.value, "loaded": m.machine.is_active()}
 
     async def admin_reload_registry(self) -> dict[str, Any]:
@@ -3063,6 +3691,7 @@ class ModelManager:
                 self.broker_instance_id,
                 self.broker_pid,
                 self.broker_start_time,
+                self.leases,
             )
             mm.adapter.validate_config()  # raises → propagates, nothing mutated yet
             fresh[a] = mm
@@ -3111,6 +3740,8 @@ class ModelManager:
         # Clear any release_stuck model whose device memory has come back (ADR 0020
         # follow-up): a stuck holder must not strand its device until a restart.
         await self._recheck_all_release_stuck()
+        # Reap stale device leases and refresh lease metrics (ADR 0026). No-op off.
+        await self.cleanup_stale_leases()
         for m in list(self.models.values()):
             if m.machine.state != State.READY or m.machine.inflight > 0:
                 continue
@@ -3495,6 +4126,14 @@ class ModelManager:
                 "start_time": m.process_start_time,
                 "adopted": m.adopted,
             }
+            # Required-GPU enforcement + verification visibility (ADR 0025).
+            snap["gpu"] = {
+                "required": m.entry.gpu.required,
+                "device_ids": list(m.entry.gpu.device_ids),
+                "evidence": m.adapter.gpu_placement_evidence(),
+                "verify": m.entry.gpu.verify,
+                "verification": m.gpu_verification,
+            }
             if cooldowns_on:
                 cd_dict = (await self.state.get_cooldown(m.entry.alias)).to_dict()
                 if self.settings.cooldown_half_open_single_trial:
@@ -3541,6 +4180,7 @@ class ModelManager:
             },
             "resources": await self.resources_block(),
             "queue": self.admission.snapshot(),
+            "leases": self._leases_block(),
             "models": models,
             "timestamp": time.time(),
         }

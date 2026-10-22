@@ -1,7 +1,7 @@
 # ADR 0025: Enforce `gpu.required` at load time in every production adapter
 
-Status: Proposed
-Date: 2026-10-21
+Status: Accepted
+Date: 2026-10-22
 Supersedes: —
 Related: ADR 0020 (vendor-neutral telemetry), ADR 0022 (memory-aware admission),
 ADR 0026 (device leases), `docs/gpu-placement.md`
@@ -60,7 +60,11 @@ adapter spawns or loads, and verify placement after the load where the backend a
    - **External OpenAI-compatible endpoints (no lifecycle):** the broker cannot verify
      placement. `gpu.required: true` there is a **startup configuration error**, unless the
      entry also sets `gpu.verify: declared`, an explicit operator statement that is shown as
-     `declared` in `/status`.
+     `declared` in `/status`. `gpu.verify: declared` is scoped to these external entries: on
+     any backend the broker *can* verify (a broker-managed runtime whose placement is
+     `measured`, or Ollama which `reports` residency) it is itself a **startup configuration
+     error**, so it can never be used as a blanket off-switch that silently disables the
+     enforcement that backend is capable of.
 4. **Visibility.** `/status` shows, per model, `gpu.required`, the inventory source and the
    last verification result. The docs and `registry.example.yaml` describe exactly what is
    enforced per backend.
@@ -100,9 +104,38 @@ already claim the requirement, so it closes a documented promise and is not opt-
 
 ## Confirmation
 
-ADR 0027 drills D7–D8, plus unit tests per adapter:
+Enforcement lives in the shared admission path, not per adapter. The hook
+functions (which ADR 0026 device leases extends) are, in `broker/manager.py`:
 
-- an empty inventory or an unknown device id fails before spawn with nothing evicted;
-- the Ollama `size_vram == 0` case unloads and fails;
-- an external entry with `required` and no `verify: declared` refuses to start;
-- a measured provider fixture with no device memory after ready unloads.
+- `ModelManager._gpu_preload_check` — the pre-spawn gate, called first in
+  `_acquire_admission` (and `acquire` / `admin_load`) before any overload wait,
+  eviction or `ensure_ready`;
+- `ModelManager._gpu_postload_verify` — post-load verification on the cold path
+  only (`ensure_ready` now returns whether it loaded);
+- `ModelManager._gpu_inventory` — the single device-inventory resolver;
+- the pure decision logic in `broker/gpu_admission.py`
+  (`resolve_inventory`, `preload_problem`, `required_device_keys`);
+- the typed errors `GpuUnavailableError` / `GpuPlacementFailedError`
+  (`broker/errors.py`), classified in `broker/reliability.py` so they fail over
+  to a qualifying member without sleep-retrying the failing one;
+- per-adapter `gpu_placement_evidence()` (`measured` / `reported` / `external`)
+  and the startup guard `_check_required_gpu_verifiable()`.
+
+Tested by `tests/test_gpu_admission.py` (unit, fake backend + `FakeTelemetry`):
+
+- an empty inventory and an unknown device id fail before spawn with nothing
+  evicted (`start()` never called);
+- the Ollama `size_vram == 0` case unloads and fails, `> 0` passes;
+- an external entry with `required` and no `verify: declared` refuses to start,
+  and with it starts and shows `declared`;
+- a measured provider fixture with no device memory after ready unloads, and one
+  that holds memory passes;
+- a pool fails over past a `gpu_unavailable` member to a qualifying one, and an
+  all-unqualified pool propagates `gpu_unavailable`;
+- a model without `gpu.required` is unchanged (no telemetry probe, no state);
+
+and by `tests/test_gpu_admission_realproc.py` (real process + real manager): a
+broker-managed stand-in runtime (`tests/fixtures/gpu_stub_runtime.sh`) with
+`gpu.required` and an empty declared inventory returns 503 `gpu_unavailable` and
+is **never spawned** — asserted via the sentinel file, `pgrep`, and the runtime
+ledger. ADR 0027 adds the end-to-end drills D7–D8.

@@ -40,6 +40,9 @@ Errors are structured (`broker/errors.py`) and carry a `remediation` hint and a
 | An orphan is listed but not adopted (`adoptable: false`) | — (by design) | The registry argv drifted from the recorded runtime, or its port didn't answer readiness — the broker won't adopt a runtime it can't confirm matches the current registry | Use `BROKER_RUNTIME_RECONCILE=stop` to reap it and let the next request load fresh. |
 | Startup fails: "another broker (pid N) already owns the runtime ledger under BROKER_CACHE_DIR …" | `config_error` | Two brokers share one `BROKER_CACHE_DIR` and this one runs `BROKER_RUNTIME_RECONCILE=adopt`/`stop`, which would act on the live sibling's runtimes — so it fails closed (ADR 0021) | Give each broker its own `BROKER_CACHE_DIR` (or host). If you only need observation, `report`/`off` start anyway but run without a ledger (see next row). |
 | A second broker starts but `GET /status.reconciliation.disabled_reason` is set / `ledger_owned: false` | — (by design) | Another live broker owns the ledger for this `BROKER_CACHE_DIR`; in `report`/`off` the second instance runs ledger-less for v0.6.0 compatibility (ADR 0021) | Give each broker its own `BROKER_CACHE_DIR` to restore per-instance recording/reconciliation. |
+| `503 device_busy` on load | `device_busy` | A device the model needs is held incompatibly and can't be freed: an `gpu.exclusive` model against any other holder, or any model against an `exclusive`/**external** holder that isn't an idle broker model (ADR 0026, leases on) | Wait for the holder to release (honor `Retry-After`), pin the model to another device, drop `gpu.exclusive`, or free the co-tenant. Inspect `GET /status.leases`. The broker never evicts/signals an external holder. |
+| After a forced stop a co-tenant stays blocked on a device | — (recoverable) | A lease whose owning broker was killed still marks the device busy (ADR 0026, leases on) | Run `python -m broker cleanup` (stop mode reaps a live orphan runtime identity-gated then releases; `--report` only reports). It also runs at startup + in the sweeper. Wire it as systemd `ExecStopPost=`. |
+| Lease stuck in `stuck` state | — (self-clearing) | The model was unloaded but its runtime process group hadn't fully released the device; the lease is kept `stuck` until the survivors exit | The sweeper clears it automatically once the memory frees. Inspect `GET /status.leases`; check for a surviving process group holding the device. |
 
 ## Diagnostics
 
@@ -68,6 +71,14 @@ Errors are structured (`broker/errors.py`) and carry a `remediation` hint and a
 | `429 capacity_unavailable` | A sized model (`memory_mib`) does not fit. `reason=exceeds_device_capacity` means it is larger than the device can ever hold (nothing is evicted — pin to a bigger device or lower `memory_mib`); `reason=*_insufficient` means the device is full and the holder can't be evicted (raise the budget/headroom, pin elsewhere, or wait for it to go idle). The `reason`/`holder` fields name why. |
 | `resources.sample.status: unavailable` | The driver tool isn't at an absolute/allow-listed path, timed out, or returned nothing. Run `python -m broker.resources_probe <provider>` and read the `reason`. |
 | A model shows `survived_kill: true` | `stop()` could not confirm the process exited after SIGKILL. Check for a wedged runtime holding the device. |
+
+## Required-GPU admission (ADR 0025)
+
+| Symptom | Cause / fix |
+|---------|-------------|
+| `503 gpu_unavailable` on a load | A `gpu.required` model could not be placed on a GPU, and **nothing was spawned or evicted** (no CPU fallback). `code=empty_inventory`: telemetry is off and no inventory is declared — set `BROKER_GPU_DEVICES=0,1` (or `BROKER_CUDA_VISIBLE_DEVICES`), or turn on `BROKER_GPU_TELEMETRY`. `code=unknown_device_id`: a `gpu.device_ids` entry is not in the inventory — fix the ordinal or the inventory. In a pool the request fails over to a qualifying member first. Check `/status` → the model's `gpu` block for the inventory source. |
+| `503 gpu_placement_failed` on a load | A `gpu.required` model loaded but did not actually hold a GPU, so it was **unloaded** (never served on CPU). Managed runtime (evidence `measured`): its process group held no memory on a required device within `BROKER_GPU_VERIFY_SECONDS` — check the runtime really used the GPU (driver, device env, `--n-gpu-layers`/`num_gpu`), or raise the timeout. Ollama (evidence `reported`): `/api/ps` reported `size_vram == 0` — the daemon loaded it on CPU (check `OLLAMA_*` GPU env on the daemon). |
+| Startup `config_error`: "sets gpu.required … with no runtime the broker can verify" | `gpu.required: true` on an **external** OpenAI-compatible endpoint (no `startup_command`, non-Ollama) the broker cannot verify. Add `gpu.verify: declared` to assert placement out-of-band (shows as `declared` in `/status`), give the entry a broker-managed `startup_command`, or drop `gpu.required`. |
 
 ## Request-queue issues (ADR 0023)
 

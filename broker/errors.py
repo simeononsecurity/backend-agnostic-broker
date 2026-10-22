@@ -273,6 +273,54 @@ class ShuttingDownError(BrokerError):
         super().__init__(message, headers=headers, **kwargs)
 
 
+class GpuUnavailableError(BrokerError):
+    """A ``gpu.required`` model could not be admitted to a GPU (ADR 0025).
+
+    Raised by the shared admission path *before any spawn or eviction* when the
+    resolved device inventory (measured telemetry devices, else the declared
+    ``BROKER_GPU_DEVICES`` / ``BROKER_CUDA_VISIBLE_DEVICES`` list) cannot satisfy
+    the entry: the model is ``gpu.required`` but the inventory is empty, or one of
+    its ``gpu.device_ids`` is not in the inventory. Nothing is loaded and there is
+    no CPU fallback. Maps to **503**; it fails over to a qualifying pool member but
+    is never retried on the same member (the check is deterministic for a member).
+    """
+
+    http_status = 503
+    error_type = "gpu_unavailable"
+
+
+class GpuPlacementFailedError(BrokerError):
+    """A ``gpu.required`` model loaded but was not confirmed on a GPU (ADR 0025).
+
+    Raised by post-load verification: a broker-managed runtime whose process group
+    held no memory on a required device within ``BROKER_GPU_VERIFY_SECONDS``
+    (evidence ``measured``), or an Ollama model whose ``/api/ps`` reported
+    ``size_vram == 0`` (evidence ``reported``). The model is unloaded before this
+    is raised, so no request is ever served from a required model running on CPU.
+    Maps to **503**; like :class:`GpuUnavailableError` it fails over to a
+    qualifying member without being retried on the failing one.
+    """
+
+    http_status = 503
+    error_type = "gpu_placement_failed"
+
+
+class DeviceBusyError(BrokerError):
+    """A device needed by a model is held incompatibly by another holder (ADR 0026).
+
+    Raised by the device-lease admission step (``BROKER_DEVICE_LEASES=on``) when a
+    model needs a device that is already leased incompatibly and the holder cannot
+    be evicted: an ``exclusive`` model against any other holder, or any model
+    against an ``exclusive``/``external`` holder that is not an idle broker model.
+    The broker never evicts or signals an external holder. Maps to **503** with a
+    ``Retry-After`` so a client (and the ADR 0023 queue) can back off and retry.
+    Nothing is spawned.
+    """
+
+    http_status = 503
+    error_type = "device_busy"
+
+
 class RequestTooLargeError(BrokerError):
     """Request body exceeded the configured size limit."""
 

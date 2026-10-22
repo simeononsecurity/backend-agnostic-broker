@@ -381,6 +381,20 @@ class Settings(BaseSettings):
     gpu_visible: bool = False
     cuda_visible_devices: str | None = None  # e.g. "0,1"
 
+    # --- Required-GPU admission (ADR 0025; enforcement of an already-documented
+    # field, on by default for entries that set gpu.required) ---
+    # Declared device inventory (ordinals, e.g. "0,1") the broker may place a
+    # required model on when telemetry is OFF. Falls back to CUDA_VISIBLE_DEVICES.
+    # When telemetry is ON the measured devices are the inventory and this is
+    # ignored. A gpu.required model with an empty inventory (telemetry off and
+    # neither this nor BROKER_CUDA_VISIBLE_DEVICES set) fails fast with
+    # gpu_unavailable (503) instead of silently starting on CPU.
+    gpu_devices: str | None = None  # e.g. "0,1"
+    # How long (seconds) post-load verification waits for a broker-managed
+    # runtime's process group to hold memory on a required device (measured
+    # telemetry), before unloading and failing gpu_placement_failed.
+    gpu_verify_seconds: float = 30.0
+
     # --- Resource telemetry + measured release (ADR 0020; opt-in, default OFF) ---
     # Provider that measures per-device memory (and, where exposed, which PIDs hold
     # it): "off" (DEFAULT; behavior == v0.6.0), "nvidia" (nvidia-smi query mode),
@@ -537,6 +551,28 @@ class Settings(BaseSettings):
     # confusing readiness timeout. Non-loading TCP connect probe only.
     runtime_port_precheck: bool = True
 
+    # --- Host-local device leases (ADR 0026; opt-in, default OFF) ---
+    # When "on", the broker records one lease file per device it uses under
+    # device_lease_dir so co-tenant workloads get a reliable, readable "device N
+    # is in use" signal, and so a forced stop can be cleaned up from the service
+    # manager's post-stop step (python -m broker cleanup). Default "off" is
+    # byte-for-byte the previous release: no lease dir is created and nothing is
+    # read or written.
+    device_leases: str = "off"  # "off" | "on"
+    # Directory holding the per-device lease files. Unset => <cache_dir>/leases.
+    # Files are world-readable, owner-writable so an external holder/co-tenant can
+    # read (and, following the documented protocol, write "external" leases).
+    device_lease_dir: str | None = None
+    # Optional operator hooks run on lease acquire/release (and on a stale release
+    # by `cleanup`). Argv templates with {device} {mode} {holder}; the executable
+    # must resolve inside BROKER_ALLOWED_EXEC_DIRS; no shell is used. A failed
+    # acquire hook fails the load (device_busy); a failed release hook is logged
+    # and retried by the sweeper. Unset => no hook.
+    lease_acquire_command: str | None = None
+    lease_release_command: str | None = None
+    # Per-hook subprocess timeout (seconds).
+    lease_hook_timeout_seconds: float = 10.0
+
     # --- Docker / networking hints (documented, used by compose) ---
     docker_network_mode: str = "bridge"
 
@@ -577,6 +613,23 @@ class Settings(BaseSettings):
             raise ValueError("runtime_reconcile must be 'off', 'report', 'adopt', or 'stop'")
         return v
 
+    @field_validator("device_leases")
+    @classmethod
+    def _device_leases(cls, v: str) -> str:
+        if v not in ("off", "on"):
+            raise ValueError("device_leases must be 'off' or 'on'")
+        return v
+
+    def leases_enabled(self) -> bool:
+        """True when host-local device leases are turned on (ADR 0026)."""
+        return self.device_leases == "on"
+
+    def device_lease_dir_resolved(self) -> str:
+        """Lease directory: BROKER_DEVICE_LEASE_DIR, else <cache_dir>/leases."""
+        if self.device_lease_dir and str(self.device_lease_dir).strip():
+            return str(self.device_lease_dir).rstrip("/")
+        return f"{self.cache_dir.rstrip('/')}/leases"
+
     @field_validator("gpu_telemetry")
     @classmethod
     def _gpu_telemetry(cls, v: str) -> str:
@@ -613,6 +666,21 @@ class Settings(BaseSettings):
         if device_key in m:
             return m[device_key]
         return m.get("*")
+
+    def declared_gpu_devices(self) -> list[str]:
+        """Declared device inventory for required-GPU admission (ADR 0025).
+
+        The ``BROKER_GPU_DEVICES`` ordinals, falling back to
+        ``BROKER_CUDA_VISIBLE_DEVICES``. Each entry is a device key (string).
+        Empty list when neither is set. Used only when telemetry is OFF; with
+        telemetry ON the measured devices are the inventory.
+        """
+        raw = self.gpu_devices
+        if raw is None or not str(raw).strip():
+            raw = self.cuda_visible_devices
+        if raw is None or not str(raw).strip():
+            return []
+        return [tok.strip() for tok in str(raw).split(",") if tok.strip()]
 
     def validate_runtime(self) -> None:
         """Cross-field, fail-fast checks run once at startup."""
@@ -785,6 +853,8 @@ class Settings(BaseSettings):
             )
         if self.gpu_memory_reservation_seconds < 0:
             raise ConfigError("BROKER_GPU_MEMORY_RESERVATION_SECONDS must be >= 0")
+        if self.gpu_verify_seconds < 0:
+            raise ConfigError("BROKER_GPU_VERIFY_SECONDS must be >= 0 (0 = don't wait)")
         for _tool_path in (
             self.gpu_telemetry_nvidia_smi_path,
             self.gpu_telemetry_amd_smi_path,

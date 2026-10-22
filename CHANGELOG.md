@@ -6,6 +6,51 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Host-local device leases (ADR 0026; opt-in, `BROKER_DEVICE_LEASES=off` by
+  default).** When on, the broker records one lease file per device it uses under
+  `BROKER_DEVICE_LEASE_DIR` (default `<cache_dir>/leases`; atomic + `flock`,
+  world-readable) so co-tenant workloads get a reliable, readable "device N is in
+  use" signal, `gpu.exclusive` models are admitted safely, and a forced stop can
+  be cleaned up promptly.
+  - **Exclusive admission.** New registry field `gpu.exclusive`. An exclusive
+    model evicts an idle broker holder on its device under the normal policy but
+    fails fast with **503** `device_busy` + `Retry-After` against a busy broker
+    holder or any **external** holder — which is never signalled or evicted.
+    Leases are acquired inside the atomic admission step **before** spawn and
+    released only once teardown (ADR 0024) reports **no survivors** and measured
+    release confirms the runtime is gone (otherwise marked `stuck` for the sweeper).
+  - **Stale/forced-stop cleanup.** Stale leases (broker dead **and** runtime gone)
+    are removed at startup, by the sweeper, and by a new one-shot
+    `python -m broker cleanup` (bounded, no server, JSON summary, exit 0/1) meant
+    for systemd `ExecStopPost=`. In `stop` mode it reaps a live orphan runtime
+    **identity-gated** (descendant-aware, via the ADR 0024 teardown) then releases;
+    `report` keeps it `orphaned` and signals nothing. The lease file format is a
+    documented, versioned interface; external holders may publish their own
+    `external` lease.
+  - **Hooks** `BROKER_LEASE_ACQUIRE_COMMAND` / `BROKER_LEASE_RELEASE_COMMAND`
+    (single argv-template strings with `{device}` `{mode}` `{holder}`, allow-listed,
+    no shell, bounded by `BROKER_LEASE_HOOK_TIMEOUT_SECONDS`) run on acquire/release
+    and on a stale release by `cleanup`. A malformed hook fails the load closed with
+    `device_busy`; the startup log names the setting it could not parse.
+  - `GET /status` gains a `leases` block; Prometheus gains
+    `broker_device_leases{state}`, `broker_device_lease_stale_cleanups_total`, and
+    `broker_device_lease_hook_failures_total{phase}`. See
+    [docs/device-leases.md](docs/device-leases.md). Default off is byte-for-byte
+    the previous release (no lease directory is created).
+- **`BROKER_SHUTDOWN_BUDGET_SECONDS`** (default `45`, must be > 0): the total
+  wall-clock budget for the whole stop path. Each runtime's SIGTERM grace is
+  `min(BROKER_SHUTDOWN_TIMEOUT_SECONDS, remaining budget)`; at expiry everything
+  left is SIGKILLed and the broker exits. A second `SIGTERM`/`SIGINT` during
+  shutdown escalates immediately to SIGKILL of every runtime tree.
+- Per-stop teardown telemetry: `broker_runtime_teardown_total{outcome}` counter and
+  `broker_runtime_teardown_duration_seconds` histogram; the teardown result
+  (signalled / exited / survivors / reaped / duration) is logged and surfaced through
+  `survived_kill` / `release_stuck` in `/status` while survivors exist.
+- New typed error `shutting_down` (HTTP **503**, with `Retry-After`): returned to a
+  client whose request was waiting on a model load the broker cancelled while stopping.
+
 ### Fixed
 
 - **Bounded, descendant-aware shutdown (ADR 0024) — production-canary blocker.**
@@ -36,20 +81,27 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     only a per-runtime grace: adopted-runtime termination moved off the event loop
     (no longer blocks the loop during the grace), and uvicorn runs with
     `timeout_graceful_shutdown` bounded by the budget.
-
-### Added
-
-- **`BROKER_SHUTDOWN_BUDGET_SECONDS`** (default `45`, must be > 0): the total
-  wall-clock budget for the whole stop path. Each runtime's SIGTERM grace is
-  `min(BROKER_SHUTDOWN_TIMEOUT_SECONDS, remaining budget)`; at expiry everything
-  left is SIGKILLed and the broker exits. A second `SIGTERM`/`SIGINT` during
-  shutdown escalates immediately to SIGKILL of every runtime tree.
-- Per-stop teardown telemetry: `broker_runtime_teardown_total{outcome}` counter and
-  `broker_runtime_teardown_duration_seconds` histogram; the teardown result
-  (signalled / exited / survivors / reaped / duration) is logged and surfaced through
-  `survived_kill` / `release_stuck` in `/status` while survivors exist.
-- New typed error `shutting_down` (HTTP **503**, with `Retry-After`): returned to a
-  client whose request was waiting on a model load the broker cancelled while stopping.
+- **`gpu.required` / `gpu.device_ids` are now enforced in every production adapter
+  (ADR 0025).** Previously only the fake test backend read `gpu.required`; the
+  Ollama, vLLM, llama.cpp and Strata adapters ignored it and nothing validated
+  `gpu.device_ids`, so a model marked required could start on CPU (silently/slowly)
+  or on an unintended device — the docs promised a guarantee the broker did not
+  give. Enforcement now lives in the shared admission path:
+  - **Pre-load gate (all backends), before any spawn or eviction:** a load fails
+    fast with **503** `gpu_unavailable` when `gpu.required` is set and the device
+    inventory is empty, or when a `gpu.device_ids` entry is not in it. Nothing is
+    spawned or evicted and there is no CPU fallback; within a pool the request
+    fails over to a qualifying member without sleep-retrying the failing one.
+  - **Device inventory** resolves from measured telemetry devices when
+    `BROKER_GPU_TELEMETRY` is on, else the new `BROKER_GPU_DEVICES` (ordinals),
+    falling back to `BROKER_CUDA_VISIBLE_DEVICES`; the source is labelled
+    `measured` / `declared` in `/status`.
+  - **Post-load verification:** broker-managed runtimes (with telemetry) must hold
+    memory on a required device within `BROKER_GPU_VERIFY_SECONDS` (default 30);
+    Ollama must report `/api/ps` `size_vram > 0`. On failure the model is unloaded
+    and the request fails **503** `gpu_placement_failed` — never served on CPU.
+  - `GET /status` gains a per-model `gpu` block (`required`, inventory source,
+    evidence mode, last verification result).
 
 ### Changed
 
@@ -61,6 +113,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`TimeoutStopSec`, `KillMode=mixed`; see the operations runbook).
 - `ProcessSupervisor.stop()` and the adapter `stop()` contract now return a
   `TeardownResult` (was a bool on the supervisor) describing the teardown outcome.
+- **Behaviour change for misconfigured entries (ADR 0025).** This enforcement is
+  **on by default** for entries that already set `gpu.required`:
+  - a `gpu.required` entry with no resolvable GPU (telemetry off and no declared
+    inventory) now fails at load with 503 `gpu_unavailable` instead of silently
+    running on CPU;
+  - a `gpu.device_ids` referencing a device not in the inventory now fails at load;
+  - setting `gpu.required: true` on an **external** OpenAI-compatible endpoint (no
+    `startup_command`, non-Ollama) the broker cannot verify is now a **startup
+    configuration error** unless the entry also sets the new `gpu.verify: declared`
+    (shown as `declared` in `/status`). `gpu.verify: declared` is scoped to those
+    external entries: it is **rejected** (startup config error) on any backend the
+    broker can verify (managed/Ollama) so it can never silently disable
+    enforcement.
+
+  Models **without** `gpu.required` are unchanged. New settings
+  `BROKER_GPU_DEVICES` and `BROKER_GPU_VERIFY_SECONDS`, the registry value
+  `gpu.verify: declared`, and the error types `gpu_unavailable` /
+  `gpu_placement_failed`. See the [upgrading guide](docs/guides/upgrading.md).
 
 ## [0.7.0] - 2026-10-21
 
