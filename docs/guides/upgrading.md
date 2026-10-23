@@ -24,10 +24,11 @@ The new features added alongside this branch — GPU-safe model swapping
 reconciliation (ADR 0021) — are likewise **opt-in and default-off**, so none of
 them changes behavior unless you enable them (see the adopting table below).
 
-## The three behavior changes to know
+## The behavior changes to know
 
-These are the **only** non-default-off changes since v0.5.0. Both are documented in
-`CHANGELOG.md`.
+These are the **only** non-default-off changes since v0.5.0; the last two
+(ADR 0024/0025) are the on-by-default changes new in **0.8.0** (0.6.0 → 0.8.0).
+All are documented in `CHANGELOG.md`.
 
 ### 1. Upstream HTTP errors are surfaced by status (ADR 0017)
 
@@ -90,6 +91,27 @@ documented promise, not an opt-in feature.
 New knobs: `BROKER_GPU_DEVICES`, `BROKER_GPU_VERIFY_SECONDS`, and the registry
 value `gpu.verify: declared`. See [gpu-placement.md](../gpu-placement.md).
 
+### 5. Bounded, descendant-aware shutdown (ADR 0024)
+
+Stopping the broker is now **deadline-driven** and tears down each runtime's whole
+descendant tree. This is **on by default** — it fixes a production-canary blocker
+(a stop that hung ~97 s waiting on an in-progress load, and an escaped `setsid`
+descendant that survived broker exit), not an opt-in feature.
+
+- The whole stop path now runs within **`BROKER_SHUTDOWN_BUDGET_SECONDS`**
+  (default `45`). The **first** stop signal cancels any in-progress load before
+  uvicorn's graceful phase; a client waiting on that cold load fails fast with
+  **503** `shutting_down` (+ `Retry-After`) instead of hanging. A second
+  `SIGTERM`/`SIGINT` escalates immediately to SIGKILL of every runtime tree.
+- **Action required for systemd users:** set the unit's stop timeout to
+  **`TimeoutStopSec` ≥ `BROKER_SHUTDOWN_BUDGET_SECONDS` + 15 s** (with
+  `KillMode=mixed`), so the service manager never SIGKILLs the broker mid-teardown
+  and leaves a runtime holding the GPU. For `docker stop`, use
+  `-t <budget + 15>`. See the [operations runbook](../operations-runbook.md).
+- `ProcessSupervisor.stop()` / the adapter `stop()` contract now return a
+  `TeardownResult`; new telemetry `broker_runtime_teardown_total{outcome}` and
+  `broker_runtime_teardown_duration_seconds`.
+
 ### If you run the frozen v0.5.0 test suite against this branch
 
 Three tests intentionally fail because they assert the **old** cache-aware β — all
@@ -118,6 +140,7 @@ Everything else in the v0.5.0 suite passes unchanged (including
 | GPU-safe model swapping (telemetry, measured release, sized models) | `BROKER_GPU_TELEMETRY` + `memory_mib` on models | [gpu-memory](gpu-memory.md) |
 | Request queueing under overload | `BROKER_QUEUE_ENABLED=true` | [request-queueing](request-queueing.md) |
 | Crash recovery / restart reconciliation | `BROKER_RUNTIME_RECONCILE=adopt\|stop` | [restart-and-recovery](restart-and-recovery.md) |
+| Host-local device leases / exclusive models / stale-lease cleanup | `BROKER_DEVICE_LEASES=on` + `gpu.exclusive` | [device-leases](../device-leases.md) |
 
 ## Verify the upgrade
 
@@ -134,4 +157,7 @@ Expected: identical model list and routing behavior to before — new blocks in
 - Reference: [CHANGELOG](../../CHANGELOG.md) · [configuration](../configuration.md) ·
   [API reference](../api-reference.md)
 - ADRs: [0017 reliability v2](../adr/0017-reliability-v2.md) ·
-  [0018 cache-aware v2](../adr/0018-cache-aware-v2.md)
+  [0018 cache-aware v2](../adr/0018-cache-aware-v2.md) ·
+  [0024 bounded shutdown](../adr/0024-bounded-shutdown-and-descendant-teardown.md) ·
+  [0025 required-GPU enforcement](../adr/0025-enforce-required-gpu-admission.md) ·
+  [0026 device leases](../adr/0026-device-leases-and-stale-lease-cleanup.md)

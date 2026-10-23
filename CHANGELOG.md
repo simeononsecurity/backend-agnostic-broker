@@ -4,7 +4,9 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-10-22
+
+> v0.7.0 (ADRs 0020–0023) was prepared but never published; its changes ship here in v0.8.0 together with the P5 lifecycle work (ADRs 0024–0027).
 
 ### Added
 
@@ -61,91 +63,6 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `survived_kill` / `release_stuck` in `/status` while survivors exist.
 - New typed error `shutting_down` (HTTP **503**, with `Retry-After`): returned to a
   client whose request was waiting on a model load the broker cancelled while stopping.
-
-### Fixed
-
-- **Bounded, descendant-aware shutdown (ADR 0024) — production-canary blocker.**
-  Stopping the broker is now deadline-driven and tears down each runtime's whole
-  descendant tree, fixing three stop-path defects seen on a production canary and
-  reproduced locally (same on v0.6.0 and the v0.7.0 RC):
-  - `SIGTERM` **during an in-progress load** no longer waits for the load to finish
-    (was up to ~97 s): the **first** stop signal **cancels** the load *before*
-    uvicorn's graceful phase, kills the spawning runtime, and the model goes to
-    `UNLOADED`. `ManagedModel.stop()` no longer waits unbounded on `load_lock`. A
-    client request waiting on that cold load fails fast with a typed **503
-    `shutting_down`** (with `Retry-After`) instead of hanging until the budget
-    expires. uvicorn's graceful HTTP phase is now capped at `min(10 s, budget/3)` and
-    the whole stop is drawn from one deadline stamped at the first signal, so the
-    total stays within the budget.
-  - An **escaped `setsid` runtime descendant** (e.g. a GPU worker in a new session)
-    is no longer left holding device memory after the broker exits: descendants are
-    recorded while the runtime lives (Linux `/proc` + child-subreaper; a periodic
-    argv-only `ps` snapshot elsewhere) and the kill set is the process group **plus
-    every recorded descendant**, each identity-gated (PID + start time).
-  - **Re-parented descendants no longer accumulate as zombies.** On Linux the broker
-    is a child subreaper, so a descendant that outlives its runtime re-parents to the
-    broker; after teardown those are now **reaped** (`waitpid(WNOHANG)` on only the
-    specific kill-set PIDs whose parent is the broker — never `waitpid(-1)`), both
-    inline in `terminate_tree` (after an eviction/unload/shutdown) and periodically in
-    the idle sweeper. Previously repeated evictions left zombie children behind.
-  - A runtime that ignores `SIGTERM` is now bounded by a total budget instead of
-    only a per-runtime grace: adopted-runtime termination moved off the event loop
-    (no longer blocks the loop during the grace), and uvicorn runs with
-    `timeout_graceful_shutdown` bounded by the budget.
-- **`gpu.required` / `gpu.device_ids` are now enforced in every production adapter
-  (ADR 0025).** Previously only the fake test backend read `gpu.required`; the
-  Ollama, vLLM, llama.cpp and Strata adapters ignored it and nothing validated
-  `gpu.device_ids`, so a model marked required could start on CPU (silently/slowly)
-  or on an unintended device — the docs promised a guarantee the broker did not
-  give. Enforcement now lives in the shared admission path:
-  - **Pre-load gate (all backends), before any spawn or eviction:** a load fails
-    fast with **503** `gpu_unavailable` when `gpu.required` is set and the device
-    inventory is empty, or when a `gpu.device_ids` entry is not in it. Nothing is
-    spawned or evicted and there is no CPU fallback; within a pool the request
-    fails over to a qualifying member without sleep-retrying the failing one.
-  - **Device inventory** resolves from measured telemetry devices when
-    `BROKER_GPU_TELEMETRY` is on, else the new `BROKER_GPU_DEVICES` (ordinals),
-    falling back to `BROKER_CUDA_VISIBLE_DEVICES`; the source is labelled
-    `measured` / `declared` in `/status`.
-  - **Post-load verification:** broker-managed runtimes (with telemetry) must hold
-    memory on a required device within `BROKER_GPU_VERIFY_SECONDS` (default 30);
-    Ollama must report `/api/ps` `size_vram > 0`. On failure the model is unloaded
-    and the request fails **503** `gpu_placement_failed` — never served on CPU.
-  - `GET /status` gains a per-model `gpu` block (`required`, inventory source,
-    evidence mode, last verification result).
-
-### Changed
-
-- **Behaviour change (on by default — a bug fix to the "stopping the broker stops
-  what it started" invariant, not an opt-in feature):** a model load interrupted by
-  shutdown is abandoned and repeats on the next start; the broker now tears down the
-  runtime's whole descendant tree rather than only its process group. Set the
-  service manager's stop timeout to **≥ `BROKER_SHUTDOWN_BUDGET_SECONDS` + 15 s**
-  (`TimeoutStopSec`, `KillMode=mixed`; see the operations runbook).
-- `ProcessSupervisor.stop()` and the adapter `stop()` contract now return a
-  `TeardownResult` (was a bool on the supervisor) describing the teardown outcome.
-- **Behaviour change for misconfigured entries (ADR 0025).** This enforcement is
-  **on by default** for entries that already set `gpu.required`:
-  - a `gpu.required` entry with no resolvable GPU (telemetry off and no declared
-    inventory) now fails at load with 503 `gpu_unavailable` instead of silently
-    running on CPU;
-  - a `gpu.device_ids` referencing a device not in the inventory now fails at load;
-  - setting `gpu.required: true` on an **external** OpenAI-compatible endpoint (no
-    `startup_command`, non-Ollama) the broker cannot verify is now a **startup
-    configuration error** unless the entry also sets the new `gpu.verify: declared`
-    (shown as `declared` in `/status`). `gpu.verify: declared` is scoped to those
-    external entries: it is **rejected** (startup config error) on any backend the
-    broker can verify (managed/Ollama) so it can never silently disable
-    enforcement.
-
-  Models **without** `gpu.required` are unchanged. New settings
-  `BROKER_GPU_DEVICES` and `BROKER_GPU_VERIFY_SECONDS`, the registry value
-  `gpu.verify: declared`, and the error types `gpu_unavailable` /
-  `gpu_placement_failed`. See the [upgrading guide](docs/guides/upgrading.md).
-
-## [0.7.0] - 2026-10-21
-
-### Added
 
 - **Runtime process identity + restart reconciliation (ADR 0021).** The broker now
   records every runtime it spawns (vLLM / llama.cpp / Strata) in a host-local,
@@ -245,12 +162,89 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Behaviour change (on by default — a bug fix to the "stopping the broker stops
+  what it started" invariant, not an opt-in feature):** a model load interrupted by
+  shutdown is abandoned and repeats on the next start; the broker now tears down the
+  runtime's whole descendant tree rather than only its process group. Set the
+  service manager's stop timeout to **≥ `BROKER_SHUTDOWN_BUDGET_SECONDS` + 15 s**
+  (`TimeoutStopSec`, `KillMode=mixed`; see the operations runbook).
+- `ProcessSupervisor.stop()` and the adapter `stop()` contract now return a
+  `TeardownResult` (was a bool on the supervisor) describing the teardown outcome.
+- **Behaviour change for misconfigured entries (ADR 0025).** This enforcement is
+  **on by default** for entries that already set `gpu.required`:
+  - a `gpu.required` entry with no resolvable GPU (telemetry off and no declared
+    inventory) now fails at load with 503 `gpu_unavailable` instead of silently
+    running on CPU;
+  - a `gpu.device_ids` referencing a device not in the inventory now fails at load;
+  - setting `gpu.required: true` on an **external** OpenAI-compatible endpoint (no
+    `startup_command`, non-Ollama) the broker cannot verify is now a **startup
+    configuration error** unless the entry also sets the new `gpu.verify: declared`
+    (shown as `declared` in `/status`). `gpu.verify: declared` is scoped to those
+    external entries: it is **rejected** (startup config error) on any backend the
+    broker can verify (managed/Ollama) so it can never silently disable
+    enforcement.
+
+  Models **without** `gpu.required` are unchanged. New settings
+  `BROKER_GPU_DEVICES` and `BROKER_GPU_VERIFY_SECONDS`, the registry value
+  `gpu.verify: declared`, and the error types `gpu_unavailable` /
+  `gpu_placement_failed`. See the [upgrading guide](docs/guides/upgrading.md).
+
 - Graceful shutdown (FastAPI lifespan / `SIGTERM` to `python -m broker`, incl.
   `docker stop`) now also clears the runtime ledger after stopping runtimes. The
   Docker image declares `STOPSIGNAL SIGTERM` explicitly (exec-form entrypoint
   already made python PID 1).
 
 ### Fixed
+
+- **Bounded, descendant-aware shutdown (ADR 0024) — production-canary blocker.**
+  Stopping the broker is now deadline-driven and tears down each runtime's whole
+  descendant tree, fixing three stop-path defects seen on a production canary and
+  reproduced locally (same on v0.6.0 and the v0.7.0 RC):
+  - `SIGTERM` **during an in-progress load** no longer waits for the load to finish
+    (was up to ~97 s): the **first** stop signal **cancels** the load *before*
+    uvicorn's graceful phase, kills the spawning runtime, and the model goes to
+    `UNLOADED`. `ManagedModel.stop()` no longer waits unbounded on `load_lock`. A
+    client request waiting on that cold load fails fast with a typed **503
+    `shutting_down`** (with `Retry-After`) instead of hanging until the budget
+    expires. uvicorn's graceful HTTP phase is now capped at `min(10 s, budget/3)` and
+    the whole stop is drawn from one deadline stamped at the first signal, so the
+    total stays within the budget.
+  - An **escaped `setsid` runtime descendant** (e.g. a GPU worker in a new session)
+    is no longer left holding device memory after the broker exits: descendants are
+    recorded while the runtime lives (Linux `/proc` + child-subreaper; a periodic
+    argv-only `ps` snapshot elsewhere) and the kill set is the process group **plus
+    every recorded descendant**, each identity-gated (PID + start time).
+  - **Re-parented descendants no longer accumulate as zombies.** On Linux the broker
+    is a child subreaper, so a descendant that outlives its runtime re-parents to the
+    broker; after teardown those are now **reaped** (`waitpid(WNOHANG)` on only the
+    specific kill-set PIDs whose parent is the broker — never `waitpid(-1)`), both
+    inline in `terminate_tree` (after an eviction/unload/shutdown) and periodically in
+    the idle sweeper. Previously repeated evictions left zombie children behind.
+  - A runtime that ignores `SIGTERM` is now bounded by a total budget instead of
+    only a per-runtime grace: adopted-runtime termination moved off the event loop
+    (no longer blocks the loop during the grace), and uvicorn runs with
+    `timeout_graceful_shutdown` bounded by the budget.
+- **`gpu.required` / `gpu.device_ids` are now enforced in every production adapter
+  (ADR 0025).** Previously only the fake test backend read `gpu.required`; the
+  Ollama, vLLM, llama.cpp and Strata adapters ignored it and nothing validated
+  `gpu.device_ids`, so a model marked required could start on CPU (silently/slowly)
+  or on an unintended device — the docs promised a guarantee the broker did not
+  give. Enforcement now lives in the shared admission path:
+  - **Pre-load gate (all backends), before any spawn or eviction:** a load fails
+    fast with **503** `gpu_unavailable` when `gpu.required` is set and the device
+    inventory is empty, or when a `gpu.device_ids` entry is not in it. Nothing is
+    spawned or evicted and there is no CPU fallback; within a pool the request
+    fails over to a qualifying member without sleep-retrying the failing one.
+  - **Device inventory** resolves from measured telemetry devices when
+    `BROKER_GPU_TELEMETRY` is on, else the new `BROKER_GPU_DEVICES` (ordinals),
+    falling back to `BROKER_CUDA_VISIBLE_DEVICES`; the source is labelled
+    `measured` / `declared` in `/status`.
+  - **Post-load verification:** broker-managed runtimes (with telemetry) must hold
+    memory on a required device within `BROKER_GPU_VERIFY_SECONDS` (default 30);
+    Ollama must report `/api/ps` `size_vram > 0`. On failure the model is unloaded
+    and the request fails **503** `gpu_placement_failed` — never served on CPU.
+  - `GET /status` gains a per-model `gpu` block (`required`, inventory source,
+    evidence mode, last verification result).
 
 - **Restart reconciliation no longer loses an orphan on an unrelated broker's
   shutdown (ADR 0021).** `ManagedModel.stop()` removed a model's ledger record
